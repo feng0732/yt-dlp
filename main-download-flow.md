@@ -451,7 +451,7 @@ process_video_result(info_dict, download=True)
 | `info_dict['requested_downloads']` | 已下载的所有格式详情 | `process_video_result` 末尾 L3145 |
 | `info_dict['__postprocessors']` | 动态注入的 PP（merger、fixup） | `process_info` 下载/修复阶段 |
 | `info_dict['__files_to_move']` | 需移动的附属文件映射 | 贯穿 pre_process / post_process |
-| `info_dict['__write_download_archive']` | 是否写入归档（True/False/'ignore'） | process_info 各分支 |
+| `info_dict['__write_download_archive']` | 外层格式组（粒度 2）的归档标记（True/False/'ignore'）。不存在于内层子格式（粒度 3） | `process_info` 各分支（见第 10.5 节失败边界） |
 
 ---
 
@@ -579,7 +579,22 @@ MaxDownloadsReached           │ —                     │ —
 | `force_write_download_archive` | [L3671](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3671) | `True` | `--force-write-download-archive` 全局覆盖 |
 | `extract_flat` 模式 | [L1936](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L1936) | 直接调用 `record_download_archive` | 不展开提取，直接记录 |
 
-### 10.3 多格式归档汇总判断
+### 10.3 三层粒度体系与归档判断
+
+在分析归档逻辑之前，必须首先厘清三层粒度，否则会发生"外层格式组"与"内层子格式"的混淆：
+
+| 粒度层 | 名称 | 数据结构 | 对应代码位置 | 说明 |
+|-------|------|---------|------------|------|
+| 粒度 1（最外层） | **单个视频**（info_dict） | 整个 `info_dict` | `record_download_archive(info_dict)` | 归档的实际写入单位，键为 `extractor_key + video_id` |
+| 粒度 2 | **外层格式组**（formats_to_download 元素） | `fmt`（含 `format_id` 可能为 `"137+140"`） | `process_video_result` 中 `itertools.product(formats_to_download, requested_ranges)` 循环，每个元素一次 `process_info` 调用 | 多格式合并时，一个外层格式组 = 一个"需要合并的集合"（如 video-only + audio-only） |
+| 粒度 3（最内层） | **内层子格式**（requested_formats 元素） | 单个 format（如 format_id=`137` 的纯视频、format_id=`140` 的纯音频） | `process_info` 中 `for f in info_dict['requested_formats']` 循环 | 真正独立下载的媒体文件，无独立归档标记 |
+
+**关键区分**：
+- `downloaded_formats`（[L3127](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3127)）收集的是 **粒度 2（外层格式组）**，每个元素对应一次 `process_info` 调用
+- `__write_download_archive` 只存在于 **粒度 2**，不存在于粒度 3 的子格式
+- 归档判断完全在 **粒度 1** 和 **粒度 2** 两层进行，**粒度 3（子格式）没有独立的归档话语权**
+
+### 10.4 多格式归档汇总判断（粒度 1 vs 粒度 2）
 
 在 `process_video_result` 的下载循环结束后（[L3140-L3143](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3140-L3143)）：
 
@@ -590,15 +605,153 @@ if True in write_archive and False not in write_archive:
     self.record_download_archive(info_dict)
 ```
 
-**判断逻辑**：收集所有格式（每个 `process_info` 调用一个）的 `__write_download_archive` 值，仅当：
-- 至少有一个 `True`（有格式成功下载完成）
-- 且没有任何 `False`（没有格式失败或被提前 return）
+**判断逻辑（粒度 2 → 粒度 1）**：收集所有外层格式组（粒度 2）的 `__write_download_archive` 值，仅当：
+- 至少有一个 `True`（有外层格式组完整成功）
+- 且没有任何 `False`（没有外层格式组失败或被提前 return）
 
-才会写入归档。`'ignore'` 不阻止写入。
+才会在粒度 1 写入归档。`'ignore'` 不阻止写入。
 
-**这意味着**：如果一个视频选择了 2 个格式，格式 1 下载成功（`True`）但格式 2 下载失败（`False`），则 **不会** 写入归档——重试时两个格式都会重新下载。
+**易混淆点澄清**：
+- ❌ 错误理解：`formats_to_download` 中每个元素是单个子格式，子格式部分失败单独标记
+- ✅ 正确理解：`formats_to_download` 中每个元素是 **外层格式组**，格式组内部包含多个子格式（由 `_merge()` 构造，含 `requested_formats` 列表）
+- ✅ 正确理解：粒度 3 子格式失败会 **连带** 整个外层格式组（粒度 2）的 `__write_download_archive` 变为 `False`（或保持默认的 `False`，因为 `success=False` 导致跳过赋值）
 
-### 10.4 `record_download_archive` 实现
+### 10.5 子格式失败边界分析（粒度 3 失败如何传播到粒度 2）
+
+外层格式组（粒度 2）对应的 `process_info` 调用内部，可能存在多个内层子格式（粒度 3）的下载。子格式失败如何影响外层格式组的 `__write_download_archive` 值，取决于失败发生的位置：
+
+#### 场景 A：多格式逐个下载分支（`fd is None`，[L3549-L3563](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3549-L3563)）
+
+```python
+success = True
+downloaded = []
+for f in info_dict['requested_formats']:     # 遍历每个子格式（粒度3）
+    new_info = dict(info_dict)
+    del new_info['requested_formats']
+    new_info.update(f)
+    fname = prepend_extension(temp_filename, f'f{f["format_id"]}', new_info['ext'])
+    if not self._ensure_dir_exists(fname):
+        return                                # ⚠️ 提前 return：__write_download_archive 保持 False
+    f['filepath'] = fname
+    downloaded.append(fname)
+    partial_success, real_download = self.dl(fname, new_info)
+    info_dict['__real_download'] = info_dict['__real_download'] or real_download
+    success = success and partial_success     # 一票否决：任一子格式失败 → success=False
+```
+
+失败边界：
+1. **`_ensure_dir_exists` 失败** → 整个 `process_info` **立即 return**，`__write_download_archive` 从未被赋值，保持默认 `False`
+2. **某个子格式 `partial_success=False`**：循环会继续执行完所有子格式（不会提前 break），但最终 `success=False`
+3. 循环结束后进入 `[L3597](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3597)` 判断：`if success and full_filename != '-'` → 由于 `success=False`，整个 fixup + post_process + `__write_download_archive = True` 赋值块 **被完全跳过**
+4. 最终外层格式组的 `__write_download_archive` 值为 `False`（默认值）
+
+**关键结论**：在逐个下载分支，任何一个子格式下载失败（`partial_success=False`）→ 外层格式组 `success=False` → 跳过后处理 → `__write_download_archive` 保持 `False`。**即使部分子格式（如视频轨）已经完整下载到磁盘，也不会在外层被记为"成功"**。
+
+#### 场景 B：非 FFmpeg 下载器一步下载多 URL（[L3519-L3527](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3519-L3527)）
+
+```python
+if fd != FFmpegFD and temp_filename != '-':
+    for f in info_dict['requested_formats']:
+        f['filepath'] = fname = prepend_extension(...)
+        downloaded.append(fname)
+info_dict['url'] = '\n'.join(f['url'] for f in info_dict['requested_formats'])
+success, real_download = self.dl(temp_filename, info_dict)  # 一次调用，多 URL 输入
+```
+
+- 下载器内部处理多 URL，返回的 `success` 是整体结果
+- `success=False` → 外层格式组整体标记为失败，`__write_download_archive` 保持 `False`
+- 子格式级别的部分成功在这个分支无法感知
+
+#### 场景 C：FFmpegFD 一步下载+合并（[L3526](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3526)）
+
+- FFmpegFD 内部 `-map` 合并，无显式子格式概念
+- 只有整体 `success`，任何失败都导致外层 `__write_download_archive=False`
+
+#### 场景 D：后处理阶段失败（FFmpegMergerPP 合并失败）
+
+```python
+if success and full_filename != '-':
+    fixup()           # 注入各种 Fixup PP 到 __postprocessors
+    try:
+        replace_info_dict(self.post_process(dl_filename, info_dict, files_to_move))
+        # post_process 内部按顺序执行：
+        #   run_all_pps('post_process') → 含 FFmpegMergerPP（多格式合并）
+        #   run_pp(MoveFilesAfterDownloadPP)
+        #   run_all_pps('after_move')
+    except PostProcessingError as err:
+        self.report_error(f'Postprocessing: {err}')
+        return        # ⚠️ 提前 return：__write_download_archive 赋值被跳过
+    try:
+        for ph in self._post_hooks:
+            ph(info_dict['filepath'])
+    except Exception as err:
+        self.report_error(f'post hooks: {err}')
+        return        # ⚠️ 提前 return
+    info_dict['__write_download_archive'] = True   # ← 只有走到这里才是 True
+```
+
+**关键边界**：`__write_download_archive = True` 的赋值在 [L3667](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3667)，位于：
+- post_process（含 FFmpegMergerPP 合并）成功之后
+- post_hooks 成功之后
+
+因此，**即使所有子格式都下载成功（分文件完整存在于磁盘），只要 FFmpegMergerPP 合并失败**，就会 `return`，`__write_download_archive` 保持 `False`。
+
+### 10.6 重试影响分析：子格式部分成功但归档未写入
+
+#### 重试前的文件状态
+
+假设外层格式组 `bestvideo+bestaudio`（format_id=`137+140`）：
+- 子格式 137（纯视频）：下载成功，文件为 `video.f137.mp4`（分文件）
+- 子格式 140（纯音频）：下载失败
+- 合并后的最终文件 `video.mp4`：不存在（合并从未开始或失败）
+
+#### 下次重试时发生了什么
+
+1. **归档检查（粒度 1）**：`in_download_archive` 检查 `extractor_key+video_id` → 归档未写入 → **不跳过**，重新进入下载流程
+2. **existing_video_file 检查（粒度 1）**：检查合并后的最终文件 `video.mp4` 和临时文件 `video.mp4.part`（[L3508](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3508)）→ 两者都不存在 → **继续下载**
+3. **子文件是否被复用？**
+   - `existing_video_file` **只检查合并后的最终文件名**，不检查分文件 `video.f137.mp4`
+   - 分文件 `video.f137.mp4` 如果在磁盘上，只有下载器自己的 `continuedl`（HTTP 续传）逻辑可能复用
+   - 但子文件使用的是 `temp_filename` 变体（如 `video.f137.mp4.f137.mp4`？不，`prepend_extension` 生成的文件名不含 `.part` 后缀）
+   - **实际行为**：分文件通常会被重新下载（如果有 `.part` 文件，HTTP 续传可能生效）
+
+#### 重试场景完整表
+
+| 失败位置 | 成功的子格式是否在磁盘 | 合并后文件 | 归档是否写入 | 重试行为 |
+|---------|---------------------|-----------|------------|---------|
+| `_ensure_dir_exists` 失败 | 否 | 否 | 否 | 重新下载全部子格式 |
+| 第 1 个子格式下载失败 | 否（第 1 个失败，第 2 个会继续尝试） | 否 | 否 | 重新下载全部子格式 |
+| 第 2 个子格式下载失败 | 是（第 1 个完整） | 否 | 否 | **重新下载全部子格式**（第 1 个虽在磁盘但不被检测，可能被覆盖或续传） |
+| 全部子格式下载成功，FFmpegMergerPP 合并失败 | 是（全部完整） | 否 | 否 | **重新下载全部子格式**（分文件存在但不被检测，可能被覆盖） |
+| FFmpegMergerPP 成功，post_hooks 失败 | 是（全部完整） | **是**（已合并） | 否 | `existing_video_file` 会检测到合并文件 → 跳过下载，只尝试后处理 |
+| 全部成功 | 是 | 是 | 是 | 归档命中 → 整个视频跳过 |
+
+#### `existing_file` 对于已存在分文件的行为
+
+`existing_file` 方法（[L3320-L3328](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3320-L3328)）：
+
+```python
+def existing_file(self, filepaths, *, default_overwrite=True):
+    existing_files = list(filter(os.path.exists, orderedSet(filepaths)))
+    if existing_files and not self.params.get('overwrites', default_overwrite):
+        return existing_files[0]
+    for file in existing_files:        # ⚠️ 若允许覆盖，则删除已存在文件
+        self.report_file_delete(file)
+        os.remove(file)
+    return None
+```
+
+`existing_video_file` 只传了 `full_filename` 和 `temp_filename`（合并后的文件），**没有传分文件路径**。因此：
+- 如果用户设置了 `--no-overwrites`：分文件不会被检测到，也不会被删除，但也不会被主动复用
+- 如果用户未设置 `--no-overwrites`（默认允许覆盖）：分文件同样不会被检测，因此不会被主动删除，但下载器写入同名文件时会覆盖原分文件
+- 只有分文件恰好带 `.part` 后缀且下载器支持续传时，才有可能断点续传
+
+**总结**：子格式级别的部分成功在重试时几乎不会被利用，因为：
+1. 归档粒度是视频级（粒度 1），不是子格式级（粒度 3）
+2. `existing_video_file` 只检查合并后的最终文件（粒度 1）
+3. 分文件（粒度 3）没有独立的"已完成"标记机制
+
+### 10.7 `record_download_archive` 实现
 
 位置：[L3876-L3887](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3876-L3887)
 
@@ -815,12 +968,12 @@ class FFmpegMergerPP(FFmpegPostProcessor):
 
 ### 11.6 各条件组合速查表
 
-| 条件组合 | 下载方式 | 合并方式 | 归档写入 |
-|---------|---------|---------|---------|
-| fd=FFmpegFD, merger 可用 | ffmpeg 一步下载+合并 | ffmpeg 内部 `-map` | 下载成功后 `__write_download_archive=True` |
-| fd≠FFmpegFD, merger 可用, 输出到文件 | 非ffmpeg下载器一步下载 | FFmpegMergerPP 后处理合并 | 合并成功后写入 |
-| fd=None, merger 可用, 输出到文件 | 逐格式独立下载 | FFmpegMergerPP 后处理合并 | 合并成功后写入 |
-| fd=None, merger 不可用, ignoreerrors=True | 逐格式独立下载 | **不合并**，分文件各自保留 | 部分成功可写入（取决于各格式 `__write_download_archive`） |
+| 条件组合 | 下载方式 | 合并方式 | 归档写入（粒度 1） |
+|---------|---------|---------|-------------------|
+| fd=FFmpegFD, merger 可用 | ffmpeg 一步下载+合并 | ffmpeg 内部 `-map` | 外层格式组粒度 2 成功 → 粒度 1 写入归档 |
+| fd≠FFmpegFD, merger 可用, 输出到文件 | 非ffmpeg下载器一步下载 | FFmpegMergerPP 后处理合并 | 外层格式组粒度 2 的下载+合并均成功 → 粒度 1 写入；任何子格式失败或合并失败 → 不写入 |
+| fd=None, merger 可用, 输出到文件 | 逐子格式（粒度 3）独立下载 | FFmpegMergerPP 后处理合并 | **粒度 3 部分成功不会被单独计为成功**；所有子格式全部下载成功 + 合并成功 → 粒度 2 标记 True → 粒度 1 写入；任一子格式下载失败 → 粒度 2 保持 False → 不写入 |
+| fd=None, merger 不可用, ignoreerrors=True | 逐子格式（粒度 3）独立下载 | **不合并**，分文件各自保留 | 不合并仍走 post_process → 若所有子格式下载均成功（粒度 2 的 `success=True`）→ 粒度 2 标记 True → 粒度 1 写入；任一子格式失败 → 不写入 |
 | fd=None, merger 不可用, ignoreerrors=False | 报错中止 | — | — |
-| 任何, 输出到 stdout (`-`) | 逐格式流式输出 | **不可合并** | 取决于各格式成功与否 |
-| 任何, `allow_unplayable_formats=True` | 视情况 | **强制不合并**（防数据损坏） | 下载成功可写入 |
+| 任何, 输出到 stdout (`-`) | 逐格式流式输出 | **不可合并** | 输出到 stdout 时跳过 `__write_download_archive=True` 赋值（`full_filename != '-'` 条件不满足）→ 粒度 2 保持 False → 不写入 |
+| 任何, `allow_unplayable_formats=True` | 视情况 | **强制不合并**（防数据损坏） | 不合并仍走 post_process；下载成功 → 粒度 2 标记 True → 粒度 1 写入 |
