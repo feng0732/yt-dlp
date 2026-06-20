@@ -660,11 +660,221 @@ DenoJCP / BunJCP._get_env_options()
    Deno/Bun 进程继承环境变量
 ```
 
-### 5.3 外部下载器的代理路径
+### 5.3 JS 挑战求解脚本的四种加载源及代理路径
+
+JS 挑战求解脚本（yt.solver.lib.js / yt.solver.core.js）有 4 种加载源，按优先级依次尝试。不同来源的代理路径完全不同。
+
+#### 5.3.1 四种加载源与优先级
+
+ejs.py#L259-L264（`yt_dlp/extractor/youtube/jsc/_builtin/ejs.py:L259-L264`） 定义了 `_iter_script_sources` 的顺序：
+
+```
+PYPACKAGE → CACHE → BUILTIN → WEB
+```
+
+| 来源 | `ScriptSource` 枚举值 | 触发条件 | 是否需要代理 |
+|------|----------------------|---------|-------------|
+| **PYPACKAGE** | `python package` | 已安装 `yt_dlp_ejs` PyPI 包 | ❌ 不需要（从本地 Python 包读取） |
+| **CACHE** | `cache` | 之前从 WEB 下载过且已缓存到磁盘 | ❌ 不需要（从 yt-dlp 本地 cache 读取） |
+| **BUILTIN** | `builtin` | yt-dlp 发行版内置 vendored 脚本 | ❌ 不需要（从包资源读取） |
+| **WEB** | `web` | 用户启用了 `--remote-components ejs:github` | ✅ **需要**（从 GitHub Release 下载） |
+
+每个来源返回一个 `Script` 对象（含 code、version、variant、source），通过 `hashlib.sha3_512(code.encode())` 计算哈希与 `_ALLOWED_HASHES` 白名单对比校验，未通过则继续尝试下一来源。
+
+#### 5.3.2 PYPACKAGE 源：本地 Python 包读取
+
+ejs.py#L266-L275（`yt_dlp/extractor/youtube/jsc/_builtin/ejs.py:L266-L275`）：
+
+```python
+def _pypackage_source(self, script_type: ScriptType, /) -> Script | None:
+    if not _has_ejs:
+        return None
+    try:
+        code = yt_dlp_ejs.yt.solver.core() if script_type is ScriptType.CORE else yt_dlp_ejs.yt.solver.lib()
+    except Exception as e:
+        self.logger.warning(f'Failed to load ... from python package: {e}')
+        return None
+    return Script(script_type, ScriptVariant.MINIFIED, ScriptSource.PYPACKAGE, yt_dlp_ejs.version, code)
+```
+
+直接从已安装的 `yt_dlp_ejs` 包中调用函数获取代码字符串。**无网络请求，不走任何代理路径**。
+
+#### 5.3.3 CACHE 源：本地磁盘缓存读取
+
+ejs.py#L277-L280（`yt_dlp/extractor/youtube/jsc/_builtin/ejs.py:L277-L280`）：
+
+```python
+def _cached_source(self, script_type: ScriptType, /) -> Script | None:
+    if data := self.ie.cache.load(self._CACHE_SECTION, script_type.value):
+        return Script(script_type, ScriptVariant(data['variant']), ScriptSource.CACHE, data['version'], data['code'])
+    return None
+```
+
+从 yt-dlp 本地缓存（`_CACHE_SECTION = 'challenge-solver'`）读取之前 WEB 源下载成功后存入的 `{version, variant, code}`。**无网络请求，不走任何代理路径**。
+
+若版本不匹配（minor version 不符）或哈希校验失败，会主动清空缓存（ejs.py#L228-L244（`yt_dlp/extractor/youtube/jsc/_builtin/ejs.py:L228-L244`））：
+
+```python
+if source is ScriptSource.CACHE:
+    self.logger.debug('Clearing outdated cached script')
+    self.ie.cache.store(self._CACHE_SECTION, script_type.value, None)
+```
+
+#### 5.3.4 BUILTIN 源：包内 vendored 资源读取
+
+ejs.py#L282-L289（`yt_dlp/extractor/youtube/jsc/_builtin/ejs.py:L282-L289`）：
+
+```python
+def _builtin_source(self, script_type: ScriptType, /) -> Script | None:
+    error_hook = lambda _: self.logger.warning(f'Failed to read builtin ... script')
+    code = vendor.load_script(self._SCRIPT_FILENAMES[script_type], error_hook=error_hook)
+    if code:
+        return Script(script_type, ScriptVariant.UNMINIFIED, ScriptSource.BUILTIN, self._SCRIPT_VERSION, code)
+    return None
+```
+
+从 `yt_dlp/extractor/youtube/jsc/_builtin/vendor/` 目录读取 vendored 脚本。**无网络请求，不走任何代理路径**。
+
+注意返回的 variant 是 `ScriptVariant.UNMINIFIED`，因为 vendored 目录下的是未压缩版本。
+
+#### 5.3.5 WEB 源：从 GitHub Release 下载（需要代理）
+
+ejs.py#L291-L305（`yt_dlp/extractor/youtube/jsc/_builtin/ejs.py:L291-L305`）：
+
+```python
+def _web_release_source(self, script_type: ScriptType, /):
+    if 'ejs:github' not in (self.ie.get_param('remote_components') or ()):
+        return self._skip_component('ejs:github')
+    url = f'https://github.com/{self._REPOSITORY}/releases/download/{self._SCRIPT_VERSION}/{self._MIN_SCRIPT_FILENAMES[script_type]}'
+    if code := self.ie._download_webpage_with_retries(
+        url, None, f'[{self.logger.prefix}] Downloading challenge solver {script_type.value} script from  {url}',
+        f'[{self.logger.prefix}] Failed to download challenge solver {script_type.value} script', fatal=False,
+    ):
+        self.ie.cache.store(self._CACHE_SECTION, script_type.value, {
+            'version': self._SCRIPT_VERSION,
+            'variant': ScriptVariant.MINIFIED.value,
+            'code': code,
+        })
+        return Script(script_type, ScriptVariant.MINIFIED, ScriptSource.WEB, self._SCRIPT_VERSION, code)
+    return None
+```
+
+**完整代理路径**：
+
+```
+用户启用 --remote-components ejs:github
+        │
+        ▼
+_web_release_source()
+        │
+        ▼
+self.ie._download_webpage_with_retries(url, ...)
+        │  走 extractor 常规下载路径
+        ▼
+YoutubeDL.urlopen(req)
+        │  req.proxies 默认为空，headers 中没有地理验证代理头
+        ▼
+clean_proxies(req.proxies, req.headers)
+        │
+        ▼
+内置网络栈 → 正常代理流程
+```
+
+由于使用了 `_download_webpage_with_retries` → `_request_webpage` → `_create_request` → `YoutubeDL.urlopen` 的完整 extractor 下载链路，WEB 源下载会走 yt-dlp 的内置网络栈：全局 `--proxy` 与系统环境变量代理会生效；但这条 GitHub Release 请求本身没有注入 `geo_verification_headers()`，所以不会自动使用 `--geo-verification-proxy`。下载成功后代码存入本地 cache，下次直接走 CACHE 源不再需要网络。
+
+#### 5.3.6 脚本加载源的代理路径对比表
+
+| 来源 | 网络请求 | 代理参与 | 代理来源 |
+|------|---------|---------|---------|
+| PYPACKAGE | ❌ | ❌ | — |
+| CACHE | ❌ | ❌ | — |
+| BUILTIN | ❌ | ❌ | — |
+| WEB | ✅ GitHub HTTPS | ✅ | 内置网络栈代理（全局 `--proxy`、系统环境变量；默认不含地理验证代理） |
+
+### 5.4 PoToken 缓存键如何纳入代理信息
+
+PoToken 的缓存设计明确将「代理」作为缓存隔离的一部分，避免不同出口 IP（不同代理）获取的 PoToken 在另一个出口 IP 下使用时报错。
+
+#### 5.4.1 缓存键生成流程
+
+缓存键在 pot/_director.py#L149-L151（`yt_dlp/extractor/youtube/pot/_director.py:L149-L151`） 生成：
+
+```python
+def _generate_key(self, bindings: dict) -> str:
+    binding_string = ''.join(repr(dict(sorted(bindings.items()))))
+    return hashlib.sha256(binding_string.encode()).hexdigest()
+```
+
+所有 key_bindings 先按 key 字母排序后转 repr 字符串，再做 SHA-256 哈希，得到固定长度的缓存键。
+
+#### 5.4.2 `WebPoPCSP` 的 key_bindings（含代理字段）
+
+唯一内置的缓存规范提供者是 webpo_cachespec.py#L17-L48（`yt_dlp/extractor/youtube/pot/_builtin/webpo_cachespec.py:L17-L48`）：
+
+```python
+@register_spec
+class WebPoPCSP(PoTokenCacheSpecProvider, BuiltinIEContentProvider):
+    PROVIDER_NAME = 'webpo'
+
+    def generate_cache_spec(self, request: PoTokenRequest) -> PoTokenCacheSpec | None:
+        ...
+        return PoTokenCacheSpec(
+            key_bindings={
+                't': 'webpo',                                   # 类型标记
+                'cb': content_binding,                          # 内容绑定（visitor_id 或 video_id）
+                'cbt': content_binding_type.value,              # 绑定类型：visitor / video
+                'ip': traverse_obj(request.innertube_context, ('client', 'remoteHost')),  # 客户端出口 IP
+                'sa': request.request_source_address,           # 源地址绑定（--source-address）
+                'px': request.request_proxy,                    # ← 代理 URL 字符串
+            },
+            default_ttl=21600,    # 6 小时
+            write_policy=write_policy,
+        )
+```
+
+**代理信息以三个维度纳入缓存隔离**：
+
+| 字段 | key | 来源 | 含义 |
+|------|-----|------|------|
+| 代理 URL | `px` | `PoTokenRequest.request_proxy`（即 `select_proxy('https://www.youtube.com', YoutubeDL.proxies)` 的结果） | 完整代理 URL 字符串，含 scheme、user:pass、host、port。不同代理 → 不同缓存键 |
+| 源地址 | `sa` | `PoTokenRequest.request_source_address`（即 `YoutubeDL.params['source_address']`） | `--source-address` 绑定的出站 IP。不同出站 IP → 不同缓存键 |
+| 远程 IP | `ip` | `request.innertube_context.client.remoteHost` | YouTube 端看到的客户端出口 IP（从 innertube API 返回）。即使代理相同，若出口 IP 不同（如轮询代理池），缓存也会隔离 |
+
+这样保证了：换代理、换出口 IP、换源地址时，旧缓存不会被误命中，避免 YouTube 因「PoToken 的签发 IP 与当前请求 IP 不匹配」而拒绝。
+
+#### 5.4.3 `_generate_key_bindings` 的额外处理
+
+`yt_dlp/extractor/youtube/pot/_director.py:L138-L147` 在生成缓存键前对 bindings 做了清洗和补充：
+
+```python
+def _generate_key_bindings(self, spec: PoTokenCacheSpec) -> dict[str, str]:
+    bindings_cleaned = {
+        **{k: v for k, v in spec.key_bindings.items() if v is not None},   # 过滤 None 值
+        '_dlp_cache': 'v1',                                                # 缓存版本号
+    }
+    if spec._provider:
+        bindings_cleaned['_p'] = spec._provider.PROVIDER_KEY               # 规范提供者标识（'webpo'）
+    return bindings_cleaned
+```
+
+过滤 `None` 值意味着：如果没设代理（`request_proxy=None`），`px` 字段不会出现在 bindings 中；如果后来设了代理，`px` 就会出现 → 排序后的 repr 字符串不同 → 哈希不同 → 缓存键不同。
+
+#### 5.4.4 PoToken 缓存键生成示例
+
+| 场景 | `px` | `sa` | `ip` | 缓存键（SHA-256）是否相同 |
+|------|------|------|------|---------------------------|
+| 无代理，无 source-address | None | None | '1.2.3.4' | ✅ |
+| `--proxy http://a:8080` | 'http://a:8080' | None | '5.6.7.8' | ❌ 不同 |
+| `--proxy http://b:8080` | 'http://b:8080' | None | '9.9.9.9' | ❌ 不同 |
+| 相同代理，同 session 同 visitor | 'http://a:8080' | None | '5.6.7.8' | ✅ 相同（缓存命中） |
+| 相同代理，出口 IP 变了（代理池） | 'http://a:8080' | None | '5.6.7.9' | ❌ 不同（缓存隔离） |
+| `--source-address 10.0.0.1` | None | '10.0.0.1' | '1.2.3.4' | ❌ 不同 |
+
+### 5.5 外部下载器的代理路径
 
 外部下载器（ffmpeg、aria2c、curl、wget 等）是独立的系统进程，代理通过**命令行参数**或**环境变量**注入。
 
-#### 5.3.1 curl：`--proxy` 命令行参数
+#### 5.5.1 curl：`--proxy` 命令行参数
 
 external.py#L215-L249（`yt_dlp/downloader/external.py:L215-L249`） 的 `CurlFD._make_cmd`：
 
@@ -674,7 +884,7 @@ cmd += self._option('--proxy', 'proxy')
 
 `self._option('--proxy', 'proxy')` 读取 `self.params['proxy']`（即 `YoutubeDL.params['proxy']`，原始 `--proxy` 参数值），如果存在则生成 `['--proxy', '<URL>']`。curl 原生支持 HTTP/HTTPS/SOCKS 代理。
 
-#### 5.3.2 aria2c：`--all-proxy` 命令行参数
+#### 5.5.2 aria2c：`--all-proxy` 命令行参数
 
 external.py#L312-L348（`yt_dlp/downloader/external.py:L312-L348`） 的 `Aria2cFD._make_cmd`：
 
@@ -684,7 +894,7 @@ cmd += self._option('--all-proxy', 'proxy')
 
 同样读取 `self.params['proxy']`，生成 `['--all-proxy', '<URL>']`。aria2c 的 `--all-proxy` 对所有协议生效。
 
-#### 5.3.3 wget：`--execute http_proxy=...` 命令行参数
+#### 5.5.3 wget：`--execute http_proxy=...` 命令行参数
 
 external.py#L281-L301（`yt_dlp/downloader/external.py:L281-L301`） 的 `WgetFD._make_cmd`：
 
@@ -697,7 +907,7 @@ if proxy:
 
 wget 没有统一的 `--proxy` 参数，而是通过 `--execute http_proxy=...` 和 `--execute https_proxy=...` 分别设置。同一代理值同时设给两者。
 
-#### 5.3.4 ffmpeg：环境变量注入
+#### 5.5.4 ffmpeg：环境变量注入
 
 external.py#L411-L428（`yt_dlp/downloader/external.py:L411-L428`） 的 `FFmpegFD._call_downloader`：
 
@@ -722,12 +932,12 @@ ffmpeg 的代理注入方式最特殊：
 4. 通过 `Popen(env=env)` 设置 `HTTP_PROXY` + `http_proxy` 环境变量
 5. 代码注释指出 ffmpeg 已支持 `-http_proxy` 选项，但版本检测尚未实现
 
-#### 5.3.5 HttpieFD / AxelFD：无显式代理注入
+#### 5.5.5 HttpieFD / AxelFD：无显式代理注入
 
 - `yt_dlp/downloader/external.py:L351-L369`：`_make_cmd` 中不传任何代理参数
 - `yt_dlp/downloader/external.py:L262-L275`：同上
 
-#### 5.3.6 外部下载器代理来源差异
+#### 5.5.6 外部下载器代理来源差异
 
 | 下载器 | 代理来源 | 传递方式 | SOCKS 支持 |
 |-------|---------|---------|-----------|
@@ -848,6 +1058,29 @@ ffmpeg 的代理注入方式最特殊：
                 │
                 ▼
    外部进程通过环境变量使用代理
+
+  【JS 挑战求解脚本加载】
+  PYPACKAGE (yt_dlp_ejs) → 本地 Python 包函数调用，无网络
+  CACHE (yt-dlp cache)  → 磁盘读取，无网络
+  BUILTIN (vendor dir)  → 包资源读取，无网络
+  WEB (GitHub Release)  → _download_webpage_with_retries()
+                            → YoutubeDL.urlopen() → 内置网络栈（全局/环境代理）
+                            → 成功后存入 CACHE
+
+  【PoToken 缓存键（代理信息纳入隔离）】
+  PoTokenRequest
+   │  .request_proxy           → px
+   │  .request_source_address  → sa
+   │  .innertube_context.client.remoteHost → ip
+   ▼
+  WebPoPCSP.generate_cache_spec()
+   → key_bindings {t, cb, cbt, ip, sa, px}
+   → _generate_key_bindings()   过滤 None + 加 _dlp_cache + _p
+   → _generate_key()            SHA-256(排序后的 repr 字符串)
+   → 缓存键
+         │
+         ├──► cache.get(cache_key)   命中直接返回
+         └──► cache.store(cache_key, response)
 
   【外部下载器】
   YoutubeDL.params['proxy']  ← 原始 --proxy 参数，不经 YoutubeDL.proxies
