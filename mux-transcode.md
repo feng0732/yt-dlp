@@ -18,15 +18,18 @@ CLI 参数解析
 FFmpeg 外部工具调用 (real_run_ffmpeg)
     ↓
 产物替换与信息更新 (filepath/ext/__files_to_move)
+    ↓
+文件搬移与最终落盘 (MoveFilesAfterDownloadPP)
 ```
 
-**关键代码入口文件：**
-- 主流程调度：[YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py)
-- 后处理器基类：[postprocessor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/common.py)
-- FFmpeg 系列后处理器：[postprocessor/ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py)
-- 后处理器注册：[postprocessor/__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/__init__.py)
-- CLI 参数转后处理器配置：[__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/__init__.py#L627-L729)
-- FFmpeg 直接下载合并：[downloader/external.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/downloader/external.py#L372-L571)
+**关键代码入口文件（仓库内路径）：**
+- 主流程调度：[YoutubeDL.py](yt_dlp/YoutubeDL.py)
+- 后处理器基类：[postprocessor/common.py](yt_dlp/postprocessor/common.py)
+- FFmpeg 系列后处理器：[postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py)
+- 后处理器注册：[postprocessor/__init__.py](yt_dlp/postprocessor/__init__.py)
+- 文件搬移 PP：[postprocessor/movefilesafterdownload.py](yt_dlp/postprocessor/movefilesafterdownload.py)
+- CLI 参数转后处理器配置：[__init__.py](yt_dlp/__init__.py#L627-L729)
+- FFmpeg 直接下载合并：[downloader/external.py](yt_dlp/downloader/external.py#L372-L571)
 
 ---
 
@@ -56,7 +59,7 @@ POSTPROCESS_WHEN = ('pre_process', 'after_filter', 'video', 'before_dl',
 
 ### 2.2 CLI 参数如何转化为后处理器
 
-在 [yt_dlp/__init__.py:627-729](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/__init__.py#L627-L729) 的 `get_postprocessors()` 函数中，命令行参数被转化为后处理器配置字典列表。
+在 [yt_dlp/__init__.py:627-729](yt_dlp/__init__.py#L627-L729) 的 `get_postprocessors()` 函数中，命令行参数被转化为后处理器配置字典列表。
 
 **核心映射关系：**
 
@@ -83,7 +86,7 @@ POSTPROCESS_WHEN = ('pre_process', 'after_filter', 'video', 'before_dl',
 
 ### 2.3 后处理器实例化与注册
 
-在 [YoutubeDL.py:827-834](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L827-L834) 中，配置字典被实例化为后处理器对象：
+在 [YoutubeDL.py:827-834](yt_dlp/YoutubeDL.py#L827-L834) 中，配置字典被实例化为后处理器对象：
 
 ```python
 for pp_def_raw in self.params.get('postprocessors', []):
@@ -94,8 +97,8 @@ for pp_def_raw in self.params.get('postprocessors', []):
         when=when)
 ```
 
-- `get_postprocessor(key)` → [postprocessor/__init__.py:51-52](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/__init__.py#L51-L52)：从全局注册表查找 `key + 'PP'` 对应的类
-- `add_post_processor(pp, when)` → [YoutubeDL.py:942-946](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L942-L946)：将 PP 加入 `self._pps[when]` 列表
+- `get_postprocessor(key)` → [postprocessor/__init__.py:51-52](yt_dlp/postprocessor/__init__.py#L51-L52)：从全局注册表查找 `key + 'PP'` 对应的类
+- `add_post_processor(pp, when)` → [YoutubeDL.py:942-946](yt_dlp/YoutubeDL.py#L942-L946)：将 PP 加入 `self._pps[when]` 列表
 
 ---
 
@@ -105,7 +108,7 @@ for pp_def_raw in self.params.get('postprocessors', []):
 
 当用户的格式选择器（`-f` 参数）选择了**多个需要组合的格式**时（例如 `bestvideo+bestaudio`），格式选择系统会生成一个包含 `requested_formats` 字段的 info_dict。
 
-**关键代码：** [YoutubeDL.py:2450-2522](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L2450-L2522) 的 `_merge()` 函数
+**关键代码：** [YoutubeDL.py:2450-2522](yt_dlp/YoutubeDL.py#L2450-L2522) 的 `_merge()` 函数
 
 ```python
 def _merge(formats_pair):
@@ -136,7 +139,7 @@ def _merge(formats_pair):
 
 ### 3.2 输出容器兼容性判定
 
-`get_compatible_ext()` → [_utils.py:3088-3126](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/utils/_utils.py#L3088-L3126)
+`get_compatible_ext()` → [utils/_utils.py:3088-3126](yt_dlp/utils/_utils.py#L3088-L3126)
 
 判定规则（按优先级）：
 1. **多流场景**：如果音频或视频流数量 >1，且 `mkv` 在偏好中 → 直接返回 `mkv`（唯一支持多轨的格式）
@@ -170,7 +173,7 @@ def _merge(formats_pair):
                           (将独立文件合成为一个)
 ```
 
-**路径判断代码：** [YoutubeDL.py:3482-3569](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L3482-L3569)
+**路径判断代码：** [YoutubeDL.py:3482-3569](yt_dlp/YoutubeDL.py#L3482-L3569)
 
 ### 4.2 路径 A：FFmpegFD 直接合并下载
 
@@ -187,7 +190,7 @@ FFmpegFD.can_merge_formats(info_dict, params) = (
 )
 ```
 
-**FFmpegFD 合并实现：** [downloader/external.py:395-571](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/downloader/external.py#L395-L571)
+**FFmpegFD 合并实现：** [downloader/external.py:395-571](yt_dlp/downloader/external.py#L395-L571)
 
 核心参数构建：
 ```python
@@ -211,7 +214,7 @@ args += ['-c', 'copy']
 
 当 FFmpegFD 无法直接合并（协议不支持、需要特殊下载器等）时：
 
-1. **为每个格式分配独立文件名** [YoutubeDL.py:3519-3524](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L3519-L3524)：
+1. **为每个格式分配独立文件名** [YoutubeDL.py:3519-3524](yt_dlp/YoutubeDL.py#L3519-L3524)：
 ```python
 for f in info_dict['requested_formats']:
     f['filepath'] = fname = prepend_extension(
@@ -223,7 +226,7 @@ for f in info_dict['requested_formats']:
 
 2. **逐个格式下载**：循环调用 `self.dl(fname, new_info)`
 
-3. **注册合并后处理器** [YoutubeDL.py:3565-3567](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L3565-L3567)：
+3. **注册合并后处理器** [YoutubeDL.py:3565-3567](yt_dlp/YoutubeDL.py#L3565-L3567)：
 ```python
 if downloaded and merger.available and not self.params.get('allow_unplayable_formats'):
     info_dict['__postprocessors'].append(merger)       # 加入额外 PP 列表
@@ -238,7 +241,7 @@ if downloaded and merger.available and not self.params.get('allow_unplayable_for
 
 ### 5.1 入口：post_process() 方法
 
-[YoutubeDL.py:3839-3846](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L3839-L3846)
+[YoutubeDL.py:3839-3846](yt_dlp/YoutubeDL.py#L3839-L3846)
 
 ```python
 def post_process(self, filename, info, files_to_move=None):
@@ -256,7 +259,7 @@ def post_process(self, filename, info, files_to_move=None):
 
 ### 5.2 run_all_pps() - 批量调度
 
-[YoutubeDL.py:3821-3826](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L3821-L3826)
+[YoutubeDL.py:3821-3826](yt_dlp/YoutubeDL.py#L3821-L3826)
 
 ```python
 def run_all_pps(self, key, info, *, additional_pps=None):
@@ -270,7 +273,7 @@ def run_all_pps(self, key, info, *, additional_pps=None):
 
 ### 5.3 run_pp() - 单个后处理器执行
 
-[YoutubeDL.py:3798-3819](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3819)
+[YoutubeDL.py:3798-3819](yt_dlp/YoutubeDL.py#L3798-L3819)
 
 ```python
 def run_pp(self, pp, infodict):
@@ -302,7 +305,7 @@ def run_pp(self, pp, infodict):
 
 ### 5.4 PostProcessor 元类：自动进度钩子
 
-[common.py:16-33](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/common.py#L16-L33)
+[common.py:16-33](yt_dlp/postprocessor/common.py#L16-L33)
 
 所有 PP 的 `run()` 方法被 `PostProcessorMetaClass.run_wrapper` 自动包装：
 - 执行前 → 触发 `_hook_progress({'status': 'started'})`
@@ -314,7 +317,7 @@ def run_pp(self, pp, infodict):
 
 ### 6.1 FFmpegPostProcessor 初始化
 
-[ffmpeg.py:86-198](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L86-L198)
+[ffmpeg.py:86-198](yt_dlp/postprocessor/ffmpeg.py#L86-L198)
 
 ```python
 class FFmpegPostProcessor(PostProcessor):
@@ -323,7 +326,7 @@ class FFmpegPostProcessor(PostProcessor):
         self._paths = self._determine_executables()  # 确定 ffmpeg/ffprobe 路径
 ```
 
-**可执行文件定位逻辑** `_determine_executables()` [ffmpeg.py:102-128](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L102-L128)：
+**可执行文件定位逻辑** `_determine_executables()` [ffmpeg.py:102-128](yt_dlp/postprocessor/ffmpeg.py#L102-L128)：
 1. 优先使用 `--ffmpeg-location` 参数
 2. 如果是目录 → 拼接 `ffmpeg.exe` / `ffprobe.exe`
 3. 如果是文件（如指定了 `custom-ffmpeg.exe`）→ 将 basename 替换为对应程序名
@@ -331,7 +334,7 @@ class FFmpegPostProcessor(PostProcessor):
 
 ### 6.2 核心调用方法：real_run_ffmpeg()
 
-[ffmpeg.py:326-364](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L326-L364)
+[ffmpeg.py:326-364](yt_dlp/postprocessor/ffmpeg.py#L326-L364)
 
 ```python
 def real_run_ffmpeg(self, input_path_opts, output_path_opts, *, expected_retcodes=(0,)):
@@ -371,7 +374,7 @@ def real_run_ffmpeg(self, input_path_opts, output_path_opts, *, expected_retcode
 
 ### 6.3 通用流复制参数：stream_copy_opts()
 
-[ffmpeg.py:212-221](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L212-L221)
+[ffmpeg.py:212-221](yt_dlp/postprocessor/ffmpeg.py#L212-L221)
 
 ```python
 @staticmethod
@@ -398,7 +401,7 @@ def stream_copy_opts(copy=True, *, ext=None):
 
 ### 7.1 FFmpegMergerPP：格式合并（混流）
 
-**代码位置：** [ffmpeg.py:822-847](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L822-L847)
+**代码位置：** [ffmpeg.py:822-847](yt_dlp/postprocessor/ffmpeg.py#L822-L847)
 
 **触发条件：** `info_dict['requested_formats']` 存在且文件已独立下载完成
 
@@ -447,7 +450,7 @@ ffmpeg -y -i title.f137.mp4 -i title.f140.m4a \
 
 ### 7.2 FFmpegVideoRemuxerPP：容器重封装（无损）
 
-**代码位置：** [ffmpeg.py:573-578](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L573-L578)
+**代码位置：** [ffmpeg.py:573-578](yt_dlp/postprocessor/ffmpeg.py#L573-L578)
 
 **用途：** 更改容器格式但不重新编码（如 webm → mkv，avi → mp4）  
 **CLI 参数：** `--remux-video FORMAT`（支持映射规则 `aac>m4a/mov>mp4/mkv`）
@@ -464,7 +467,7 @@ class FFmpegVideoRemuxerPP(FFmpegVideoConvertorPP):
 
 ### 7.3 FFmpegVideoConvertorPP：视频转码（重编码）
 
-**代码位置：** [ffmpeg.py:538-570](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L538-L570)
+**代码位置：** [ffmpeg.py:538-570](yt_dlp/postprocessor/ffmpeg.py#L538-L570)
 
 **用途：** 完全重新编码视频（如任何格式 → mp4/h264/aac）  
 **CLI 参数：** `--recode-video FORMAT`
@@ -498,7 +501,7 @@ class FFmpegVideoConvertorPP(FFmpegPostProcessor):
 
 ### 7.4 FFmpegExtractAudioPP：音频提取与转换
 
-**代码位置：** [ffmpeg.py:432-535](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L432-L535)
+**代码位置：** [ffmpeg.py:432-535](yt_dlp/postprocessor/ffmpeg.py#L432-L535)
 
 **CLI 参数：** `-x/--extract-audio`, `--audio-format`, `--audio-quality`
 
@@ -524,9 +527,17 @@ information['ext'] = extension
 return [orig_path], information    # .orig 加入删除列表
 ```
 
+**保留/覆盖判断（nopostoverwrites）：** [ffmpeg.py:517-520](yt_dlp/postprocessor/ffmpeg.py#L517-L520)
+```python
+if (self._nopostoverwrites and os.path.exists(new_path)
+        and os.path.exists(orig_path)):
+    self.to_screen(f'Post-process file {new_path} exists, skipping')
+    return [], information
+```
+
 ### 7.5 Fixup 系列后处理器：自动修复常见问题
 
-**代码位置：** [ffmpeg.py:850-937](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L850-L937)
+**代码位置：** [ffmpeg.py:850-937](yt_dlp/postprocessor/ffmpeg.py#L850-L937)
 
 这些 PP 由 `process_info()` 中的 `fixup()` 函数**动态注册**到 `info_dict['__postprocessors']`：
 
@@ -552,16 +563,19 @@ return [orig_path], information    # .orig 加入删除列表
   {filepath: 'title.f137.mp4', ext: 'mp4', requested_formats: [...], ...}
       │
       ▼ FFmpegMergerPP.run()
-  {filepath: 'title.mp4', ext: 'mp4', __files_to_merge 被删除, ...}
+  {filepath: 'title.temp/title.mp4', ext: 'mp4', __files_to_merge 被删除, ...}
       │
       ▼ FFmpegVideoConvertorPP.run()
-  {filepath: 'title.mp4', ext: 'mp4', ...} → 不变 (已是mp4)
+  {filepath: 'title.temp/title.mp4', ext: 'mp4', ...} → 不变 (已是mp4)
       │
       ▼ FFmpegEmbedSubtitlePP.run()
-  {filepath: 'title.mp4', ...} → 内部替换 temp，内容变了路径不变
+  {filepath: 'title.temp/title.mp4', ...} → 内部替换 temp，内容变了路径不变
       │
       ▼ FFmpegExtractAudioPP.run()
-  {filepath: 'title.mp3', ext: 'mp3', ...} → 路径和扩展名都更新
+  {filepath: 'title.temp/title.mp3', ext: 'mp3', ...} → 路径和扩展名都更新
+      │
+      ▼ MoveFilesAfterDownloadPP.run()
+  {filepath: 'downloads/title.mp3', ext: 'mp3', ...} → 最终落盘路径
 ```
 
 **关键更新字段：**
@@ -582,7 +596,7 @@ return [orig_path], information    # .orig 加入删除列表
 - **`files_to_delete`**：被替换/废弃的中间文件列表
 - **返回 `[]`**：不删除任何文件（原文件继续保留/被后续使用）
 
-**是否实际删除由 `run_pp()` 根据 `-k/--keepvideo` 参数决定：**
+**是否实际删除由 `run_pp()` 根据 `-k/--keepvideo` 参数决定：** [YoutubeDL.py:3798-3819](yt_dlp/YoutubeDL.py#L3798-L3819)
 ```python
 if self.params.get('keepvideo', False):
     # -k 参数：将待删除文件加入 __files_to_move (最终会保留)
@@ -590,7 +604,22 @@ if self.params.get('keepvideo', False):
         infodict['__files_to_move'].setdefault(f, '')
 else:
     # 默认行为: 物理删除中间文件
-    self._delete_downloaded_files(*files_to_delete, ...)
+    self._delete_downloaded_files(*files_to_delete, info=infodict, ...)
+```
+
+**删除实现：** `_delete_downloaded_files()` [YoutubeDL.py:3774-3783](yt_dlp/YoutubeDL.py#L3774-L3783)
+```python
+def _delete_downloaded_files(self, *files_to_delete, info={}, msg=None):
+    for filename in set(filter(None, files_to_delete)):
+        if msg:
+            self.to_screen(msg % filename)
+        try:
+            os.remove(filename)
+        except OSError:
+            self.report_warning(f'Unable to delete file {filename}')
+        # 重要：从移动映射表中删除已删除的文件
+        if filename in info.get('__files_to_move', []):
+            del info['__files_to_move'][filename]
 ```
 
 ### 8.3 原子替换模式
@@ -612,14 +641,262 @@ Step 2: 原子替换 (os.replace / os.rename)
 
 ---
 
-## 九、完整调用链路图
+## 九、阶段六：文件搬移、覆盖与保留行为深度解析
 
-### 9.1 单个视频处理的完整链路
+### 9.1 `__files_to_move` 完整生命周期
+
+`__files_to_move` 是一个字典 `{源路径: 目标路径}`，贯穿整个后处理流程：
+
+```
+┌─ 初始化: process_info() [YoutubeDL.py:3361]
+│    files_to_move = {}
+│
+├─ 初始填充（下载前辅助文件）:
+│    ├─ 字幕文件: files_to_move.update(dict(sub_files)) [L3389]
+│    ├─ 缩略图: files_to_move.update(dict(thumb_files)) [L3395]
+│    └─ info.json: 直接写入最终目录，不经过 temp
+│
+├─ before_dl 阶段后处理:
+│    pre_process(info_dict, 'before_dl', files_to_move) [L3449]
+│    各 PP 可以修改 __files_to_move
+│
+├─ 下载后动态追加（多格式场景）:
+│    若合并后处理器未注册（ffmpeg 不可用等）:
+│        for file in downloaded:
+│            files_to_move[file] = None  # 保留中间文件
+│
+├─ post_process 入口:
+│    info['__files_to_move'] = files_to_move  [L3841]
+│
+├─ -k/--keepvideo 保留策略（run_pp 中）:
+│    if keepvideo:
+│        for f in files_to_delete:
+│            __files_to_move.setdefault(f, '')  # 待删除文件转为保留
+│
+├─ post_process 完成后（进入 MoveFilesAfterDownloadPP 前）:
+│    MoveFilesAfterDownloadPP._downloaded = True:
+│        info['__files_to_move'][info['filepath']] = finalpath  [L25-26]
+│        加入主文件的移动映射
+│
+├─ MoveFilesAfterDownloadPP.run() 执行搬移:
+│    遍历 __files_to_move.items(), 逐个 shutil.move
+│
+└─ post_process 清理:
+     del info['__files_to_move']  [L3844]
+```
+
+### 9.2 MoveFilesAfterDownloadPP 核心实现
+
+**代码位置：** [movefilesafterdownload.py:11-53](yt_dlp/postprocessor/movefilesafterdownload.py#L11-L53)
+
+```python
+class MoveFilesAfterDownloadPP(PostProcessor):
+    def __init__(self, downloader=None, downloaded=True):
+        PostProcessor.__init__(self, downloader)
+        self._downloaded = downloaded  # 是否需要添加主文件到移动列表
+
+    def run(self, info):
+        dl_path, dl_name = os.path.split(info['filepath'])
+        finaldir = info.get('__finaldir', dl_path)  # 目标目录（--paths 参数）
+        finalpath = os.path.join(finaldir, dl_name)
+        
+        # _downloaded=True 时，把当前处理的主文件加入移动列表
+        if self._downloaded:
+            info['__files_to_move'][info['filepath']] = finalpath
+        
+        make_newfilename = lambda old: os.path.join(finaldir, os.path.basename(old))
+        for oldfile, newfile in info['__files_to_move'].items():
+            # value 为 None/空字符串时，自动生成目标路径（同文件名，仅换目录）
+            if not newfile:
+                newfile = make_newfilename(oldfile)
+            
+            # 源和目标相同，跳过
+            if os.path.abspath(oldfile) == os.path.abspath(newfile):
+                continue
+            
+            # 源文件不存在，警告跳过
+            if not os.path.exists(oldfile):
+                self.report_warning(f'File "{oldfile}" cannot be found')
+                continue
+            
+            # ============= 覆盖逻辑核心 =============
+            if os.path.exists(newfile):
+                if self.get_param('overwrites', True):
+                    # 允许覆盖: 先删除目标
+                    self.report_warning(f'Replacing existing file "{newfile}"')
+                    os.remove(newfile)
+                else:
+                    # 不允许覆盖: 跳过并警告，文件留在 temp 目录
+                    self.report_warning(
+                        f'Cannot move file "{oldfile}" out of temporary directory since "{newfile}" already exists. ')
+                    continue
+            # =====================================
+            
+            # 创建目录
+            try:
+                make_parent_dirs(newfile)
+            except OSError as e:
+                raise PostProcessingError(f'Unable to create directory: {e}') from e
+            
+            # 执行移动 (shutil.move 支持跨卷)
+            self.to_screen(f'Moving file "{oldfile}" to "{newfile}"')
+            shutil.move(oldfile, newfile)
+        
+        # 更新最终产物路径
+        info['filepath'] = finalpath
+        return [], info
+```
+
+### 9.3 三种保留/覆盖控制参数对比
+
+| 参数 | 级别 | 作用阶段 | 行为 | 代码位置 |
+|------|------|---------|------|---------|
+| **`keepvideo` (`-k`)** | 后处理 | 每个 PP 完成后 | `files_to_delete` 不删除，转为 `__files_to_move` 保留 | [YoutubeDL.py:3791-3794](yt_dlp/YoutubeDL.py#L3791-L3794) |
+| **`overwrites`** | 全局 | 文件搬移 + 下载前 | `True`(默认): 覆盖已存在文件；`False`: 跳过已存在文件 | [YoutubeDL.py:291-293](yt_dlp/YoutubeDL.py#L291-L293) |
+| **`nopostoverwrites`** | ExtractAudio | 音频转换前 | `new_path` 和 `orig_path` 都存在时跳过 | [ffmpeg.py:517-520](yt_dlp/postprocessor/ffmpeg.py#L517-L520) |
+
+### 9.4 `overwrites` 参数的完整影响
+
+**代码位置：** [YoutubeDL.py:291-293](yt_dlp/YoutubeDL.py#L291-L293)
+```python
+overwrites:        Overwrite all video and metadata files if True,
+                   overwrite only non-video files if None
+                   and don't overwrite any file if False
+```
+
+#### 9.4.1 下载前覆盖检查
+
+**existing_file()** [YoutubeDL.py:3320-3328](yt_dlp/YoutubeDL.py#L3320-L3328)：
+```python
+def existing_file(self, filepaths, *, default_overwrite=True):
+    existing_files = list(filter(os.path.exists, orderedSet(filepaths)))
+    # overwrites=False: 返回第一个已存在文件 → 触发"已下载"跳过逻辑
+    if existing_files and not self.params.get('overwrites', default_overwrite):
+        return existing_files[0]
+    # overwrites=True(默认): 直接删除已存在文件，允许重新下载
+    for file in existing_files:
+        self.report_file_delete(file)
+        os.remove(file)
+    return None
+```
+
+#### 9.4.2 文件搬移覆盖检查
+
+**MoveFilesAfterDownloadPP.run()** [movefilesafterdownload.py:37-44](yt_dlp/postprocessor/movefilesafterdownload.py#L37-L44)：
+```python
+if os.path.exists(newfile):
+    if self.get_param('overwrites', True):
+        self.report_warning(f'Replacing existing file "{newfile}"')
+        os.remove(newfile)
+    else:
+        # 文件保留在 temp 目录，不移动
+        self.report_warning(f'Cannot move file "{oldfile}" out of temporary directory since "{newfile}" already exists.')
+        continue
+```
+
+### 9.5 `keepvideo` 对产物路径的影响
+
+**典型场景：下载视频 + 提取音频 + `-k` 保留原视频**
+
+```
+命令: yt-dlp -x --audio-format mp3 -k URL
+
+Step 1: 下载视频 → temp/title.mp4
+Step 2: FFmpegExtractAudioPP 提取音频 → temp/title.mp3
+        返回 files_to_delete = ['temp/title.mp4']
+
+Step 3: run_pp() 处理删除列表:
+        if keepvideo:
+            # title.mp4 不删除，加入移动列表
+            __files_to_move.setdefault('temp/title.mp4', '')
+
+Step 4: MoveFilesAfterDownloadPP.run():
+        遍历 __files_to_move:
+          'temp/title.mp3' → 'downloads/title.mp3' (主文件)
+          'temp/title.mp4' → 'downloads/title.mp4' (被保留的原文件)
+
+最终目录:
+    downloads/title.mp3 (最终产物)
+    downloads/title.mp4 (被保留的原视频)
+```
+
+**关键代码：** [YoutubeDL.py:3791-3794](yt_dlp/YoutubeDL.py#L3791-L3794)
+```python
+if self.params.get('keepvideo', False):
+    for f in files_to_delete:
+        infodict['__files_to_move'].setdefault(f, '')
+```
+
+### 9.6 搬移失败对产物路径的影响
+
+当 `overwrites=False` 且目标文件已存在时：
+
+```
+假设目标目录已存在 downloads/title.mp3
+
+Step 1: 后处理阶段顺利完成，生成 temp/title.mp3
+        info['filepath'] = 'temp/title.mp3'
+
+Step 2: MoveFilesAfterDownloadPP.run():
+        检测到 'downloads/title.mp3' 已存在
+        overwrites=False → continue，不移动
+        但 info['filepath'] 仍被更新为 finalpath = 'downloads/title.mp3'
+        (即使文件实际没有移动过去!)
+
+Step 3: 调用方获取 info['filepath'] = 'downloads/title.mp3'
+        但实际文件仍在 temp/title.mp3
+
+⚠️ 注意：这是一个潜在的状态不一致风险点
+```
+
+**验证代码：** [movefilesafterdownload.py:52](yt_dlp/postprocessor/movefilesafterdownload.py#L52)
+```python
+info['filepath'] = finalpath  # 无论移动是否成功，都无条件更新!
+return [], info
+```
+
+### 9.7 跨卷移动的处理
+
+MoveFilesAfterDownloadPP 使用 `shutil.move()` 而非 `os.rename()`：
+- `os.rename()` 无法跨卷/跨文件系统移动
+- `shutil.move()` 自动 fallback 到 copy + delete 模式
+
+**代码：** [movefilesafterdownload.py:50](yt_dlp/postprocessor/movefilesafterdownload.py#L50)
+```python
+shutil.move(oldfile, newfile)  # os.rename cannot move between volumes
+```
+
+### 9.8 特殊场景：合并被取消时的中间文件保留
+
+当 FFmpegMergerPP 因为 ffmpeg 不可用等原因无法执行时，已下载的中间文件会被保留：
+
+**代码：** [YoutubeDL.py:3570-3572](yt_dlp/YoutubeDL.py#L3570-L3572)
+```python
+else:  # merger 不可用 或 allow_unplayable_formats
+    for file in downloaded:
+        files_to_move[file] = None  # 每个中间文件都加入移动列表
+```
+
+最终目录会同时存在：
+```
+downloads/title.f137.mp4 (视频流文件)
+downloads/title.f140.m4a (音频流文件)
+```
+
+---
+
+## 十、完整调用链路图
+
+### 10.1 单个视频处理的完整链路（含搬移）
 
 ```
 YoutubeDL.process_info(info_dict)  [L3331]
   │
-  ├─ 格式已选择完成, info_dict['requested_formats'] 可能存在
+  ├─ 初始化: files_to_move = {}  [L3361]
+  │
+  ├─ 字幕/缩略图/info.json → 加入 files_to_move
+  │
+  ├─ pre_process('before_dl', files_to_move)
   │
   ├─ 下载分支判断:
   │   ├─ FFmpegFD 可直接合并? ─Yes─► 一次调用 ffmpeg 完成下载+合并
@@ -627,13 +904,19 @@ YoutubeDL.process_info(info_dict)  [L3331]
   │   └─ No:
   │       ├─ 有 requested_formats?
   │       │   └─ Yes: 分别下载各格式 → 记录 downloaded[]
-  │       │           → info_dict['__postprocessors'].append(FFmpegMergerPP)
-  │       │           → info_dict['__files_to_merge'] = downloaded
+  │       │           合并成功:
+  │       │             → info_dict['__postprocessors'].append(FFmpegMergerPP)
+  │       │             → info_dict['__files_to_merge'] = downloaded
+  │       │           合并失败:
+  │       │             → 每个 file 加入 files_to_move[file] = None
   │       └─ No: 直接下载单个文件
   │
   ├─ fixup(): 动态检测问题, 追加各种 FixupPP 到 __postprocessors
   │
-  └─ post_process(dl_filename, info_dict)  [L3839]
+  └─ post_process(dl_filename, info_dict, files_to_move)  [L3839]
+      │
+      ├─ 设置: info['filepath'] = filename
+      │       info['__files_to_move'] = files_to_move
       │
       ├─ run_all_pps('post_process', info,
       │               additional_pps = info['__postprocessors'])
@@ -655,16 +938,32 @@ YoutubeDL.process_info(info_dict)  [L3331]
       │       ├─ EmbedThumbnailPP         (--embed-thumbnail)
       │       └─ FFmpegSplitChaptersPP    (--split-chapters)
       │
-      │   (每个 PP.run() 都可能更新 filepath / ext / 返回待删除文件)
+      │   每个 PP.run() 可能:
+      │     - 更新 info['filepath'] / ['ext']
+      │     - 返回 files_to_delete 列表
+      │   run_pp() 处理返回:
+      │     if keepvideo → files_to_delete 加入 __files_to_move
+      │     else         → 调用 _delete_downloaded_files 删除
       │
-      ├─ run_pp(MoveFilesAfterDownloadPP)
-      │   └─ 把 temp 目录的文件移动到最终目录, 批量 os.replace
+      ├─ run_pp(MoveFilesAfterDownloadPP(self))  [L3843]
+      │   │
+      │   ├─ 主文件加入 __files_to_move
+      │   ├─ 遍历映射表:
+      │   │   ├─ 路径相同 → 跳过
+      │   │   ├─ 源不存在 → 警告跳过
+      │   │   ├─ 目标已存在:
+      │   │   │   ├─ overwrites=True  → 删除目标，继续移动
+      │   │   │   └─ overwrites=False → 警告跳过（文件留在 temp）
+      │   │   └─ 正常 → shutil.move(oldfile, newfile)
+      │   └─ 更新 info['filepath'] = finalpath
+      │
+      ├─ del info['__files_to_move']  [L3844]
       │
       └─ run_all_pps('after_move', info)
           └─ XAttrMetadataPP (--xattrs, 写入扩展属性)
 ```
 
-### 9.2 PP 执行顺序的重要性
+### 10.2 PP 执行顺序的重要性
 
 PP 的顺序**不是任意的**，在 `get_postprocessors()` 中有严格的顺序设计：
 
@@ -678,13 +977,46 @@ PP 的顺序**不是任意的**，在 `get_postprocessors()` 中有严格的顺�
 8. **FFmpegSplitChapters** → 切分章节（写入文件的最终步骤）
 9. **XAttrMetadata** (`after_move`) → 文件落盘后，写入文件系统扩展属性
 
+### 10.3 三种保留/覆盖参数的交互时序
+
+```
+用户命令: yt-dlp -k --no-overwrites -x --audio-format mp3 URL
+
+下载前:
+  existing_file() 检查目标是否存在
+    overwrites=False → 若存在则跳过下载，报告"已下载"
+
+下载后:
+  下载得到 temp/title.mp4
+
+FFmpegExtractAudioPP.run():
+  生成 temp/title.mp3
+  返回 files_to_delete = ['temp/title.mp4']
+
+run_pp() 处理:
+  keepvideo=True → 将 'temp/title.mp4' 加入 __files_to_move
+  (不删除原视频)
+
+MoveFilesAfterDownloadPP.run():
+  overwrites=False:
+    若 downloads/title.mp3 已存在 → 跳过，保留在 temp
+    若 downloads/title.mp4 已存在 → 跳过，保留在 temp
+  info['filepath'] = 'downloads/title.mp3'
+  (注意: 即使文件实际还在 temp!)
+
+最终结果:
+  ✅ 音频生成成功，但可能卡在 temp 目录
+  ✅ 原视频保留
+  ⚠️ 若目标文件已存在，文件仍在 temp，需要手动处理
+```
+
 ---
 
-## 十、扩展开发：自定义混流/转码后处理器
+## 十一、扩展开发：自定义混流/转码后处理器
 
 如果需要自定义混流或转码逻辑，可以按以下步骤实现：
 
-### 10.1 继承关系
+### 11.1 继承关系
 
 ```
 PostProcessor (common.py)
@@ -692,35 +1024,42 @@ PostProcessor (common.py)
             └── YourCustomMuxerPP
 ```
 
-### 10.2 最小实现模板
+### 11.2 最小实现模板（正确处理搬移与删除）
 
 ```python
 from yt_dlp.postprocessor.ffmpeg import FFmpegPostProcessor, PostProcessingError
 from yt_dlp.postprocessor.common import PostProcessor
+from yt_dlp.utils import replace_extension
 
 class MyCustomMuxerPP(FFmpegPostProcessor):
     @PostProcessor._restrict_to(images=False)  # 不处理纯图片
     def run(self, info):
         input_path = info['filepath']
-        output_path = ...  # 计算输出路径
+        target_ext = 'mkv'  # 示例目标格式
+        output_path = replace_extension(input_path, target_ext, info['ext'])
         
         # 1. 检查是否需要处理
-        if not self._should_process(info):
+        if info['ext'] == target_ext:
             return [], info  # 返回空列表 = 不处理，不删除
         
-        # 2. 调用 ffmpeg
-        opts = ['-c', 'copy', ...]  # 你的自定义参数
+        # 2. 检查 nopostoverwrites (可选，取决于你的后处理器需求)
+        # if self._nopostoverwrites and os.path.exists(output_path):
+        #     return [], info
+        
+        # 3. 调用 ffmpeg
+        opts = ['-c', 'copy', '-f', 'matroska']  # 你的自定义参数
         self.run_ffmpeg(input_path, output_path, opts)
         
-        # 3. 更新 info_dict (产物替换)
+        # 4. 更新 info_dict (产物替换)
         info['filepath'] = output_path
-        info['ext'] = determine_ext(output_path)
+        info['ext'] = target_ext
         
-        # 4. 返回 (待删除文件列表, 更新后的 info)
+        # 5. 返回 (待删除文件列表, 更新后的 info)
+        # 重要: run_pp() 会根据 keepvideo 参数决定是否实际删除
         return [input_path], info
 ```
 
-### 10.3 通过 API 注册
+### 11.3 通过 API 注册
 
 ```python
 from yt_dlp import YoutubeDL
@@ -731,6 +1070,8 @@ ydl_opts = {
         'when': 'post_process',        # 可选时机
         # 'custom_param1': 'value',    # 构造函数参数
     }],
+    'keepvideo': True,                 # 保留原文件
+    'overwrites': False,               # 不覆盖已存在文件
 }
 
 # 或手动注册:
@@ -742,19 +1083,22 @@ ydl.add_post_processor(MyCustomMuxerPP(ydl), when='post_process')
 
 ## 关键文件速查表
 
-| 功能 | 文件路径 | 关键行范围 |
+| 功能 | 仓库内路径 | 关键行范围 |
 |------|---------|-----------|
-| 后处理器注册机制 | [postprocessor/__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/__init__.py) | L51-L68 |
-| PP 基类 + 元类包装 | [postprocessor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/common.py) | L16-L150 |
-| FFmpeg 工具调用封装 | [postprocessor/ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py) | L326-L364 |
-| 格式合并 (FFmpegMergerPP) | [postprocessor/ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py) | L822-L847 |
-| 视频转码 (VideoConvertor) | [postprocessor/ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py) | L538-L578 |
-| 音频提取 (ExtractAudio) | [postprocessor/ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/postprocessor/ffmpeg.py) | L432-L535 |
-| 主流程 process_info | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py) | L3331-L3668 |
-| 格式合并决策 _merge | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py) | L2450-L2522 |
-| 后处理调度 post_process | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py) | L3839-L3846 |
-| run_pp / run_all_pps | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/YoutubeDL.py) | L3798-L3826 |
-| CLI 转 PP 配置 | [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/__init__.py) | L627-L729 |
-| FFmpegFD 直接合并下载 | [downloader/external.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/downloader/external.py) | L372-L571 |
-| 容器兼容判定 get_compatible_ext | [utils/_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/utils/_utils.py) | L3088-L3126 |
-| 后处理时机定义 | [utils/_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/94-yt-dlp/yt_dlp/utils/_utils.py) | L2858 |
+| 后处理器注册机制 | [postprocessor/__init__.py](yt_dlp/postprocessor/__init__.py) | L51-L68 |
+| PP 基类 + 元类包装 | [postprocessor/common.py](yt_dlp/postprocessor/common.py) | L16-L150 |
+| 文件搬移 PP | [postprocessor/movefilesafterdownload.py](yt_dlp/postprocessor/movefilesafterdownload.py) | L11-L53 |
+| FFmpeg 工具调用封装 | [postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py) | L326-L364 |
+| 格式合并 (FFmpegMergerPP) | [postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py) | L822-L847 |
+| 视频转码 (VideoConvertor) | [postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py) | L538-L578 |
+| 音频提取 (ExtractAudio) | [postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py) | L432-L535 |
+| 主流程 process_info | [YoutubeDL.py](yt_dlp/YoutubeDL.py) | L3331-L3668 |
+| 格式合并决策 _merge | [YoutubeDL.py](yt_dlp/YoutubeDL.py) | L2450-L2522 |
+| 后处理调度 post_process | [YoutubeDL.py](yt_dlp/YoutubeDL.py) | L3839-L3846 |
+| run_pp / run_all_pps | [YoutubeDL.py](yt_dlp/YoutubeDL.py) | L3798-L3826 |
+| 已存在文件检查 existing_file | [YoutubeDL.py](yt_dlp/YoutubeDL.py) | L3320-L3328 |
+| 文件删除 _delete_downloaded_files | [YoutubeDL.py](yt_dlp/YoutubeDL.py) | L3774-L3783 |
+| CLI 转 PP 配置 | [__init__.py](yt_dlp/__init__.py) | L627-L729 |
+| FFmpegFD 直接合并下载 | [downloader/external.py](yt_dlp/downloader/external.py) | L372-L571 |
+| 容器兼容判定 get_compatible_ext | [utils/_utils.py](yt_dlp/utils/_utils.py) | L3088-L3126 |
+| 后处理时机定义 | [utils/_utils.py](yt_dlp/utils/_utils.py) | L2858 |
