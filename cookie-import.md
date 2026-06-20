@@ -348,3 +348,94 @@ def cookiejar(self):
 | `_decrypt_aes_gcm()` | [cookies.py#L1057](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1057) | AES-GCM 解密 |
 | `_decrypt_windows_dpapi()` | [cookies.py#L1073](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1073) | Windows DPAPI 解密 |
 | `CookieLoadError` | [cookies.py#L89](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L89) | Cookie 加载失败异常 |
+
+---
+
+## 六、来源冲突与优先级分析
+
+### 6.1 两个来源可以同时存在
+
+`--cookies` 和 `--cookies-from-browser` 两个参数互不排斥，可以同时指定。这在 [load_cookies()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L93-L113) 中体现为两个独立的 `if` 分支：
+
+```python
+def load_cookies(cookie_file, browser_specification, ydl):
+    cookie_jars = []
+    if browser_specification is not None:       # 分支1：浏览器来源
+        ...
+        cookie_jars.append(extract_cookies_from_browser(...))
+
+    if cookie_file is not None:                  # 分支2：文件来源
+        ...
+        cookie_jars.append(jar)
+
+    return _merge_cookie_jars(cookie_jars)
+```
+
+两者非互斥——当 `browser_specification` 和 `cookie_file` 都不为 `None` 时，两个 jar 都会进入合并列表。
+
+### 6.2 合并策略：顺序追加，后者覆盖
+
+[_merge_cookie_jars()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1141-L1148) 的实现：
+
+```python
+def _merge_cookie_jars(jars):
+    output_jar = YoutubeDLCookieJar()
+    for jar in jars:
+        for cookie in jar:
+            output_jar.set_cookie(cookie)
+        if jar.filename is not None:
+            output_jar.filename = jar.filename
+    return output_jar
+```
+
+合并逻辑极其简洁：**按列表顺序遍历每个 jar，逐个调用 `output_jar.set_cookie(cookie)`**。关键行为由 `http.cookiejar.CookieJar.set_cookie()` 的语义决定：
+
+- `set_cookie()` 对同一 `(domain, path, name)` 三元组的 Cookie 执行**替换**（后写入的覆盖先写入的）
+- 对不同三元组的 Cookie 则直接追加
+
+因此，**浏览器来源在列表中排第一（index 0），文件来源排第二（index 1）**，合并结果为：
+
+| 场景 | 行为 |
+|------|------|
+| 浏览器和文件有不同 Cookie | 两者的 Cookie 全部保留，互不冲突 |
+| 浏览器和文件有同名 Cookie（同 domain+path+name） | **文件来源覆盖浏览器来源** |
+
+### 6.3 文件来源优先的实质
+
+由于 `cookie_jars` 列表的构建顺序是 `[浏览器jar, 文件jar]`，文件来源的 Cookie 后写入，所以**文件来源的优先级高于浏览器来源**。
+
+这意味着：
+
+- 用户可通过 `--cookies` 文件**覆盖**从浏览器导入的特定 Cookie（例如修改某个 session token 的值）
+- 未被覆盖的浏览器 Cookie 仍然生效
+- 用户的文件只需包含想要覆盖的 Cookie，不必复制浏览器的全部 Cookie
+
+### 6.4 filename 属性的继承
+
+`_merge_cookie_jars()` 中还有一行特殊逻辑：
+
+```python
+if jar.filename is not None:
+    output_jar.filename = jar.filename
+```
+
+由于列表顺序为 `[浏览器jar, 文件jar]`，而浏览器提取函数返回的 jar 的 `filename` 为 `None`（它们不关联文件），文件来源的 jar 的 `filename` 不为 `None`。因此 **合并后 jar 的 `filename` 继承自文件来源**。
+
+这直接影响 [save_cookies()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/YoutubeDL.py#L1050-L1052) 的行为——下载完成后 `cookiejar.save()` 会将合并后的全部 Cookie（包括浏览器来源的）写回 `--cookies` 指定的文件中。这实现了「浏览器 Cookie 持久化」：首次从浏览器导入后，后续运行可直接使用文件，无需再次访问浏览器数据库。
+
+### 6.5 各场景的合并行为总结
+
+| `--cookies-from-browser` | `--cookies` | 行为 |
+|:---:|:---:|------|
+| ✗ | ✗ | 空 jar，不加载任何 Cookie |
+| ✓ | ✗ | 仅浏览器 Cookie，jar.filename 为 None，无法自动 save |
+| ✗ | ✓ | 仅文件 Cookie，jar.filename 为文件路径，可自动 save |
+| ✓ | ✓ | 浏览器 + 文件合并，同名 Cookie 以文件为准；jar.filename 为文件路径，save 时写入合并结果 |
+
+### 6.6 潜在冲突场景与风险
+
+**同名 Cookie 的静默覆盖**：当浏览器和文件中存在同 `(domain, path, name)` 的 Cookie 时，文件值静默替换浏览器值，无任何日志或警告。用户可能 unaware 浏览器中的 Cookie 被覆盖。
+
+**Session Cookie vs 持久 Cookie 混淆**：浏览器提取时，Chromium 的 session Cookie（`expires_utc=0`）被转为 `expires=None`；文件加载时同样将 `expires=0` 标记为会话 Cookie。但如果文件中手动写了 `expires=0` 而浏览器中同名的持久 Cookie 已存在，覆盖后持久 Cookie 会变为会话 Cookie，行为可能不符合预期。
+
+**域名匹配差异**：浏览器中 Cookie 的 domain 字段可能以 `.` 开头（如 `.youtube.com`），而 Netscape 格式文件中通过第二列 `TRUE/FALSE` 控制是否包含子域名。如果文件中的 domain 写法与浏览器提取结果不一致（如文件写 `youtube.com` 而浏览器为 `.youtube.com`），两者会被视为不同 Cookie 而同时存在，可能导致请求时发送重复的 Cookie 头。
