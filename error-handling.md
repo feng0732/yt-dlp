@@ -166,11 +166,38 @@ RequestError
 
 ## 5. `wait_for_video` 对错误降级的影响
 
+### 5.0 `process` 参数：直播等待逻辑的总开关
+
+在深入分析等待逻辑之前，必须先理解 `process` 参数——它是 `__extract_info` 的第 5 个参数，
+决定了**是否执行后续处理（包括等待直播）**。
+
+#### 参数来源
+
+- `YoutubeDL.extract_info(url, download=True, ..., process=True, ...)` — `yt_dlp/YoutubeDL.py#L1671-L1672`
+  - API 默认：`process=True`
+  - 注释说明："Whether to resolve all unresolved references (URLs, playlist items). Must be True for download to work"
+- 内部调用 `process_ie_result` 处理 `url_transparent` 类型时，会显式传入 `process=False`
+  - 位置：`yt_dlp/YoutubeDL.py#L1967-L1969`
+  - 场景：透明 URL 转发（如嵌入视频页面转发到实际视频站点），先只提取不处理，外层再合并元数据
+
+#### `process` 对直播等待的三层影响
+
+`process` 在 `__extract_info` 中有三个独立的判断点，分别控制不同的等待路径：
+
+| 判断点 | 代码位置 | 影响 |
+|--------|---------|------|
+| 入口①的 `if process:` | `yt_dlp/YoutubeDL.py#L1862-L1867` | 控制 UserNotLive 异常时是否调用 `_wait_for_video()` 和是否输出 warning |
+| 入口②的 `if process:` | `yt_dlp/YoutubeDL.py#L1880-L1882` | 控制提取成功但无格式时是否调用 `_wait_for_video(ie_result)` |
+| `_wait_for_video` 自身的检查 | `yt_dlp/YoutubeDL.py#L1754` | 不直接依赖 process，但依赖 wait_for_video 参数 |
+
+**总结：`process=False` 完全禁用两个入口的等待逻辑，不管 wait_for_video 参数有没有设置。**
+
 ### 5.1 `wait_for_video` 参数说明
 
 - 用途：等待预定直播/排期视频变为可用
 - 取值：`(min_wait, max_wait)` 秒数元组
 - 见 `yt_dlp/YoutubeDL.py#L384`
+- **前提条件：只有 `process=True` 时，等待逻辑才会被触发**
 
 ### 5.2 三类错误的降级逻辑
 
@@ -256,28 +283,28 @@ class UserNotLive(ExtractorError):
 
 #### 5.3.2 入口①：提取时抛出 `UserNotLive` 的传播顺序
 
-位置：`yt_dlp/YoutubeDL.py#L1860-L1867`
+位置：`yt_dlp/YoutubeDL.py#L1860-L1869`
 
 ```python
 try:
     ie_result = ie.extract(url)
 except UserNotLive as e:
-    if process:
-        if self.params.get('wait_for_video'):
+    if process:                                    # ← 第一层开关：process
+        if self.params.get('wait_for_video'):      # ← 第二层开关：wait_for_video
             self.report_warning(e)
-        self._wait_for_video()     # ← 在 raise 之前执行
-    raise                           # ← 如果上面抛了异常，这行不会执行
+        self._wait_for_video()                     # ← 在 raise 之前执行
+    raise                                            # ← 如果上面抛了异常，这行不会执行
 ```
 
-**关键细节：`_wait_for_video()` 在 `raise` 之前被调用。**
-这决定了两种完全不同的传播路径：
+**判断顺序：先看 `process`，再看 `wait_for_video`。**
+这决定了 **4 种**完全不同的传播路径：
 
-##### 路径 A：有 `wait_for_video` 参数
+##### 路径 1：`process=True` + 有 `wait_for_video` 参数
 
 | 步骤 | 发生了什么 | 异常状态 |
 |------|-----------|---------|
 | 1 | `ie.extract(url)` 抛出 `UserNotLive(expected=True)` | UserNotLive 在 except 块内被捕获 |
-| 2 | 有 `wait_for_video` → `self.report_warning(e)` 输出黄色警告 | 异常仍在 except 块内 |
+| 2 | `process=True` ✓ → `wait_for_video` 有值 ✓ → `self.report_warning(e)` 输出黄色警告 | 异常仍在 except 块内 |
 | 3 | 调用 `self._wait_for_video()`（**不传 ie_result 参数，使用默认值 `{}`**） | — |
 | 4 | `_wait_for_video({})` 内部检查通过（空 dict 无 formats/url）→ 进入等待循环 | — |
 | 5 | 等待结束（或 Ctrl+C）→ 抛出 `ReExtractInfo(expected=True)` | **ReExtractInfo 替代了 UserNotLive** |
@@ -287,13 +314,13 @@ except UserNotLive as e:
 
 **结果：原始 UserNotLive 被 ReExtractInfo "吃掉"，进入重提取循环。**
 
-##### 路径 B：没有 `wait_for_video` 参数
+##### 路径 2：`process=True` + 无 `wait_for_video` 参数
 
 | 步骤 | 发生了什么 | 异常状态 |
 |------|-----------|---------|
 | 1 | `ie.extract(url)` 抛出 `UserNotLive(expected=True)` | UserNotLive 在 except 块内被捕获 |
-| 2 | 无 `wait_for_video` → 跳过 report_warning | 异常仍在 except 块内 |
-| 3 | 调用 `self._wait_for_video()` | — |
+| 2 | `process=True` ✓ → `wait_for_video` 无值 ✗ → 跳过 report_warning | 异常仍在 except 块内 |
+| 3 | 仍调用 `self._wait_for_video()`（即使没有参数也会被调用） | — |
 | 4 | `_wait_for_video` 内部检查 `not self.params.get('wait_for_video')` → True → **直接 return，不抛异常** | — |
 | 5 | `raise` 执行 → **重新抛出原始的 UserNotLive** | 当前异常：UserNotLive |
 | 6 | UserNotLive 向上传播到装饰器 | — |
@@ -302,30 +329,64 @@ except UserNotLive as e:
 
 **结果：UserNotLive 被当作普通 ExtractorError 处理。**
 
+##### 路径 3：`process=False`（不管有没有 `wait_for_video` 参数）
+
+| 步骤 | 发生了什么 | 异常状态 |
+|------|-----------|---------|
+| 1 | `ie.extract(url)` 抛出 `UserNotLive(expected=True)` | UserNotLive 在 except 块内被捕获 |
+| 2 | `process=False` ✗ → 整个 `if process:` 块被跳过 | 不输出 warning，不调用 `_wait_for_video()` |
+| 3 | `raise` 直接执行 → **重新抛出原始的 UserNotLive** | 当前异常：UserNotLive |
+| 4 | UserNotLive 向上传播到装饰器 | — |
+| 5 | 装饰器匹配 `except ExtractorError` → `report_error()` → `trouble()` → ignoreerrors | 与路径 2 相同 |
+
+**结果：与路径 2 相同，但路径更短——连 `_wait_for_video()` 都不调用。**
+
+**`process=False` 的典型场景**：透明 URL 转发（`url_transparent`），先只提取内层 URL 的信息，不做处理和等待，外层合并元数据后再统一处理。见 `yt_dlp/YoutubeDL.py#L1967-L1969`。
+
 #### 5.3.3 入口②：提取成功但无 formats/url 的传播顺序
 
-位置：`yt_dlp/YoutubeDL.py#L1880-L1882`
+位置：`yt_dlp/YoutubeDL.py#L1880-L1884`
 
 ```python
-if process:
-    self._wait_for_video(ie_result)   # ← 传入实际的 ie_result
+if ie_result is None:
+    ...
+if process:                                            # ← 开关：process
+    self._wait_for_video(ie_result)                    # ← 传入实际的 ie_result
     return self.process_ie_result(ie_result, download, extra_info)
+else:
+    return ie_result                                    # ← process=False 时直接返回
 ```
 
 这种情况发生在提取器返回了元数据（标题、描述等）但没有视频流地址时。
 
+**两种路径：**
+
+##### 路径 A：`process=True`
+
 | 步骤 | 发生了什么 | 异常状态 |
 |------|-----------|---------|
 | 1 | `ie.extract(url)` 成功返回 ie_result（无异常） | 无异常 |
-| 2 | 执行到 `self._wait_for_video(ie_result)`（**传入实际的 ie_result**） | — |
-| 3 | 内部检查通过（无 formats/url）→ 进入等待循环 | — |
+| 2 | `process=True` ✓ → 执行 `self._wait_for_video(ie_result)`（**传入实际的 ie_result**） | — |
+| 3 | 内部检查（`wait_for_video` 参数存在 + 无 formats/url）→ 进入等待循环 | — |
 | 4 | 等待结束 → 抛出 `ReExtractInfo(expected=True)` | 当前异常：ReExtractInfo |
 | 5 | 这个异常没有被 `__extract_info` 内部任何 except 捕获，直接向上传播 | — |
 | 6 | 装饰器匹配 `except ReExtractInfo` → 打印提示 → `continue` → 重新提取 | 重新调用 `__extract_info` |
 
+##### 路径 B：`process=False`
+
+| 步骤 | 发生了什么 | 异常状态 |
+|------|-----------|---------|
+| 1 | `ie.extract(url)` 成功返回 ie_result（无异常） | 无异常 |
+| 2 | `process=False` ✗ → 不调用 `_wait_for_video`，不进入处理流程 | — |
+| 3 | `return ie_result` 直接返回原始结果（即使没有 formats/url） | 无异常，正常返回 |
+
+**结果：没有等待、没有异常，原样返回提取结果（可能只有元数据没有视频流）。**
+
 **入口① vs 入口②的区别：**
-- 入口①调用 `_wait_for_video()` 不传参数（ie_result 默认为 `{}`），无法利用 release_timestamp 计算等待时间
-- 入口②调用 `_wait_for_video(ie_result)` 传入实际结果，可以根据 `release_timestamp` 或 `live_status == 'is_upcoming'` 精准计算等待时间
+- 入口①：`_wait_for_video()` 不传参数（默认 `{}`），无法利用 release_timestamp 计算等待时间
+- 入口②：`_wait_for_video(ie_result)` 传实际结果，可根据 `release_timestamp` 或 `live_status == 'is_upcoming'` 精准计算等待时间
+- 两者最终都是通过抛出 `ReExtractInfo` 触发重提取循环
+- 两者在 `process=False` 时都完全禁用等待逻辑
 
 ### 5.4 `_wait_for_video` 等待逻辑
 
@@ -556,13 +617,14 @@ if count > retries:
 | 属性 | 说明 |
 |------|------|
 | **所在层** | Layer B（YoutubeDL 调度层），但其降级效果影响 Layer A |
-| **入口①（捕获 UserNotLive）** | `__extract_info` 中 `except UserNotLive` 块 — `yt_dlp/YoutubeDL.py#L1860-L1869`<br>有 wait_for_video 参数时：`_wait_for_video()` 先抛出 ReExtractInfo，**替代原始异常**<br>无 wait_for_video 参数时：`_wait_for_video()` 直接 return，然后 `raise` 重新抛出 UserNotLive |
-| **入口②（提取后无格式）** | `__extract_info` 提取成功后，结果无 formats/url — `yt_dlp/YoutubeDL.py#L1880-L1882`<br>→ 调用 `_wait_for_video(ie_result)` → 抛出 `ReExtractInfo` |
-| **入口③（Layer A 降级条件）** | Layer A 中的降级判断 — `ignore_no_formats_error or wait_for_video` 条件<br>→ 影响是否抛出异常（见机制二） |
-| **触发条件** | `wait_for_video` 参数已设置，且视频无可用格式 |
+| **总开关** | `process` 参数：`process=False` 时入口①②的等待逻辑**完全禁用**，不管 `wait_for_video` 有没有设置 |
+| **入口①（捕获 UserNotLive）** | `__extract_info` 中 `except UserNotLive` 块 — `yt_dlp/YoutubeDL.py#L1860-L1869`<br>`process=True` + 有 wait_for_video：`_wait_for_video()` 先抛出 ReExtractInfo，**替代原始异常**<br>`process=True` + 无 wait_for_video：`_wait_for_video()` 直接 return，然后 `raise` 重新抛出 UserNotLive<br>`process=False`：跳过整个 if 块，`raise` 直接执行，UserNotLive 原样传播 |
+| **入口②（提取后无格式）** | `__extract_info` 提取成功后，结果无 formats/url — `yt_dlp/YoutubeDL.py#L1880-L1884`<br>`process=True` → 调用 `_wait_for_video(ie_result)` → 抛出 `ReExtractInfo`<br>`process=False` → `return ie_result` 直接返回，不等待不处理 |
+| **入口③（Layer A 降级条件）** | Layer A 中的降级判断 — `ignore_no_formats_error or wait_for_video` 条件<br>→ 影响是否抛出异常（见机制二），不受 `process` 参数影响 |
+| **触发条件** | `process=True` + `wait_for_video` 参数已设置 + 视频无可用格式 |
 | **适用场景** | 预定直播尚未开始、即将上线的视频 |
-| **出口** | 有 wait_for_video：等待结束 → 抛出 `ReExtractInfo(expected=True)`<br>→ 被 `_handle_extraction_exceptions` 捕获 → `continue` 重新执行 `__extract_info`<br>无 wait_for_video（入口①）：UserNotLive 作为普通 ExtractorError 传播 → `report_error()` → `trouble()` → 机制三 |
-| **关键特点** | 这是一个**独立的重新提取循环**，与重试(RetryManager)无关<br>通过 `_handle_extraction_exceptions` 装饰器的 while True 循环实现<br>入口①的 `_wait_for_video()` 在 `raise` 之前执行，有参数时会"吃掉"原始 UserNotLive |
+| **出口** | 有 wait_for_video（process=True）：等待结束 → 抛出 `ReExtractInfo(expected=True)`<br>→ 被 `_handle_extraction_exceptions` 捕获 → `continue` 重新执行 `__extract_info`<br>无 wait_for_video 或 process=False（入口①）：UserNotLive 作为普通 ExtractorError 传播 → `report_error()` → `trouble()` → 机制三<br>process=False（入口②）：直接返回 ie_result，无异常 |
+| **关键特点** | 这是一个**独立的重新提取循环**，与重试(RetryManager)无关<br>通过 `_handle_extraction_exceptions` 装饰器的 while True 循环实现<br>入口①的 `_wait_for_video()` 在 `raise` 之前执行，有参数时会"吃掉"原始 UserNotLive<br>`process` 是总开关，`process=False` 时两个入口的等待逻辑都不执行 |
 
 ### 9.3 各机制之间的影响关系
 
@@ -643,13 +705,13 @@ __extract_info 被 _handle_extraction_exceptions 装饰
 代码位于 `yt_dlp/YoutubeDL.py#L1857-L1884`：
 
 ```
-__extract_info(url, ie, ...)   ← 被 _handle_extraction_exceptions 装饰（while True 循环）
+__extract_info(url, ie, download, extra_info, process)   ← 被 _handle_extraction_exceptions 装饰（while True 循环）
     │
     try:
         ie_result = ie.extract(url)     ←── Layer A 在此执行
     except UserNotLive as e:            ←── 入口①
-        if process:
-            if wait_for_video: report_warning(e)
+        if process:                     ←── 第一层开关：process=False 时整个块跳过
+            if wait_for_video: report_warning(e)   ←── 第二层开关：wait_for_video
             _wait_for_video()           ←── 有参数时：等待 → 抛出 ReExtractInfo
                                           ←── 无参数时：直接 return（不抛异常）
         raise                           ←── 只有上面不抛异常时才执行
@@ -657,9 +719,11 @@ __extract_info(url, ie, ...)   ← 被 _handle_extraction_exceptions 装饰（wh
     │
     ie_result 不为 None
     │
-    if process:
+    if process:                         ←── process=False 时走 else 分支，直接 return ie_result
         _wait_for_video(ie_result)      ←── 入口②（无 formats 时等待 → 抛出 ReExtractInfo）
         return process_ie_result(...)
+    else:
+        return ie_result                ←── 不处理、不等待，原样返回
 ```
 
 **入口①的关键时序（有 wait_for_video 参数）：**
@@ -694,6 +758,12 @@ __extract_info(url, ie, ...)   ← 被 _handle_extraction_exceptions 装饰（wh
 - 入口①：`_wait_for_video()` 不传参数（默认 `{}`），无法利用 release_timestamp 计算等待时间
 - 入口②：`_wait_for_video(ie_result)` 传实际结果，可根据 `release_timestamp` 精准等待
 - 两者最终都是通过抛出 `ReExtractInfo` 触发重提取循环
+- 两者在 `process=False` 时都完全禁用等待逻辑
+
+**`process=False` 的全局影响：**
+- 入口①：跳过整个 `if process:` 块，`raise` 直接执行，UserNotLive 作为普通 ExtractorError 传播
+- 入口②：走 `else` 分支，直接 `return ie_result`，不等待、不处理、不抛异常（即使没有 formats/url）
+- 典型场景：`url_transparent` 透明 URL 转发，内层提取只获取信息，外层合并后再统一处理
 
 ### 9.6 `trouble()` 的完整分支
 
