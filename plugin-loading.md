@@ -4,10 +4,15 @@
 
 yt-dlp 的插件系统采用 **命名空间包（Namespace Package） + Meta Path Finder** 的设计模式，核心文件为 `yt_dlp/plugins.py`。
 
-系统支持两种**插件类型**：`extractor`（提取器）和 `postprocessor`（后处理器）。其中：
+系统支持两种**插件类型**（plugin type）：`extractor`（提取器）和 `postprocessor`（后处理器）。每种插件类型下又有不同的插件形态：
 
-- **常规插件**：extractor 和 postprocessor 都支持，用于新增提取器或后处理器
-- **Override 插件**：**仅针对 extractor**，用于覆盖和增强已有的内置提取器类，postprocessor **不支持** override 机制
+- **常规插件**：extractor 和 postprocessor **各有一套**，分别用于新增提取器和新增后处理器
+- **Override 插件**：**仅 extractor 有**，用于覆盖和增强已有的内置提取器类；postprocessor **不支持** override 机制
+
+因此整个插件体系共有三种具体形态：
+1. Extractor 常规插件（新增提取器）
+2. Postprocessor 常规插件（新增后处理器）
+3. Extractor Override 插件（覆盖已有提取器类）
 
 插件加载的三个核心阶段：
 1. **发现路径**：确定从哪些目录搜索插件
@@ -337,7 +342,7 @@ plugin_spec.destination.value = merge_dicts(regular_classes, plugin_spec.destina
 - `destination`（如 `extractors`、`postprocessors`）保存所有类（内置 + 常规插件），使用 `merge_dicts` 将插件类**前置**
 - 插件类优先级高于内置类（同名时插件覆盖内置）
 
-### 4.5 Override 插件：仅针对 Extractor 的类替换机制
+### 4.5 Extractor Override 插件：覆盖已有提取器类
 
 Override 插件**只适用于 extractor**，用于增强或修改已有的内置提取器类。postprocessor **不支持** override——其基类 `PostProcessor` 没有实现对应的 `__init_subclass__` 钩子，全局变量中也只有 `plugin_ies_overrides` 而没有 `plugin_pps_overrides`（见 [yt_dlp/globals.py](yt_dlp/globals.py#L26-L28) 第 26-28 行）。
 
@@ -391,19 +396,32 @@ class OverrideGenericIE(GenericIE, plugin_name='override'):
 
 `_UnderscoreOverrideGenericIE`（类名以下划线开头）不会被 `get_regular_classes()` 收集为常规插件，但它的 override 效果**仍然生效**。因为类定义本身在模块加载时会执行，`__init_subclass__` 钩子不受类名是否带下划线的影响。
 
-### 4.6 常规插件 vs Override 插件对比
+### 4.6 三类插件对比：Extractor 常规 / Postprocessor 常规 / Extractor Override
 
-| 维度 | 常规插件（Extractor） | Override 插件（Extractor 专用） | 常规插件（Postprocessor） |
-|-----|---------------------|------------------------------|------------------------|
-| **适用范围** | extractor + postprocessor | **仅 extractor** | postprocessor |
-| **作用** | 新增提取器或后处理器 | **覆盖/增强已有的内置提取器类** | 新增后处理器 |
-| **基类** | `InfoExtractor` / `PostProcessor` | **具体的内置提取器类**（如 `GenericIE`） | `PostProcessor` |
-| **标识方式** | 类名后缀（`IE` / `PP`） | `plugin_name='xxx'` 关键字参数 | 类名后缀 `PP` |
-| **生效时机** | 加载后注册到注册表 | 模块加载时通过 `__init_subclass__` 立即替换目标类 | 加载后注册到注册表 |
-| **注册位置** | `plugin_ies` + `extractors` | `plugin_ies_overrides`（直接替换目标模块中的类） | `plugin_pps` + `postprocessors` |
-| **是否进入 `get_regular_classes`** | 是 | 否（有 `PLUGIN_NAME` 属性，被排除） | 是 |
-| **类名下划线开头的影响** | 不被注册为常规插件 | 不影响 override 效果（类定义仍执行） | 不被注册为常规插件 |
-| **使用方式** | 按 URL 匹配自动调用 | **透明替换原类**，调用方无感知 | 按名称调用 |
+yt-dlp 的插件体系共有三种具体形态，分布在两种插件类型中：
+
+- **常规插件**：extractor 和 postprocessor 各有一套，用于新增功能
+- **Override 插件**：仅 extractor 有，用于覆盖已有提取器类
+
+下面是三者的详细对比：
+
+| 维度 | Extractor 常规插件 | Postprocessor 常规插件 | Extractor Override 插件 |
+|-----|-------------------|----------------------|----------------------|
+| **插件类型归属** | extractor | postprocessor | extractor |
+| **所属命名空间** | `yt_dlp_plugins.extractor.*` | `yt_dlp_plugins.postprocessor.*` | `yt_dlp_plugins.extractor.*` |
+| **目录位置** | `yt_dlp_plugins/extractor/` | `yt_dlp_plugins/postprocessor/` | `yt_dlp_plugins/extractor/` |
+| **作用** | 新增提取器类 | 新增后处理器类 | **覆盖/增强已有的内置提取器类** |
+| **基类** | `InfoExtractor` | `PostProcessor` | **具体的内置提取器类**（如 `GenericIE`、`YoutubeIE` 等） |
+| **类名标识** | 以 `IE` 结尾（如 `NormalPluginIE`） | 以 `PP` 结尾（如 `NormalPluginPP`） | 命名无强制要求，通常以被覆盖类名 + Override 命名 |
+| **生效标识** | 类名后缀匹配 | 类名后缀匹配 | `plugin_name='xxx'` 关键字参数（在基类列表中指定） |
+| **生效时机** | `load_plugins()` 收集后注册到全局表 | `load_plugins()` 收集后注册到全局表 | **模块加载时立即生效**：`exec_module` 执行类定义触发 `__init_subclass__` 钩子 |
+| **注册到 `get_regular_classes`** | 是 | 是 | **否**（有 `PLUGIN_NAME` 属性，被 `get_regular_classes` 排除） |
+| **全局注册表** | `plugin_ies` + `extractors` | `plugin_pps` + `postprocessors` | `plugin_ies_overrides`（仅记录，实际通过替换模块类引用生效） |
+| **生效机制** | 注册后按 URL 匹配顺序调用 | 注册后按名称调用 | **直接替换目标模块中的类引用**：`setattr(sys.modules[module], 类名, 插件类)` |
+| **类名以下划线开头** | 不注册为常规插件 | 不注册为常规插件 | 仍可生效（类定义执行触发 `__init_subclass__`，与类名是否带下划线无关） |
+| **多层包装** | 不涉及 | 不涉及 | 支持：通过 `__wrapped__` 链保存原始类，可多个 override 叠加 |
+| **调用方感知** | 新增 IE，按 URL 匹配 | 新增 PP，按名称调用 | **透明无感知**：原类名不变，调用方直接使用即可 |
+| **代码中实现位置** | `plugins.py` 的 `load_plugins()` + `get_regular_classes()` | `plugins.py` 的 `load_plugins()` + `get_regular_classes()` | `extractor/common.py` 的 `InfoExtractor.__init_subclass__()` |
 
 ### 4.7 批量加载
 
@@ -469,8 +487,9 @@ yt-dlp 插件系统的设计巧妙地结合了 Python 标准的 import hook 机�
 
 1. **发现路径**：多层级搜索（配置目录 + 可执行文件目录 + PYTHONPATH），支持 zip 包，通过 `plugin_dirs` 控制容器目录
 2. **模块载入**：通过自定义 `MetaPathFinder` 创建虚拟命名空间包，让标准 import 机制处理子模块加载
-3. **扩展点接入**：
-   - **常规插件**（extractor 和 postprocessor 均支持）：按命名约定自动发现，注册到全局注册表，优先级高于内置
-   - **Override 插件（仅 extractor）**：通过 `InfoExtractor.__init_subclass__` 钩子在模块加载时**直接替换已有的内置提取器类**，采用装饰器模式（`__wrapped__`）支持多层包装，postprocessor 不支持此机制
+3. **扩展点接入**，三种插件形态各有不同：
+   - **Extractor 常规插件**：`yt_dlp_plugins/extractor/` 下以 `IE` 结尾的类，注册到 `plugin_ies` 和 `extractors` 全局表
+   - **Postprocessor 常规插件**：`yt_dlp_plugins/postprocessor/` 下以 `PP` 结尾的类，注册到 `plugin_pps` 和 `postprocessors` 全局表
+   - **Extractor Override 插件**：`yt_dlp_plugins/extractor/` 下继承内置提取器并指定 `plugin_name` 的类，通过 `InfoExtractor.__init_subclass__` 钩子在模块加载时**直接替换目标模块中的原始类引用**，采用装饰器模式（`__wrapped__`）支持多层包装
 
 这种设计既保持了 Pythonic 的导入方式，又提供了灵活的插件扩展能力，同时通过全局注册表实现了插件与核心代码的解耦。
