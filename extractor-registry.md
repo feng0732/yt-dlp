@@ -1,5 +1,21 @@
 # yt-dlp 提取器注册与 URL 匹配优先级分析
 
+## 修正说明
+
+本文档中的关键结论经过代码逐行核对和实际运行验证。以下几处之前的理解错误已修正（标记为 ⚠️）：
+
+1. **`extract_from_webpage` 的实例化判断逻辑**（最关键）：`isinstance(..., MethodType) == True` 表示是 `@classmethod`，**不需要**实例化；反之才需要实例化。之前理解完全颠倒。
+
+2. **`url_result` 字段优先级**：`**kwargs` 先展开，`_type` 和 `url` 后赋值，会覆盖 kwargs 中的同名键。
+
+3. **`url_transparent` 字段豁免规则**：基本豁免 `_type, url, ie_key`；非视频剪辑场景再豁免 `id, extractor, extractor_key`。视频剪辑场景下外层的 id/extractor 会覆盖内层。
+
+4. **`url_transparent` 递归层级**：不是"最多两级合并"，而是通过显式调用 `process_ie_result` 可以多层递归，且内层 `_type='url'` 会被转为 `url_transparent` 继续传递元数据。
+
+5. **`add_extra_info` 行为**：内部使用 `setdefault`，不会覆盖已有字段值。
+
+---
+
 ## 1. 核心概念
 
 ### 1.1 提取器（Extractor）
@@ -335,11 +351,12 @@ def url_result(url, ie=None, video_id=None, video_title=None, *, url_transparent
     }
 ```
 
-**返回值结构**：
+**返回值结构与字段优先级**：
+- `**kwargs` 先展开，然后 `_type` 和 `url` 会**覆盖** kwargs 中同名的键
 - `_type`: 有两种类型 —— `'url'`（纯转发）和 `'url_transparent'`（保留元数据）
-- `url`: 需要被重新处理的目标 URL
+- `url`: 需要被重新处理的目标 URL（优先级最高，不可被 kwargs 覆盖）
 - `ie_key`（可选）：指定处理该 URL 的提取器名称，跳过 URL 匹配阶段
-- 其他字段：作为 `extra_info` 传递给下一个提取器
+- 其他字段：在后续 `extract_info` 调用中作为 `extra_info` 传递，通过 `add_extra_info`（`setdefault`，不覆盖已有值）合并
 
 ### 5.2 完整接力路径：从提取到二次分派
 
@@ -377,6 +394,28 @@ __extract_info(url, ie_instance, ...)    ← 传入的是实例（通过 get_inf
 
 #### 第二阶段：二次分派（核心）
 
+**extra_info 传递链路**：
+```
+extra_info 参数
+    │
+    ├─► __extract_info(url, ie, download, extra_info, process)
+    │     │
+    │     ├─► 第 1877-1878 行：如果 extra_info['original_url'] 存在，setdefault 到 ie_result
+    │     ├─► add_default_extra_info(ie_result, ie, url) （setdefault，不覆盖）
+    │     └─► process_ie_result(ie_result, download, extra_info)  ← 透传 extra_info
+    │
+    └─► process_ie_result
+          │
+          ├─► _type='url' → extract_info(..., extra_info=extra_info)  ← 继续透传
+          │
+          └─► _type='url_transparent'
+                ├─► extract_info(..., extra_info=extra_info, process=False)
+                │     └─► 不会调用 process_ie_result，直接返回 ie_result
+                └─► process_ie_result(new_result, download=download, extra_info=extra_info)  ← 继续透传
+```
+
+**关键点**：`add_extra_info` 内部使用 `setdefault`（[YoutubeDL.py#L1666-L1669](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1666-L1669)），只会在字段不存在时设置，不会覆盖已有的值。
+
 **入口**: [YoutubeDL.process_ie_result()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1904-L2036)
 
 ```python
@@ -410,16 +449,26 @@ def process_ie_result(self, ie_result, download=True, extra_info=None):
             ie_result['url'], ie_key=ie_result.get('ie_key'),
             extra_info=extra_info, download=False, process=False)
 
-        # 合并 embedding 页面的元数据到提取结果
-        # 豁免字段：_type, url, ie_key, id, extractor 等
-        new_result = info.copy()
-        new_result.update(filter_dict(ie_result, ...))
+        # extract_info 可能返回 None（ignoreerrors 时）
+        if not info:
+            return info
 
-        # 如果内部结果还是 url 类型，转为 url_transparent 以继续传递元数据
+        # 字段豁免规则：这些字段不会被外层覆盖，以内层提取器为准
+        exempted_fields = {'_type', 'url', 'ie_key'}
+        if not ie_result.get('section_end') and ie_result.get('section_start') is None:
+            # 非视频剪辑场景（没有 section_start/section_end），
+            # id、extractor、extractor_key 也以内层为准
+            exempted_fields |= {'id', 'extractor', 'extractor_key'}
+
+        # 先复制内层结果，然后用外层的非豁免字段覆盖（外层优先）
+        new_result = info.copy()
+        new_result.update(filter_dict(ie_result, lambda k, v: v is not None and k not in exempted_fields))
+
+        # 如果内部结果还是 url 类型，转为 url_transparent 以继续传递外层元数据
         if new_result.get('_type') == 'url':
             new_result['_type'] = 'url_transparent'
 
-        # 递归处理合并后的结果
+        # 递归处理合并后的结果（可以继续接力多层）
         return self.process_ie_result(new_result, download=download, extra_info=extra_info)
 ```
 
@@ -428,9 +477,13 @@ def process_ie_result(self, ie_result, download=True, extra_info=None):
 | 特性 | `_type='url'` | `_type='url_transparent'` |
 |------|--------------|--------------------------|
 | 代码位置 | [YoutubeDL.py#L1958-L1964](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1958-L1964) | [YoutubeDL.py#L1965-L1995](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1965-L1995) |
-| 元数据来源 | 新提取器自己获取 | **保留外层页面**的 title/description 等 |
-| 递归深度 | 可能多级 | 合并后递归，最多两级合并 |
-| 典型场景 | 搜索结果 → 实际视频 | 博客页面嵌入 YouTube 视频 |
+| 第一次 `extract_info` 参数 | `process=True, download=download` | `process=False, download=False`（先不处理，只取原始结果） |
+| 元数据合并 | 无合并（每次接力都是全新开始） | **外层优先**：外层字段覆盖内层，仅豁免字段例外 |
+| 豁免字段 | 不适用 | 基本豁免：`_type, url, ie_key`；非剪辑场景再豁免：`id, extractor, extractor_key` |
+| 递归方式 | 直接调用 `extract_info` 从头开始 | 合并字段后显式递归调用 `process_ie_result` |
+| 递归深度 | 可能多级 | 可能多级（每次递归都会合并外层元数据） |
+| `_type='url'` 转换 | 不转换 | 内层若为 `url` 会被转为 `url_transparent` 以继续传递元数据 |
+| 典型场景 | 搜索结果 → 实际视频、短链 → 真实URL | 博客页面嵌入 YouTube 视频、视频剪辑（section_start/end） |
 
 #### 第三阶段：重新匹配提取器
 
@@ -501,13 +554,17 @@ GenericIE._real_extract(url)
 ```python
 @classmethod
 def extract_from_webpage(cls, ydl, url, webpage):
-    # 关键判断：如果 _extract_from_webpage 是绑定方法（即定义在类上的实例方法），
-    # 则需要实例化提取器（需要实例状态，如 _downloader）
-    # 否则（默认实现是 classmethod），可以直接用类调用
+    # ⚠️ 关键判断：条件的含义与直觉相反！
+    # Python 中，@classmethod 在类上访问时是 bound method（MethodType）
+    # 而普通实例方法在类上访问时是 function（不是 MethodType）
+    # 所以：
+    #   isinstance(..., MethodType) == True  →  是 @classmethod → 可以用类直接调用，不需要实例化
+    #   isinstance(..., MethodType) == False →  是普通实例方法 → 需要实例化才能调用
     ie = (cls if isinstance(cls._extract_from_webpage, types.MethodType)
           else ydl.get_info_extractor(cls.ie_key()))
 
     for info in ie._extract_from_webpage(url, webpage) or []:
+        # url = None 表示不设置 webpage_url 和 original_url（因为是嵌入视频，不是原始页面）
         ydl.add_default_extra_info(info, ie, None)
         yield info
 
@@ -518,10 +575,14 @@ def _extract_from_webpage(cls, url, webpage):
         yield cls.url_result(embed_url, None if cls._VALID_URL is False else cls)
 ```
 
-**这里的关键设计**：
-- `_extract_from_webpage` 允许是 classmethod 或实例方法
-- 如果是实例方法 → 需要通过 `ydl.get_info_extractor()` 获取实例（触发实例化和缓存）
-- 默认是 classmethod → 零成本，无需实例化即可在 HTML 中扫描
+**这里的关键设计**（基于实际运行验证）：
+
+| `cls._extract_from_webpage` 类型 | `isinstance(..., MethodType)` | `ie` 的值 | 是否实例化 | 场景 |
+|----------------------------------|-------------------------------|-----------|------------|------|
+| `@classmethod`（默认实现） | `True` | `cls`（类本身） | ❌ 不需要 | 绝大多数提取器，仅用 `_EMBED_REGEX` 扫描 |
+| 普通实例方法（重写后） | `False` | 实例化对象 | ✅ 需要 | 提取器重写了 `_extract_from_webpage`，需要访问 `self._downloader` 等实例状态 |
+
+> **重要修正**：之前的理解完全搞反了条件判断的含义。默认的 `_extract_from_webpage` 是 classmethod，所以 `isinstance` 返回 `True`，走第一个分支用类本身，**不实例化**。只有当子类**重写为普通实例方法**（去掉 `@classmethod`）时，才会触发实例化。
 
 ### 5.4 实例缓存机制：_ies 与 _ies_instances
 
@@ -595,8 +656,9 @@ def get_info_extractor(self, ie_key):
    ie = (cls if isinstance(cls._extract_from_webpage, types.MethodType)
          else ydl.get_info_extractor(cls.ie_key()))
    ```
-   - 如果提取器重写了 `_extract_from_webpage` 为实例方法 → 实例化（如需要访问 `self._downloader`）
-   - 默认实现是 classmethod → 不需要实例化，零成本扫描
+   - ⚠️ **条件含义已修正**：`isinstance(..., MethodType) == True` 表示是 `@classmethod` → 用类本身，**不实例化**
+   - 默认实现是 `@classmethod` → 绝大多数提取器零成本扫描，不触发实例化
+   - 只有当子类**重写为普通实例方法**（去掉 `@classmethod`）→ `isinstance` 返回 `False` → 触发实例化（如需要访问 `self._downloader` 等实例状态）
 
 4. **播放列表场景的实例复用**：播放列表中的每个条目通过 `process_ie_result` → `extract_info` 分派时，`get_info_extractor` 直接返回缓存实例，避免了重复的初始化（登录、geo bypass 等）。
 
@@ -779,10 +841,10 @@ GenericIE._real_extract(blog_url)
         ├─► 遍历 self._ies (按优先级)
         │     │
         │     ├─► YoutubeIE.extract_from_webpage(ydl, url, html)
-        │     │     │
-        │     │     ├─► isinstance(_extract_from_webpage, MethodType)?
-        │     │     │     ├─► 否 (默认classmethod) → 直接用类调用，无需实例化
-        │     │     │     └─► 是 (自定义实例方法) → ydl.get_info_extractor() 触发实例化+缓存
+        │     │
+        │     ├─► isinstance(_extract_from_webpage, MethodType)?
+        │     │     │     ├─► ✅ 是 (默认@classmethod) → ie = cls → 直接用类调用，无需实例化
+        │     │     │     └─► ❌ 否 (重写为普通实例方法) → ydl.get_info_extractor() 触发实例化+缓存
         │     │     │
         │     │     └─► _extract_embed_urls → YoutubeIE._EMBED_REGEX 扫 HTML
         │     │           └─► 找到 <iframe src="https://youtube.com/watch?v=xxx">
@@ -817,11 +879,16 @@ GenericIE._real_extract(blog_url)
    - `_ies_instances`：仅存储已实例化的提取器，避免重复初始化（登录、geo bypass 等）
 
 5. **灵活的接力机制**：
-   - `url` 类型：纯净转发，适用于搜索→视频、短链→真实URL
-   - `url_transparent` 类型：保留外层元数据，适用于嵌入视频场景
-   - 可指定 `ie_key` 跳过重新匹配，直接定位目标提取器
+   - `url` 类型：纯净转发，每次接力从头开始，元数据不累积，适用于搜索→视频、短链→真实URL
+   - `url_transparent` 类型：外层元数据优先（仅豁免字段例外），可多层递归合并，适用于嵌入视频场景
+   - 可指定 `ie_key` 跳过重新匹配，直接定位目标提取器，避免遍历开销
+   - `add_extra_info` 内部使用 `setdefault`，不会覆盖已有字段值
 
-6. **按需实例化**：嵌入识别时，只有重写了 `_extract_from_webpage` 为实例方法的提取器才需要实例化，默认实现（classmethod）零成本扫描。
+6. **按需实例化（⚠️ 条件含义与直觉相反）**：
+   - `isinstance(_extract_from_webpage, MethodType) == True` → 是 `@classmethod` → 用类本身，**不实例化**
+   - `isinstance(_extract_from_webpage, MethodType) == False` → 是普通实例方法 → 需要实例化
+   - 默认实现是 `@classmethod` → 绝大多数提取器零成本扫描，不触发实例化
+   - 只有当子类**重写为普通实例方法**（去掉 `@classmethod`）时，才会触发实例化
 
 7. **通用兜底策略**：GenericIE + 嵌入提取机制确保最大兼容性。直链视频直接返回，HTML 页面遍历所有提取器找嵌入。
 
@@ -844,7 +911,8 @@ GenericIE._real_extract(blog_url)
 
 4. 嵌入提取相关：
    - 定义 `_EMBED_REGEX` 列表，每个正则必须包含 `(?P<url>...)` 命名组
-   - 如果嵌入识别需要访问 `self._downloader`（实例状态），重写 `_extract_from_webpage` 为实例方法
+   - 如果嵌入识别需要访问 `self._downloader`（实例状态），重写 `_extract_from_webpage` 为**普通实例方法**（去掉 `@classmethod` 装饰器），这会触发实例化
+   - 默认情况下（`@classmethod`），嵌入识别零成本，不触发实例化
    - 如果需要独占处理网页，抛出 `StopExtraction` 异常
    - 如果提取器需要调用 GenericIE 继续查找，务必加上 `block_ies=[self.ie_key()]` 防循环
 
