@@ -72,7 +72,7 @@ FormatSelector = namedtuple('FormatSelector', ['type', 'selector', 'filters'])
 |--------|--------|----------|------|
 | 最低 | `,` | 顶层 `_parse_format_selection` | 分隔多个独立选择器 |
 | 低 | `/` | 顶层，递归调用 `inside_choice=True` | 候选回退，右结合 |
-| 中 | `+` | 递归调用 `inside_merge=True` | 合并，左结合 |
+| 中 | `+` | 递归调用 `inside_merge=True` | 合并，**右侧递归嵌套** |
 | 高 | `[...]` | 附加到当前选择器 | 过滤器 |
 | 最高 | `()` | 递归调用 `inside_group=True` | 分组 |
 
@@ -89,7 +89,23 @@ FormatSelector = namedtuple('FormatSelector', ['type', 'selector', 'filters'])
 7. 遇到 `w` → 构造 `SINGLE('w', [])`
 8. 最终：`PICKFIRST(MERGE(bv,ba), SINGLE(w), [])`
 
-### 3.3 递归入口的约束
+### 3.3 `+` 的右侧递归嵌套细节
+
+`+` 采用右侧递归嵌套（右结合），而非左结合。解析 `a+b+c` 的过程：
+
+1. 顶层遇到 `a` → `current_selector = SINGLE('a')`
+2. 遇到 `+` → `selector_1 = SINGLE('a')`，递归调用 `_parse_format_selection(tokens, inside_merge=True)` 解析右侧
+3. 递归内遇到 `b` → `current_selector = SINGLE('b')`
+4. 递归内遇到 `+` → `selector_1 = SINGLE('b')`，再次递归调用 `_parse_format_selection(tokens, inside_merge=True)`
+5. 第二次递归内遇到 `c` → `current_selector = SINGLE('c')`
+6. 第二次递归返回 `[SINGLE('c')]`
+7. 第一层递归构造 `MERGE(SINGLE('b'), [SINGLE('c')])`，返回 `[MERGE(...)]`
+8. 顶层构造 `MERGE(SINGLE('a'), [MERGE(SINGLE('b'), [SINGLE('c')])])`
+
+最终结构（伪代码）：`MERGE(a, [MERGE(b, [c])])`。
+编译后执行顺序为 `_merge(_merge(b, c), a)`，即先合并右侧的 `b+c`，再与 `a` 合并。
+
+### 3.4 递归入口的约束
 
 | 递归参数 | 遇到哪个运算符时回退并退出 |
 |-----------|---------------------------|
@@ -146,9 +162,9 @@ def selector_function(ctx):
 
 ### `_merge` 合并细节
 
-1. 展开两边的 `requested_formats`（支持已合并格式的再合并）
+1. 展开两边的 `requested_formats`（支持已合并格式的再合并），合并后的顺序为 `format_1.requested_formats + format_2.requested_formats`
 2. 根据多流策略过滤：
-   - 若不允许同类型多流（默认），只保留第一个视频流和第一个音频流
+   - 若不允许同类型多流（默认），按遍历顺序**保留先遇到的视频流和先遇到的音频流**，后续同类型流被丢弃
    - 剔除 `acodec==vcodec=='none'` 的无效格式
 3. 计算兼容输出扩展名（基于编解码器和 `merge_output_format` 参数）
 4. 构建合并字典，包含 `format_id`、`ext`、`protocol`、`language`、`filesize_approx`、`tbr` 等字段
@@ -224,7 +240,21 @@ elif format_spec == 'mergeall':
 2. `ctx['formats']` 是按"最差→最优"排序，所以 `formats[-1]` 是最优格式
 3. 以最优格式为起点，从次优到最差依次调用 `_merge` 层层合并
 4. 最终只产出**一个合并结果**，包含所有视频/音频流的信息
-5. 受多流策略约束：若未启用 `--video-multistreams` / `--audio-multistreams`，`_merge` 内部会丢弃多余的同类型流，实际只保留一个视频流和一个音频流
+5. 受多流策略约束：若未启用 `--video-multistreams` / `--audio-multistreams`，`_merge` 内部会按遍历顺序保留**先遇到的**视频流和**先遇到的**音频流，后续同类型流被丢弃
+
+**多流关闭时 `_merge` 的流选择细节**：
+```python
+# _merge 内部：
+formats_info = format_1.requested_formats + format_2.requested_formats  # 按合并顺序排列
+get_no_more = {'video': False, 'audio': False}
+for fmt_info in formats_info:
+    if fmt_info 有视频流且 get_no_more['video']: 丢弃
+    elif fmt_info 有视频流且 !get_no_more['video']: 保留, get_no_more['video'] = True
+    if fmt_info 有音频流且 get_no_more['audio']: 丢弃
+    elif fmt_info 有音频流且 !get_no_more['audio']: 保留, get_no_more['audio'] = True
+```
+
+由于 mergeall 按"最优→次优→...→最差"的合并顺序，`formats_info` 中质量较高的流排在前面，因此先遇到的也就是质量较高的视频流和质量较高的音频流会被保留。但代码并未主动"挑选最优"，而是被动地保留遍历顺序中首次出现的流。
 
 **典型用法**：`bv*+mergeall[vcodec=none]` + `--audio-multistreams` = 最佳含视频格式 + 合并所有纯音频格式（多音轨）。
 
@@ -467,8 +497,8 @@ PICKFIRST
 执行流程：
 1. 过滤掉 vcodec 和 acodec 均为 none 的无效格式
 2. 以最优格式（formats[-1]）为基底
-3. 从次优到最差依次与当前结果 `_merge`，由于默认不允许多流，每次合并实际只保留第一个视频和第一个音频
-4. 最终产出一个合并格式，其本质等同于选择了最优的视频格式和最优的音频格式
+3. 从次优到最差依次与当前结果 `_merge`，由于默认不允许多流，`_merge` 会按遍历顺序**保留先遇到的视频流和先遇到的音频流**，后续同类型流被丢弃
+4. 最终产出一个合并格式，其实际保留的是**遍历顺序中首次出现的视频流和首次出现的音频流**，由于 mergeall 从最优开始合并，实际保留的是质量较高的视频流和质量较高的音频流
 
 ### `bestvideo[height<=?480]+bestaudio/worst`
 
