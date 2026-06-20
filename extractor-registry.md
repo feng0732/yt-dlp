@@ -8,11 +8,15 @@
 
 2. **`url_result` 字段优先级**：`**kwargs` 先展开，`_type` 和 `url` 后赋值，会覆盖 kwargs 中的同名键。
 
-3. **`url_transparent` 字段豁免规则**：基本豁免 `_type, url, ie_key`；非视频剪辑场景再豁免 `id, extractor, extractor_key`。视频剪辑场景下外层的 id/extractor 会覆盖内层。
+3. **两种接力的字段传递差异**（核心错误）：
+   - `_type='url'`（普通接力）：**只透传既有的 `extra_info` 参数**（加上公共逻辑从 ie_result 合并的 `original_url`），**不会**把外层 ie_result 的 title/description 等字段传递给下一个提取器
+   - `_type='url_transparent'`（透明接力）：先透传 extra_info 提取内层结果，然后显式执行 `new_result.update(filter_dict(ie_result, ...))`，把外层 ie_result 的非豁免字段合并覆盖到内层结果
 
-4. **`url_transparent` 递归层级**：不是"最多两级合并"，而是通过显式调用 `process_ie_result` 可以多层递归，且内层 `_type='url'` 会被转为 `url_transparent` 继续传递元数据。
+4. **`url_transparent` 字段豁免规则**：基本豁免 `_type, url, ie_key`；非视频剪辑场景再豁免 `id, extractor, extractor_key`。视频剪辑场景下外层的 id/extractor 会覆盖内层。
 
-5. **`add_extra_info` 行为**：内部使用 `setdefault`，不会覆盖已有字段值。
+5. **`url_transparent` 递归层级**：不是"最多两级合并"，而是通过显式调用 `process_ie_result` 可以多层递归，且内层 `_type='url'` 会被转为 `url_transparent` 继续传递元数据。
+
+6. **`add_extra_info` 行为**：内部使用 `setdefault`，不会覆盖已有字段值。
 
 ---
 
@@ -394,27 +398,44 @@ __extract_info(url, ie_instance, ...)    ← 传入的是实例（通过 get_inf
 
 #### 第二阶段：二次分派（核心）
 
-**extra_info 传递链路**：
+**字段传递完整链路**（⚠️ 注意区分 `extra_info` 参数和 `ie_result` 外层字段）：
+
 ```
-extra_info 参数
+process_ie_result(ie_result, download, extra_info)
     │
-    ├─► __extract_info(url, ie, download, extra_info, process)
+    ├─► 公共逻辑（url 和 url_transparent 都会执行）[YoutubeDL.py#L1916-L1937]
     │     │
-    │     ├─► 第 1877-1878 行：如果 extra_info['original_url'] 存在，setdefault 到 ie_result
-    │     ├─► add_default_extra_info(ie_result, ie, url) （setdefault，不覆盖）
-    │     └─► process_ie_result(ie_result, download, extra_info)  ← 透传 extra_info
+    │     ├─► 规范化 ie_result['url']
+    │     │
+    │     └─► 第 1919-1920 行：如果 ie_result 有 original_url 且 extra_info 没有，
+    │           把 original_url 放入 extra_info（仅此一个字段从 ie_result 合并到 extra_info）
+    │           extra_info = {'original_url': ie_result['original_url'], **extra_info}
     │
-    └─► process_ie_result
+    ├─► _type='url'（普通接力）[YoutubeDL.py#L1958-L1964]
+    │     │
+    │     └─► 直接调用 extract_info(ie_result['url'], ..., extra_info=extra_info)
+    │           只传递 extra_info 参数（含上面合并的 original_url）
+    │           ❌ ie_result 的 title/description 等其他字段**不会**传递给下一个提取器
+    │
+    └─► _type='url_transparent'（透明接力）[YoutubeDL.py#L1965-L1995]
           │
-          ├─► _type='url' → extract_info(..., extra_info=extra_info)  ← 继续透传
+          ├─► 调用 extract_info(ie_result['url'], ..., extra_info=extra_info, process=False)
+          │     透传 extra_info（同上）
           │
-          └─► _type='url_transparent'
-                ├─► extract_info(..., extra_info=extra_info, process=False)
-                │     └─► 不会调用 process_ie_result，直接返回 ie_result
-                └─► process_ie_result(new_result, download=download, extra_info=extra_info)  ← 继续透传
+          ├─► ⚠️ 关键：第 1982-1983 行执行字段合并
+          │     new_result = info.copy()   # 内层结果
+          │     new_result.update(filter_dict(ie_result, lambda k, v: v is not None and k not in exempted_fields))
+          │     ✅ 外层 ie_result 的 title/description/uploader 等非豁免字段覆盖内层结果
+          │
+          ├─► 若 new_result._type == 'url' → 转为 'url_transparent' 继续传递外层元数据
+          │
+          └─► 递归调用 process_ie_result(new_result, ..., extra_info=extra_info)
 ```
 
-**关键点**：`add_extra_info` 内部使用 `setdefault`（[YoutubeDL.py#L1666-L1669](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1666-L1669)），只会在字段不存在时设置，不会覆盖已有的值。
+**关键点**：
+1. `add_extra_info` 内部使用 `setdefault`（[YoutubeDL.py#L1666-L1669](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1666-L1669)），只会在字段不存在时设置，不会覆盖已有的值
+2. `_type='url'` 和 `_type='url_transparent'` 在公共逻辑中都会把 `ie_result['original_url']` 合并到 `extra_info`，这是两者唯一的字段从 `ie_result` 流入 `extra_info` 的地方
+3. 只有 `_type='url_transparent'` 才会执行 `new_result.update(ie_result, ...)` 把外层提取器返回的元数据（title、description 等）合并到内层结果
 
 **入口**: [YoutubeDL.process_ie_result()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1904-L2036)
 
@@ -437,14 +458,19 @@ def process_ie_result(self, ie_result, download=True, extra_info=None):
         return ie_result
 
     elif result_type == 'url':
-        # ===== 纯接力：重新调用 extract_info =====
+        # ===== 普通接力：重新调用 extract_info =====
+        # 注释原文：We have to add extra_info to the results because it may be contained in a playlist
+        # 注意：这里只透传 extra_info 参数，**不**把 ie_result（外层提取器返回的）中的
+        # title、description 等字段传递给下一个提取器。
         return self.extract_info(
             ie_result['url'], download,
             ie_key=ie_result.get('ie_key'),   # 可指定提取器
-            extra_info=extra_info)            # 透传额外信息
+            extra_info=extra_info)            # 只透传已有的 extra_info（加上公共逻辑合并的 original_url）
 
     elif result_type == 'url_transparent':
         # ===== 透明接力：先提取，再合并元数据 =====
+        # 注释原文：Use the information from the embedding page
+        # 注意：只有这里才会把外层 ie_result（嵌入页面）中的字段合并到内层结果
         info = self.extract_info(
             ie_result['url'], ie_key=ie_result.get('ie_key'),
             extra_info=extra_info, download=False, process=False)
@@ -460,7 +486,8 @@ def process_ie_result(self, ie_result, download=True, extra_info=None):
             # id、extractor、extractor_key 也以内层为准
             exempted_fields |= {'id', 'extractor', 'extractor_key'}
 
-        # 先复制内层结果，然后用外层的非豁免字段覆盖（外层优先）
+        # ⚠️ 只有这里才执行字段合并：
+        # 先复制内层结果 info，然后用外层 ie_result 的非豁免字段覆盖（外层优先）
         new_result = info.copy()
         new_result.update(filter_dict(ie_result, lambda k, v: v is not None and k not in exempted_fields))
 
@@ -474,12 +501,14 @@ def process_ie_result(self, ie_result, download=True, extra_info=None):
 
 **两种接力方式对比**：
 
-| 特性 | `_type='url'` | `_type='url_transparent'` |
+| 特性 | `_type='url'`（普通接力） | `_type='url_transparent'`（透明接力） |
 |------|--------------|--------------------------|
 | 代码位置 | [YoutubeDL.py#L1958-L1964](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1958-L1964) | [YoutubeDL.py#L1965-L1995](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1965-L1995) |
 | 第一次 `extract_info` 参数 | `process=True, download=download` | `process=False, download=False`（先不处理，只取原始结果） |
-| 元数据合并 | 无合并（每次接力都是全新开始） | **外层优先**：外层字段覆盖内层，仅豁免字段例外 |
+| 外层 ie_result 字段是否传递 | ❌ **不传递**。只透传 `extra_info` 参数（加上公共逻辑合并的 `original_url`） | ✅ **传递并覆盖**。通过 `new_result.update(filter_dict(ie_result, ...))` 把外层非豁免字段合并到内层 |
+| 元数据来源 | 下一个提取器自己获取 | **外层优先**：外层 ie_result 的 title/description 等覆盖内层结果，仅豁免字段例外 |
 | 豁免字段 | 不适用 | 基本豁免：`_type, url, ie_key`；非剪辑场景再豁免：`id, extractor, extractor_key` |
+| 执行 `update(ie_result, ...)` | ❌ 从不执行 | ✅ 每次都执行（合并外层字段） |
 | 递归方式 | 直接调用 `extract_info` 从头开始 | 合并字段后显式递归调用 `process_ie_result` |
 | 递归深度 | 可能多级 | 可能多级（每次递归都会合并外层元数据） |
 | `_type='url'` 转换 | 不转换 | 内层若为 `url` 会被转为 `url_transparent` 以继续传递元数据 |
@@ -878,9 +907,10 @@ GenericIE._real_extract(blog_url)
    - `_ies`：存储所有提取器（类或实例均可），保持优先级顺序，用于遍历匹配
    - `_ies_instances`：仅存储已实例化的提取器，避免重复初始化（登录、geo bypass 等）
 
-5. **灵活的接力机制**：
-   - `url` 类型：纯净转发，每次接力从头开始，元数据不累积，适用于搜索→视频、短链→真实URL
-   - `url_transparent` 类型：外层元数据优先（仅豁免字段例外），可多层递归合并，适用于嵌入视频场景
+5. **⚠️ 两种接力的字段传递机制完全不同**：
+   - `_type='url'`（普通接力）：**只透传既有 `extra_info` 参数**（加上公共逻辑合并的 `original_url`），外层提取器返回的 ie_result 中 title/description 等字段**不会**传递给下一个提取器。适用于搜索→视频、短链→真实URL 等不需要保留外层元数据的场景。
+   - `_type='url_transparent'`（透明接力）：先透传 extra_info 提取内层结果，然后通过 `new_result.update(filter_dict(ie_result, ...))` 把外层 ie_result 的非豁免字段**覆盖合并**到内层结果。适用于嵌入视频、视频剪辑等需要保留外层页面元数据的场景。
+   - 两者唯一共同点：公共逻辑中都会把 `ie_result['original_url']`（如果存在）合并到 `extra_info`
    - 可指定 `ie_key` 跳过重新匹配，直接定位目标提取器，避免遍历开销
    - `add_extra_info` 内部使用 `setdefault`，不会覆盖已有字段值
 
@@ -917,6 +947,6 @@ GenericIE._real_extract(blog_url)
    - 如果提取器需要调用 GenericIE 继续查找，务必加上 `block_ies=[self.ie_key()]` 防循环
 
 5. 返回 `url_result` 时：
-   - 纯转发场景用默认 `_type='url'`
-   - 需要保留当前页面元数据（如 title、description）用 `url_transparent=True`
+   - 纯转发场景（不需要保留当前提取器返回的 title/description 等元数据）用默认 `_type='url'`。此时只有 `extra_info` 参数和 `original_url` 会被传递。
+   - 需要保留当前页面元数据（如博客标题、描述等覆盖嵌入视频的元数据）用 `url_transparent=True`。此时当前 ie_result 的非豁免字段会被 update 覆盖到内层结果。
    - 明确知道目标提取器时，务必传 `ie` 参数，避免重新遍历匹配的开销
