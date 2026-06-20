@@ -309,19 +309,52 @@ if self.params.get('force_write_download_archive'):
 
 **行为**：遍历 `params['print_to_file']['after_video']` 中的 (模板, 文件路径) 对，渲染后追加写入文件。
 
+**代码流程**：
+```python
+for tmpl, file_tmpl in self.params['print_to_file'].get(key, []):
+    filename = self.prepare_filename(info_dict, outtmpl=file_tmpl)
+    tmpl = format_tmpl(tmpl)
+    self.to_screen(f'[info] Writing {tmpl!r} to: {filename}')
+    if self._ensure_dir_exists(filename):
+        with open(filename, 'a', encoding='utf-8', newline='') as f:
+            f.write(self.evaluate_outtmpl(tmpl, info_copy) + os.linesep)
+```
+
+**关键链路**：`_ensure_dir_exists` → `report_error` → `trouble`
+
+```python
+def _ensure_dir_exists(self, path):
+    try:
+        make_parent_dirs(path)
+        return True
+    except OSError as e:
+        self.report_error(f'Unable to create directory: {e}')  # ← 会调用 trouble
+        return False
+
+def trouble(self, message=None, tb=None, is_error=True):
+    self.to_stderr(message)
+    if not is_error:
+        return
+    if not self.params.get('ignoreerrors'):       # ← 看 ignoreerrors
+        raise DownloadError(message, exc_info)    # ← 抛异常
+    self._download_retcode = 1                    # ← 仅记错误码，不抛异常
+```
+
 **失败场景及行为**：
 
-| 失败场景 | 行为 | 是否抛异常 |
-|---|---|---|
-| 父目录创建失败 | `_ensure_dir_exists` 返回 False，**静默跳过**该文件写入 | ❌ 不抛 |
-| `open(file, 'a')` 失败（权限、磁盘满等） | 直接抛出 OSError | ✅ 抛异常 |
-| `f.write(...)` 失败 | 直接抛出 OSError | ✅ 抛异常 |
+| 失败场景 | 行为 | ignoreerrors=False/None | ignoreerrors=True | 归档状态 |
+|---|---|---|---|---|
+| 父目录创建失败 | `_ensure_dir_exists` → `report_error` → `trouble` | ❌ 抛 `DownloadError`，终止流程 | ✅ 不抛异常，仅记 retcode=1，**写文件被跳过** | ✅ 已写入，无回滚 |
+| `open(file, 'a')` 失败（权限、磁盘满等） | 直接抛 `OSError` | ❌ 抛 `OSError`，终止流程 | ❌ 抛 `OSError`（非 DownloadError，ignoreerrors 不生效） | ✅ 已写入，无回滚 |
+| `f.write(...)` 失败 | 直接抛 `OSError` | ❌ 抛 `OSError`，终止流程 | ❌ 抛 `OSError`（非 DownloadError，ignoreerrors 不生效） | ✅ 已写入，无回滚 |
 
-**是否受 ignoreerrors 影响**：❌ 不受影响。`_forceprint` 中没有捕获 OSError 的逻辑，异常会直接向上抛出。
+**目录创建失败是否受 ignoreerrors 影响**：✅ **受影响**。但只有目录创建失败（通过 `_ensure_dir_exists` → `report_error` → `trouble` 路径）才受 `ignoreerrors` 保护。`open/write` 抛出的 `OSError` 不经过 `report_error`，因此不受 `ignoreerrors` 控制。
 
-**归档状态**：✅ 已落盘，无回滚。
+**目录创建失败到底是跳过还是报错**：
+- **ignoreerrors=False**：既报错（to_stderr）又抛 `DownloadError` 异常，整个视频处理终止
+- **ignoreerrors=True**：既报错（to_stderr）但不抛异常，写文件被静默跳过，继续后续 PP 和流程
 
-**注意**：目录创建失败是静默跳过的，不会导致 after_video 阶段失败。只有文件打开/写入本身失败才会抛异常。
+**注意**：无论哪种情况，目录创建失败时 `to_stderr` 一定会输出 ERROR 消息，不存在完全静默的情况。区别只在于是否抛异常终止流程。
 
 ---
 
@@ -358,14 +391,14 @@ except PostProcessingError as e:
 
 ### 5.6 after_video 失败总表
 
-| 失败步骤 | 失败类型 | 受 ignoreerrors 影响 | 异常是否抛出 | 归档是否已写入 | 归档是否回滚 |
-|---|---|---|---|---|---|
-| forceprint 模板渲染失败 | 非 PP 异常 | ❌ 不受 | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
-| print_to_file 目录创建失败 | 非 PP 异常 | ❌ 不受 | ❌ 静默跳过 | ✅ 已写入 | ❌ 不回滚 |
-| print_to_file open/write 失败 | OSError | ❌ 不受 | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
-| 自定义 PP 抛 PostProcessingError | PP 异常 | ✅ 受（ignoreerrors is True 时忽略） | 取决于设置 | ✅ 已写入 | ❌ 不回滚 |
-| 自定义 PP 抛其他异常 | 非 PP 异常 | ❌ 不受 | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
-| max_downloads_reached | 控制流异常 | - | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
+| 失败步骤 | 失败类型 | 受 ignoreerrors 影响 | ignoreerrors=False/None | ignoreerrors=True | 归档是否已写入 | 归档是否回滚 |
+|---|---|---|---|---|---|---|
+| forceprint 模板渲染失败 | 非 PP 异常 | ❌ 不受 | ✅ 抛出异常终止 | ✅ 抛出异常终止（非 PostProcessingError/DownloadError） | ✅ 已写入 | ❌ 不回滚 |
+| print_to_file 目录创建失败 | report_error 触发 DownloadError | ✅ 受 | ❌ 抛出 DownloadError 终止 | ✅ 仅记 retcode=1，不抛异常，跳过写文件 | ✅ 已写入 | ❌ 不回滚 |
+| print_to_file open/write 失败 | OSError | ❌ 不受 | ❌ 抛出 OSError 终止 | ❌ 抛出 OSError 终止 | ✅ 已写入 | ❌ 不回滚 |
+| 自定义 PP 抛 PostProcessingError | PP 异常 | ✅ 受（仅 ignoreerrors is True 时忽略） | ❌ 抛出 PostProcessingError 终止 | ✅ report_error + 继续后续 PP | ✅ 已写入 | ❌ 不回滚 |
+| 自定义 PP 抛其他异常 | 非 PP 异常 | ❌ 不受 | ❌ 抛出异常终止 | ❌ 抛出异常终止 | ✅ 已写入 | ❌ 不回滚 |
+| max_downloads_reached | 控制流异常 | - | ✅ 抛出 MaxDownloadsReached | ✅ 抛出 MaxDownloadsReached | ✅ 已写入 | ❌ 不回滚 |
 
 ---
 
@@ -375,9 +408,12 @@ except PostProcessingError as e:
 
 1. **at-least-once 语义**：只要下载成功就归档，after_video 阶段的失败不影响归档记录。下次运行时该视频会被跳过。
 2. **after_video 适合做"锦上添花"的操作**：如元数据上报、统计、通知等。这些操作失败不应影响视频已下载的事实。
-3. **ignoreerrors 的有限作用**：`ignoreerrors` 只能保护 `PostProcessingError` 类型的 PP 失败，对于 `_forceprint` 中的错误（模板渲染、文件写入）无能为力。
+3. **ignoreerrors 的有限作用**：
+   - 对 PP：只保护 `PostProcessingError` 类型的 PP 失败
+   - 对 print_to_file 目录创建：通过 `_ensure_dir_exists` → `report_error` → `trouble` 链路保护，防止 `DownloadError` 终止流程
+   - 对 forceprint 模板渲染、print_to_file 的 open/write OSError、PP 抛其他异常：完全不受保护
 4. **如果 after_video 失败需要重试**：不能依赖归档去重，需要手动清理归档记录或使用其他机制。
-5. **print_to_file 目录创建静默失败**：目录创建失败不会报错也不会终止流程，可能导致写文件操作被静默跳过而用户不知情。
+5. **print_to_file 目录创建失败不是完全静默**：无论 ignoreerrors 如何设置，都会向 stderr 输出 `ERROR:` 消息。区别只在于是否抛 `DownloadError` 异常终止流程。ignoreerrors=True 时会记 retcode=1 但继续执行，写文件操作被跳过。
 
 ---
 
