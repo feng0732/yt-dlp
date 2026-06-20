@@ -244,60 +244,131 @@ def __init__(self, ydl, info_dict):
 ### 5.2 parse_playlist_items() — start/end/items 解析
 
 ```python
-PLAYLIST_ITEMS_RE = r'''(?x)
+PLAYLIST_ITEMS_RE = re.compile(r'''(?x)
     (?P<start>[+-]?\d+)?
     (?P<range>[:-]
-        (?P<end>[+-]?\d+|inf(?:inite)?)?
+        (?P<end>[+-]?\d+|inf(?:inite)?)?   # end 支持数字 / 负号 / inf / infinite
         (?::(?P<step>[+-]?\d+))?
-    )?'''
+    )?''')
 
 @classmethod
 def parse_playlist_items(cls, string):
     for segment in string.split(','):
-        # 解析为 int 或 slice(start, end, step)
-        # 例：'3,5:10' → yield 3, slice(5,10,None)
-        yield slice(int_or_none(start), float_or_none(end), int_or_none(step)) if has_range else int(start)
+        if not segment:
+            raise ValueError('There is two or more consecutive commas')
+        mobj = cls.PLAYLIST_ITEMS_RE.fullmatch(segment)
+        if not mobj:
+            raise ValueError(f'{segment!r} is not a valid specification')
+        start, end, step, has_range = mobj.group('start', 'end', 'step', 'range')
+        if int_or_none(step) == 0:
+            raise ValueError(f'Step in {segment!r} cannot be zero')
+        # 返回值保持用户原始 1-based 语义：start/end 不做 0-based 转换
+        # 例：'3,5:10' → yield 3, slice(5, 10, None)
+        #     '::-1'   → yield slice(None, None, -1)
+        #     '1:inf:2' → yield slice(1, float('inf'), 2)
+        if has_range:
+            yield slice(int_or_none(start), float_or_none(end), int_or_none(step))
+        else:
+            yield int(start)
 ```
 
-用户参数映射（`get_requested_items` L2462 附近）：
-- `--playlist-start N --playlist-end M`  → 合成 `f'{N}:{M}'` 再解析
-- `--playlist-items '1,3,5:10'`          → 直接解析，此时 start/end 被忽略并告警
+**⚠️ `--playlist-end -1` 的特殊兼容陷阱**（`get_requested_items` L2462 附近）：
+```python
+playlist_start = self.ydl.params.get('playliststart', 1)
+playlist_end   = self.ydl.params.get('playlistend')
+if playlist_end in (-1, None):      # -1 被历史兼容为"不设终点"，不是"倒数第 1 条"！
+    playlist_end = ''
+if not playlist_items:
+    playlist_items = f'{playlist_start}:{playlist_end}'
+```
+- `--playlist-end -1` 实际等价于**不指定 playlist_end**（全量到尾），不是负索引。
+- 要表达"倒数第 N 条"必须用 `--playlist-items '1:-5'`（通过 items 语法走负号解析），不能用 `--playlist-start/end`。
+
+用户参数映射：
+- `--playlist-start N --playlist-end M`  → 合成字符串 `f'{N}:{M}'` 再调用 parse_playlist_items
+- `--playlist-items '1,3,5:10'`          → 直接解析；若同时指定了 start/end 会告警并忽略 start/end
+
+**合法的 items 写法示例**（测试用例真实行为，以 10 条 `[1..10]` 为例）：
+
+| items 字符串 | parse 结果（slice/int） | 真实选到的下标（1-based） | 说明 |
+|---|---|---|---|
+| `':'` / `'::1'` | `slice(None, None, 1)` | 1,2,3,4,5,6,7,8,9,10 | 全量 |
+| `'::-1'` | `slice(None, None, -1)` | 10,9,8,7,6,5,4,3,2,1 | 反向全量，会触发 `len(self)` |
+| `':6'` | `slice(None, 6, None)` | 1,2,3,4,5,6 | 前 6 条 |
+| `':-6'` | `slice(None, -6, None)` | 1,2,3,4,5 | 等价于 Python `[:-5]`（注意偏移 +1），触发 `len(self)` |
+| `'-1:6:-2'` | `slice(-1, 6, -2)` | 10,8,6 | 反向步长 2，从倒数第 1 条到第 6 条，触发 `len(self)` |
+| `'9:-6:-2'` | `slice(9, -6, -2)` | 9,7,5 | 反向步长 2，触发 `len(self)` |
+| `'1:inf:2'` / `'1:infinite:2'` | `slice(1, float('inf'), 2)` | 1,3,5,7,9 | 无限终点，正向步长 2，不触发 `len(self)` |
+| `'-2:inf'` | `slice(-2, float('inf'), None)` | 9,10 | 倒数第 2 条到末尾，先触发 `len(self)` 算起点 |
+| `':inf:-1'` | `slice(None, float('inf'), -1)` | 空 | 反向 + 终点=inf 永远不进入 frange |
+| `'0-2:2'` | `slice(0, 2, 2)` | 2 | start=0 被 `-1` 后变成 -1，`i<0` 跳过；下一个 i=1 → 下标 2 |
+| `'1-:2'` | `slice(1, None, 2)` | 1,3,5,7,9 | 省略 end 的正步长区间写法 |
+| `'0--2:2'` | `slice(0, -2, 2)` | 2,4,6,8 | 触发 `len(self)`，等价 `[1:-1:2]` |
+| `'0'` | `0` | 空 | int(0) 经 `-1` 得 i=-1，被 `if i<0: continue` 跳过 |
+| `'20'` | `20` | 空 | 超出范围 → `_getter` 抛 IndexError → break |
+
+---
 
 ### 5.3 __getitem__ — 用户范围到实际索引的转换
 
+`PlaylistEntries` 对用户的 1-based 输入到生成器产出 `(1-based_index, entry)` 做了 4 步转换：
+
 ```python
 def __getitem__(self, idx):
+    # ── Step 1：单 int 统一转成 slice，后续只用一套边界处理 ──
     if isinstance(idx, int):
-        idx = slice(idx, idx)                 # 单数字也转成 slice，保持统一
+        idx = slice(idx, idx)             # int(3) → slice(3, 3)
+                                          # 这样 int 和 slice 走相同的 start/stop 计算
 
+    # ── Step 2：step 默认值 ──
     step = 1 if idx.step is None else idx.step
-    # 用户下标从 1 开始，转成 0-based
+
+    # ── Step 3：算 start（用户 1-based → 0-based） ──
     if idx.start is None:
-        start = 0 if step > 0 else len(self) - 1   # ⚠️ len(self) → 全量消费！
+        # 起点缺省：正向从头开始，反向从尾开始
+        start = 0 if step > 0 else len(self) - 1   # ⚠️ 反向起点调 len(self) → 全量消费！
     else:
-        start = idx.start - 1 if idx.start >= 0 else len(self) + idx.start
-    #
+        # 正数：减 1 变 0-based；负数：len(self) + idx.start
+        start = idx.start - 1 if idx.start >= 0 else len(self) + idx.start  # ⚠️ 负起点也调 len
+
+    # ── Step 4：算 stop（用户 1-based → 0-based → frange 开区间） ──
     if idx.stop is None:
-        stop = 0 if step < 0 else float('inf')     # 没有上限 → 到无穷（一直取到出错）
+        # 终点缺省：反向到 0，正向到无穷
+        stop = 0 if step < 0 else float('inf')
     else:
-        stop = idx.stop - 1 if idx.stop >= 0 else len(self) + idx.stop
+        # 正数：减 1 变 0-based；负数：len(self) + idx.stop
+        stop = idx.stop - 1 if idx.stop >= 0 else len(self) + idx.stop   # ⚠️ 负终点也调 len
+    # ⭐ 关键修正：用户想要的是"包含 stop"的闭区间，但 frange 是开区间 (<)
+    #   step>0 → stop += 1 让 frange 包含用户的 stop
+    #   step<0 → stop -= 1 让 frange 往负方向多走一格（stop 是较小的 0-based 索引）
     stop += [-1, 1][step > 0]
 
+    # ── Step 5：frange 产出 0-based i，跳过负数，逐一取条目 ──
     for i in frange(start, stop, step):
-        if i < 0: continue
+        # frange 行为：while sign*start < sign*stop: yield start; start += step
+        if i < 0:
+            continue                        # 用户写 0 或很小的负数时跳过
         try:
-            entry = self._getter(i)                 # ⭐ 逐次按单个索引访问
+            entry = self._getter(i)         # ⭐ 单个索引访问 → LazyList[i] / PagedList[i]
         except self.IndexError:
-            self.is_exhausted = True; break if step>0 else continue
-        yield i + 1, entry                           # 返回 (1-based 下标, entry)
+            self.is_exhausted = True
+            if step > 0: break               # 正向：到尾就退出
+            else:     continue              # 反向：越界跳过，继续尝试下一个 i
+        yield i + 1, entry                   # ⭐ 对外再转回 1-based 下标
 ```
 
-**关键观察（⭐）**：`PlaylistEntries` 对底层容器的访问方式是**"单个索引逐个访问"** —— `_getter(i)` → `self._entries[i]`，而**不是**传入一个 slice。
+**边界示例（对照测试用例）**：
+- 用户 `'3'`（单元素）→ int(3) → slice(3,3) → start=3-1=2, stop=3-1=2, step=1 → stop+=1=3 → frange(2,3,1) → `i=2` → yield `(3, entry)` ✅
+- 用户 `'2-4'` → slice(2,4) → start=1, stop=4-1=3, step=1 → stop+=1=4 → frange(1,4,1) → `i=1,2,3` → yield `(2, entry), (3, entry), (4, entry)` 即 `[2,3,4]` ✅（与测试一致）
+- 用户 `':-6'`（10 条列表）→ slice(None, -6) → start=0, stop=len+(-6)=4, step=1 → stop+=1=5 → frange(0,5,1) → `i=0..4` → yield `1..5` ✅（等价 Python `INDICES[:-5]`，比用户写的 -6 多 +1）
+- 用户 `'::-1'`（反向全量）→ slice(None, None, -1) → `start=len(self)-1` ⚠️ 先全量消费 → start=9, stop=0, step=-1 → stop+=(-1)=-1 → frange(9,-1,-1) → `i=9,8..0` → yield `10,9..1` ✅
+
+**关键观察（⭐）**：`PlaylistEntries` 对底层容器的访问方式是**"单个索引逐个访问"** —— 每次循环调 `_getter(i)` → 最终是 `self._entries[i]`（单个 int 索引），而**不是**一次性传入 slice。
 
 这意味着：
-- 对 **PagedList**：`PagedList[i]` 内部会调 `getslice(i, i+1)`，仍然按页号精确跳页，没问题
-- 对 **LazyList**：`LazyList[i]` 走单元素分支 → 只会消费到 `i`，顺序推进，但**不能跳**
-- 对 **`idx.start` 为负 / `idx.stop` 为负 / 需要 `len(self)`**：先调用 `__len__` → `tuple(self[:])` → **全量消费生成器，全部翻页请求打完**
+- 对 **PagedList**：`PagedList[i]` 内部会走 `__getitem__` → 若传入 int 则调 `_getslice(i, i+1)`，仍然按页号精确跳页，没问题
+- 对 **LazyList**：`LazyList[i]` 走单元素分支 → 只会消费到 `i`，顺序推进，但**不能跳过前面的元素**
+- 对 **`idx.start` 为负 / `idx.stop` 为负 / step<0 且 start=None**：先调用 `len(self)` → `tuple(self[:])` → **全量消费生成器，全部翻页请求打完**
 
 ### 5.4 _getter — 单条获取的异常包装
 
@@ -305,45 +376,58 @@ def __getitem__(self, idx):
 @functools.cached_property
 def _getter(self):
     if isinstance(self._entries, list):
-        def get_entry(i): ...  # 直接索引
+        def get_entry(i): ...  # 直接索引，IndexError 抛 self.IndexError / EntryNotInPlaylist
     else:
         def get_entry(i):
             try:
-                # 用 _handle_extraction_exceptions 包一层，单条失败不中断
+                # ⭐ 单个索引访问套上 _handle_extraction_exceptions 装饰器
+                # 页面请求失败等 ExtractorError 会被 report_error；
+                # LazyList.IndexError / PagedList.IndexError 在装饰器白名单内原样 re-raise
                 return type(self.ydl)._handle_extraction_exceptions(
                     lambda _, i: self._entries[i])(self.ydl, i)
             except (LazyList.IndexError, PagedList.IndexError):
                 raise self.IndexError
+    return get_entry
 ```
 
-每个单独索引的访问都带异常处理，确保某一页请求失败时可以按 `--ignore-errors` 策略处理。
+装饰器内的异常处理（见第 10 节详细说明）：
+- 属于白名单的 4 种异常（含 `LazyList.IndexError`、`PagedList.IndexError`）原样抛出，被上面 `except` 捕获并转成 `self.IndexError`
+- 其它异常（翻页 HTTP 失败等 `ExtractorError` / 普通 `Exception`）：若 `--ignore-errors` 开启则 `report_error` + 返回 None（单条视为失败），否则原样 re-raise 冒泡
 
 ---
 
 ## 6. 范围筛选对翻页请求的实际影响（完整决策表）
 
-综合上面几层，现在可以给出**用户参数 → 实际翻页请求行为**的完整映射。
+综合上面几层，现在给出**用户参数 → 实际翻页请求行为**的完整映射。
 
 假设：一个 1000 条、每页 100 条的播放列表，底层 `entries` 为 `LazyList(generator)`（YouTube 的典型情况）。
 
-| 用户参数 | PlaylistEntries 切片 | 底层访问模式 | 实际触发的页 | 说明 |
-|---|---|---|---|---|
-| （无筛选，全量） | `[1:]` → start=0, stop=∞ | `_getter(0), _getter(1)...` 直到 IndexError | page 0 ~ page 9（全部 10 页） | stop=∞ 不会强制 exhaust，但会一直迭代到尾 |
-| `--playlist-start 1 --playlist-end 50` | `[1:50]` → start=0, stop=49 | `_getter(0..49)` → LazyList 消费到 index 49 | page 0（前 50 条都在第一页） | ✅ 只请求第 0 页 |
-| `--playlist-start 301 --playlist-end 350` | `[301:350]` → start=300, stop=349 | `_getter(300..349)` → LazyList **顺序消费 0..349** | page 0, 1, 2, 3（前 4 页） | ❌ **虽然只需要第 301-350 条，但因为是生成器顺序推进，前面的 page 0/1/2 也必须全部请求完** |
-| `--playlist-items 1,101,201`（离散项） | `int(1), int(101), int(201)` → `slice(1,1), slice(101,101), slice(201,201)` | `_getter(0)`, `_getter(100)`, `_getter(200)` | page 0, 1, 2 | ❌ 同样顺序消费，每跳到一个新索引都补消费中间部分 |
-| `--playlist-items 900:1000`（尾部范围） | `[900:1000]` → start=899, stop=999 | `_getter(899..999)` → 消费全部 0..999 | page 0 ~ 9（全部 10 页） | ❌ 生成器必须从头 yield |
-| `--playlist-end -10`（负索引终点） | 解析时遇到负 stop → `len(self)+idx.stop` → 调 `__len__` | `__len__` → `tuple(self[:])` → **立即全量消费** | page 0 ~ 9（全部） | ❌ 负索引触发 `len()`，直接全部翻完 |
-| `--playlist-items '::-1'`（反向 step） | `start=None, stop=None, step=-1` → 看 L2521-2522：`start=len(self)-1` → 又调 `__len__` | `__len__` → 全量消费 | 全部页 | ❌ 反向遍历必须先知道总长 |
+| 用户参数 | 内部 slice | 触发 `len(self)` 全量消费？ | 实际消费到的最大 0-based 索引 | 实际触发的页 | 说明 |
+|---|---|---|---|---|---|
+| （无筛选，全量） | `slice(1, '', None)` → `slice(1, None)` → start=0, stop=∞ | 否 | 999（迭代到 IndexError） | page 0 ~ 9（全部 10 页） | stop=∞ 不强制 exhaust，但会一直迭代直到耗尽 |
+| `--playlist-start 1 --playlist-end 50` | `slice(1, 50)` → start=0, stop=50（经过 step>0 偏移） | 否 | 49 | page 0（前 50 条都在第一页） | ✅ 只请求第 0 页 |
+| `--playlist-end 50` | 同上 | 否 | 49 | page 0 | ✅ 同 start=1 end=50 |
+| `--playlist-end -1`（⚠️ 历史兼容） | `-1` 被转成空字符串 → `slice(1, None)` 等价全量 | 否 | 999（迭代到 IndexError） | page 0 ~ 9（全部） | ❗ `-1` **不是负索引**，被兼容为"不设终点" |
+| `--playlist-items :-10`（负索引终点） | `slice(None, -10)` → `stop = len(self) + (-10)` 触发 len | ✅ 是 | 999（len 时全量） | page 0 ~ 9（全部） | ❌ 负 stop 触发 `len()` 直接全翻，翻完后再 slice 取前 990 条 |
+| `--playlist-start 301 --playlist-end 350` | `slice(301, 350)` → start=300, stop=350 | 否 | 349 | page 0, 1, 2, 3（前 4 页） | ❌ **虽然只需要 301-350，但生成器必须顺序 yield 到 index 349，前面的 page 0/1/2 也要请求** |
+| `--playlist-items 1,101,201`（离散项） | int(1) → slice(1,1); int(101)→slice(101,101); int(201)→slice(201,201) | 否 | 200（到第 3 段为止） | page 0, 1, 2 | ❌ 顺序消费，每段单独推进 LazyList，无法"跳回" |
+| `--playlist-items 900:1000`（尾部范围） | `slice(900, 1000)` → start=899, stop=1000 | 否 | 999 | page 0 ~ 9（全部 10 页） | ❌ 生成器必须从头 yield 到 999 |
+| `--playlist-items 0` | int(0) → slice(0,0) → start=-1 | 否 | -1 被 `if i<0: continue` 跳过 | 无请求 | 空结果，消费 0 条 |
+| `--playlist-items 2000`（越界） | int(2000) → start=1999 → `_getter(1999)` 抛 IndexError → break | 否 | 999（消费到耗尽） | page 0 ~ 9（全部） | ❌ 生成器顺序推进到耗尽才知道越界，全部翻完 |
+| `--playlist-items :::-1`（反向 step） | start 缺省且 step<0 → `start=len(self)-1` 触发 len | ✅ 是 | 999（len 时全量） | 全部页 | ❌ 反向必须先知道总长 |
+| `--playlist-items 1:inf:2`（无限终点） | `slice(1, inf, 2)` → start=0, stop=∞, step=2 | 否 | 998（偶数索引） | page 0 ~ 9（全部 10 页） | ⚠️ inf 不触发 len，但仍会迭代到耗尽；如果步长大实际请求的页数相同 |
+| `--playlist-items -2:inf`（负起点 + 无限终点） | start=-2 → `start = len(self) + (-2)` 触发 len | ✅ 是 | 999（len 时全量） | 全部页 | ❌ 负起点触发 len |
 
 ### 如果底层换成 OnDemandPagedList（行为完全不同）
 
 | 用户参数 | 实际触发的页 |
 |---|---|
 | `--playlist-start 301 --playlist-end 350` | pagenum = 300//100=3 .. 349//100=3 → **只请求 page 3** ✅ |
-| `--playlist-items 1,101,201` | page 0, page 1, page 2 → **3 次请求，中间不跨页浪费** ✅ |
+| `--playlist-items 1,101,201` | int(1)→getslice(0,1)→page 0; int(101)→getslice(100,101)→page 1; int(201)→getslice(200,201)→page 2 → **3 次请求，不跨页浪费** ✅ |
+| `--playlist-items 900:1000` | getslice(899,1000) → pagenum 8, 9 → **只请求 page 8, 9** ✅ |
+| `--playlist-items :::-1` | 调 len() → 对 InAdvancePagedList 无害（已知 pagecount） |
 
-**所以**：生成器型 entries（YouTube 式）受限于顺序消费，只有 PagedList 型 entries 能真正跳过中间页。
+**核心差异**：生成器型 entries（YouTube 式）受限于顺序消费，只有 PagedList 型 entries 能真正跳过中间页。
 
 ---
 
@@ -360,41 +444,48 @@ __process_playlist(ie_result, download)
   │     → 生成器自动包装为 LazyList
   │
   ├─ entries = orderedSet(all_entries.get_requested_items(), lazy=True)
-  │     → orderedSet 在 lazy=True 时返回去重生成器（不消费）
+  │     → orderedSet(lazy=True) 返回去重生成器（不消费）
   │     → get_requested_items 产出 (1-based_index, entry)
   │
   ├─ lazy = params['lazy_playlist']
   │
   ├─ 非 lazy 分支（默认）：
   │     entries = resolved_entries = list(entries)   # ⚠️⭐ 这里一次性消费
-  │     → 触发 get_requested_items 生成器跑完
-  │     → 触发所有 _getter(i) → 所有范围内翻页请求打完
-  │     n_entries = len(resolved_entries)            # 此时可以显示总数
+  │     → get_requested_items 生成器跑完全程
+  │     → 所有 _getter(i) 被调完 → 筛选范围内所有翻页请求全部发出
+  │     n_entries = len(resolved_entries)            # 此时已知精确总数
   │
   ├─ lazy 分支：
-  │     resolved_entries, n_entries = [], 'N/A'      # 总长未知
-  │     entries 还是生成器，留到 for 循环才消费
+  │     resolved_entries, n_entries = [], 'N/A'      # 总长未知，先占位
+  │     ie_result['requested_entries'] = None        # 清空 infodict 中的浅引用
+  │     ie_result['entries'] = None
+  │     entries 还是生成器，留到下面 for 循环才消费
   │
-  ├─ （写 playlist info.json 等文件）
+  ├─ （写 playlist info.json / description / thumbnails）
   │
-  ├─ 非 lazy：playlistreverse / playlistrandom 可排序（已有全量 list）
-  │   lazy：  这两个选项告警不支持
+  ├─ ⚠️ playlistreverse / playlistrandom 分支：
+  │     if lazy:
+  │         report_warning("... not supported with lazy_playlist")
+  │         # 不做任何操作，不会触发 exhaust
+  │     elif playlistreverse:
+  │         entries.reverse()                         # entries 已是 list，不触发
+  │     elif playlistrandom:
+  │         random.shuffle(entries)                   # entries 已是 list，不触发
   │
   └─ for i, (playlist_index, entry) in enumerate(entries):
         │
-        ├─ lazy：resolved_entries.append(...)   # 边迭代边追加
+        ├─ lazy：resolved_entries.append(...)         # 边迭代边累计
         │
         ├─ entry_copy = ChainMap(entry + playlist_info + playlist_index)
         │
-        ├─ _match_entry(entry_copy, incomplete=True)    # 日期/标题/观看量 过滤
-        │   → 不匹配但没开 break_on_reject → 只是跳过，不 break
-        │   → 开了 break_on_reject + reject 命中 → 抛 RejectedVideoReached → 中止
+        ├─ _match_entry(entry_copy, incomplete=True) is not None
+        │   → 被 match_filter/date/等过滤（非 break 情形）
+        │   → resolved_entries[i] = NO_DEFAULT; continue
         │
         ├─ （打印 "Downloading item i of N"）
         │
         └─ __process_iterable_entry(entry, download, extra_info)
-              └─ process_ie_result(...)
-                    └─ （单条展开 / 下载）
+              └─ process_ie_result(...)                # 单条展开 / 下载
 ```
 
 ### 7.2 消费时机的 4 个关键分叉点
@@ -468,16 +559,19 @@ for i, (playlist_index, entry) in enumerate(entries):
 
 以下任一场景都会导致"用户以为选了范围，实际还是翻完全部/大部"：
 
-| 触发条件 | 所在位置 | 后果 |
-|---|---|---|
-| **`--playlistreverse`** | __process_playlist L2122-2123：`entries.reverse()`（要求非 lazy 并已有 list） + LazyList 反向步进 | 非 lazy：已经 list 但本来就是全量；LazyList 单独使用时 reverse 会 exhaust |
-| **`--playlistrandom`** | __process_playlist L2124-2125：`random.shuffle(entries)` | shuffle 需要 list → 全量消费 |
-| **负索引** 如 `--playlist-end -5` | PlaylistEntries.__getitem__ L2524, L2530 调 `len(self)` → `__len__` → `tuple(self[:])` | LazyList 全量 exhaust |
-| **反向 step** 如 `--playlist-items '::-2'` | 同上，需要先算 `len(self)` 找起点 | LazyList 全量 exhaust |
-| **`--playlist-items '[:]'` / 省略 end** | LazyList.__getitem__ L2265 判断 `stop is None and step > 0` → `_exhaust()` | LazyList 全量 exhaust |
-| **调用 `len(PlaylistEntries)`** | `__len__` = `len(tuple(self[:]))` | 全量 exhaust |
-| **`playlist_count` 推断** 对 InAdvancePagedList pagesize=1 | get_full_count 直接返回 `_pagecount` | 无害，不触发请求（只对该类生效） |
-| **`_playlist_infodict` 的 `__last_playlist_index`** | L2071：`max(ie_result.get('requested_entries') or (0, 0))` | 只在已经有 requested_entries 时用，不触发请求 |
+| 触发条件 | 所在位置 | 真实行为 | 是否会额外触发全翻 |
+|---|---|---|---|
+| **负索引 start/stop** 如 `--playlist-items ':-5'` / `'2:-3'` | PlaylistEntries.__getitem__：`len(self) + idx.start/stop` | `len(self)` → `tuple(self[:])` 立即触发 LazyList 全量 exhaust | ❌ 是 |
+| **反向 step** 如 `--playlist-items '::-1'` / `'5:1:-2'` | PlaylistEntries.__getitem__：start 缺省且 step<0 → `start = len(self) - 1` 调 `len(self)` | 同上，负起点也会先全量 | ❌ 是 |
+| **`--playlist-items '[:]'` 全切片 / 省略 stop** | LazyList.__getitem__：`stop is None and step > 0` 判断 → `_exhaust()` | LazyList 判定无法找到终点 → 全量消费 | ❌ 是 |
+| **显式调用 `len(PlaylistEntries)`** | `__len__` = `len(tuple(self[:]))` | 直接全切片 self[:] → 全量 | ❌ 是 |
+| **`--playlistreverse`（非 lazy，默认）** | __process_playlist L2122：`entries.reverse()` | 此时 entries 已经是 `list(entries)` 消费完的结果 → reverse 只是对内存 list 反转，**不额外触发翻页** | ⚠️ 翻页请求已在 `list(entries)` 时完成，不是 reverse 导致的 |
+| **`--playlistreverse`（lazy 模式）** | __process_playlist L2120-2121：`report_warning` + 不做任何操作 | **不会触发任何翻页**，只是告警然后用原顺序继续 | ✅ 不会额外翻页 |
+| **`--playlistrandom`（非 lazy）** | __process_playlist L2124：`random.shuffle(entries)` | 同上，shuffle 的是已经消费完的 list | ⚠️ 同上，翻页请求已在 `list(entries)` 时完成 |
+| **`playlist_count` 推断**（InAdvancePagedList pagesize=1） | `get_full_count()` 直接返回 `_pagecount` | 不触发任何请求 | ✅ 无害（仅该类） |
+| **`_playlist_infodict` 的 `__last_playlist_index`** | `max(ie_result.get('requested_entries') or (0,0))` | 只在已有 `requested_entries` 被回填后使用 | ✅ 不触发 |
+
+> **关键澄清**：`--playlistreverse / --playlistrandom` **本身并不导致翻页**——真正触发全量翻页的是默认的非 lazy 模式（`list(entries)` 那行代码），reverse/shuffle 只是在结果上的后处理。如果用户同时开了 lazy 模式又加 reverse，根本不会 reverse（只会告警），也不会多翻页。
 
 ---
 
@@ -658,36 +752,153 @@ watch 页面右侧的"正在播放"列表（inline playlist）使用 `next` API�
 
 ---
 
-## 10. 提前终止的完整拦截点图
+## 10. 提前终止的完整拦截点图与异常传播路径
+
+### 10.1 _handle_extraction_exceptions —— 装饰器的真实行为
+
+首先明确这个被大量方法（`__extract_info`、`__process_iterable_entry`、`PlaylistEntries._getter` 内部调用）都套着的装饰器到底吞哪些异常、不吞哪些：
+
+```python
+def _handle_extraction_exceptions(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        while True:
+            try:
+                return func(self, *args, *kwargs)
+            except (CookieLoadError, DownloadCancelled, LazyList.IndexError, PagedList.IndexError):
+                raise             # ⭐ 白名单：原样 re-raise，不 report_error
+            except ReExtractInfo as e:
+                ...; continue     # 重试：重新跑 while
+            except GeoRestrictedError as e:
+                self.report_error(msg)   # 吞掉 + report_error，然后 break 退出 while（函数返回 None）
+            except ExtractorError as e:
+                self.report_error(str(e), ...)  # 吞掉 + report_error，返回 None
+            except Exception as e:
+                if self.params.get('ignoreerrors'):
+                    self.report_error(str(e), tb=...)  # ⚠️ ignoreerrors 才吞，否则 re-raise
+                else:
+                    raise
+            break
+    return wrapper
+```
+
+**分类汇总**：
+
+| 异常类型 | 装饰器行为 | 是否"吞掉"（返回 None） |
+|---|---|---|
+| `CookieLoadError`, `DownloadCancelled`, `LazyList.IndexError`, `PagedList.IndexError` | 直接 re-raise | 否 |
+| `ReExtractInfo` | continue 重试 | 否（重试） |
+| `GeoRestrictedError` | report_error + break | 是（函数返回 None） |
+| `ExtractorError` | report_error + break | 是（函数返回 None） |
+| 其它 Exception（含 `ExistingVideoReached`, `RejectedVideoReached` 等） | `ignoreerrors=True` → 吞；`ignoreerrors=False` → re-raise | 视参数而定 |
+
+`ExistingVideoReached` 和 `RejectedVideoReached` **不在白名单里**，它们是普通 Exception 子类：
+- 默认 `ignoreerrors=False` → 会原样 re-raise，整个命令**直接失败终止
+- 只有显式开了 `--ignore-errors` 才会被吞掉返回 None，计入 failures
+
+---
+
+### 10.2 三层终止拦截点（按代码执行顺序）
 
 ```
-用户开启 --break-on-existing / --break-on-reject / --skip-playlist-after-errors N
-         │
-         ▼
- ┌─ __process_playlist() ────────────────────────────────────────────────┐
- │                                                                        │
- │  ① get_requested_items()（只在 非lazy）                                 │
- │     _match_entry(entry, incomplete=True, silent=True)                  │
- │     ├─ 命中 archive 且开 break_on_existing → ExistingVideoReached      │
- │     └─ 被 reject 且开 break_on_reject  → RejectedVideoReached          │
- │       → 生成器 return，后面的翻页请求都不发 ✅ （仅非lazy）              │
- │                                                                        │
- │  ② __process_playlist for 循环内（lazy + 非lazy 都有）                  │
- │     _match_entry(entry_copy, incomplete=True)                          │
- │     命中 → resolved_entries[i] = NO_DEFAULT（跳过，不处理）             │
- │     如果 break_on_* → 抛异常 → 被 _handle_extraction_exceptions 捕获   │
- │       → __process_iterable_entry 返回 None → failures += 1             │
- │                                                                        │
- │  ③ failures >= max_failures（--skip-playlist-after-errors N）          │
- │       → break 退出循环                                                 │
- │       → 非lazy：翻页请求已全部打完，只能省后面的下载                    │
- │       → lazy   ：entries 生成器未消费完，✅ 翻页和下载都省              │
- │                                                                        │
- │  ④ MaxDownloadsReached（--max-downloads N）                            │
- │       → process_info 中 check_max_downloads() 抛出                    │
- │       → 向上冒泡，外层 for 循环捕获并 break                             │
- └────────────────────────────────────────────────────────────────────────┘
+用户开 --break-on-existing / --break-on-reject / --skip-playlist-after-errors N
+                │
+                ▼
+ ┌─ __process_playlist() ──────────────────────────────────────────────────┐
+ │                                                                     │
+ │                                                                     │
+ │  ① get_requested_items() 内的预检查（仅非 lazy 生效）                       │
+ │  ┌──────────────────────────────────────────────────────────┐         │
+ │  │ for index in parse_playlist_items(playlist_items):          │         │
+ │  │     for i, entry in self[index]:                       │         │
+ │  │         yield i, entry                                   │         │
+ │  │         if not entry: continue                         │         │
+ │  │         if not lazy_playlist:                              │         │
+ │  │             try:                                       │         │
+ │  │                 _match_entry(entry, incomplete=True, silent=True) │         │
+ │  │             except (ExistingVideoReached,                │         │
+ │  │                     RejectedVideoReached):                  │         │
+ │  │                 return  ← ⭐ 直接 return，结束整个生成器        │         │
+ │  │                                                       │         │
+ │  └──────────────────────────────────────────────────────────┘         │
+ │     ⚠️ 注意：这段 try/except 独立于 _handle_extraction_exceptions       │
+ │        不经过装饰器，直接捕获 → 生成器静默结束                              │
+ │     效果：后面条目不再 yield，后续翻页请求不发 ✅                       │
+ │                                                                     │
+ │  ② __process_playlist for 循环内（lazy + 非 lazy 都有）                       │
+ │  ┌───────────────────────────────────────────────────────────┐         │
+ │  │ for i, (playlist_index, entry) in enumerate(entries):   │         │
+ │  │     _match_entry(entry_copy, incomplete=True)              │         │
+ │  │     ├─ 返回 None 不匹配但未 break_on_* → resolved_entries   │         │
+ │  │     │  [i] = NO_DEFAULT; continue  # 不终止，继续下一条 │         │
+ │  │     │                                                   │         │
+ │  │     └─ 命中 break_on_existing / break_on_reject → 抛异常 │         │
+ │  │        ExistingVideoReached / RejectedVideoReached       │         │
+ │  │                                                       │         │
+ │  │     entry_result = __process_iterable_entry(entry, ...)  │         │
+ │  │     ↑ 方法本身带 @_handle_extraction_exceptions 装饰器       │         │
+ │  │                                                       │         │
+ │  │     → ignoreerrors=False（默认）→ 异常原样 re-raise ↗    │         │
+ │  │        ↑ 不在装饰器白名单 → Exception 分支：raise，命令整体失败     │         │
+ │  │     → ignoreerrors=True → 被 except Exception 分支吞掉   │         │
+ │  │        report_error + 返回 None                         │         │
+ │  │                                                       │         │
+ │  │     if not entry_result: failures += 1                     │         │
+ │  │     if failures >= max_failures: break 退出循环             │         │
+ │  └───────────────────────────────────────────────────────────┘         │
+ │                                                                     │
+ │  ③ failures >= max_failures（--skip-playlist-after-errors N）                    │
+ │     → report_error + break                                              │
+ │     → 非lazy：翻页请求已全部打完，只能省后续下载                              │
+ │     → lazy  ：生成器未消费完，✅ 翻页和下载都省                             │
+ │                                                                     │
+ │  ④ MaxDownloadsReached（--max-downloads N）                                  │
+ │     → process_info 中 check_max_downloads() 抛出                                │
+ │     → 不在装饰器白名单内（普通 Exception）
+ │     → ignoreerrors=False → re-raise，冒泡到 for 循环外层             │
+ └─────────────────────────────────────────────────────────────────────────────┘
 ```
+
+### 10.3 _match_entry() 本身不抛异常（除非开了 break 选项）
+
+```python
+# _match_entry 逻辑（简化）：
+def _match_entry(self, info_dict, incomplete=False, silent=False):
+    if self.in_download_archive(info_dict):
+        reason = "has already been recorded in the archive"
+        break_opt, break_err = 'break_on_existing', ExistingVideoReached
+    else:
+        try:
+            reason = check_filter()     # match_filter / date / duration 等
+        except DownloadCancelled:
+            ...
+        else:
+            break_opt, break_err = 'break_on_reject', RejectedVideoReached
+
+    if reason is not None:
+        if not silent:
+            self.to_screen('[download] ' + reason)
+        if self.params.get(break_opt, False):   # ⭐ 只有用户显式开了 break_on_*
+            raise break_err()              #    才抛异常
+    return reason    # 返回值非 None 表示"被过滤"但不抛异常
+```
+
+关键点：
+- 默认不开 `break_on_existing` / `break_on_reject`，`_match_entry` **只返回 reason**（非 None 表示"被过滤"）但**不抛异常** → for 循环里只是 `continue` 跳过，不会中断整个播放列表
+- 只有显式开了相应的 `break_on_*` 参数才会抛 `ExistingVideoReached` / `RejectedVideoReached`
+- 这两个异常类本身是普通 Exception 子类，会走装饰器的 `except Exception` 分支，取决于 `ignoreerrors` 是否开启：
+  - 不开 → 冒泡直接失败
+  - 开 → 被吞返回 None → failures++ → 到 `failures >= max_failures` 判断是否中止整个循环
+
+### 10.4 break_on_existing 的两层拦截对比
+
+| 拦截层 | 生效模式 | 触发条件 | 能否省翻页请求 |
+|---|---|---|---|
+| ① `get_requested_items` 内独立 try/except | 仅非 lazy | `break_on_*` 开 + 命中 | ✅ 生成器 return，后续翻页不发 |
+| ② `__process_iterable_entry` 装饰器 | lazy + 非 lazy 都有 | `break_on_*` 开 + 命中 + `ignoreerrors=True` | 非 lazy：翻页请求已打完 ❌；lazy：✅ 可以省 |
+| ③ `failures >= max_failures` | 都生效 | 前面 N 条失败累积到阈值 | 非 lazy ❌ / lazy ✅ |
+
+> 这就是为什么 `get_requested_items` 里要有一层预检查：非 lazy 模式下 `list(entries)` 会先把范围内所有翻页请求打完，所以必须在生成器消费期提供一次提前终止机会，否则等进了 for 循环再 break 就省不了翻页请求了。
 
 ---
 
