@@ -187,6 +187,75 @@ Linux 密钥环的选择逻辑在 [_choose_linux_keyring()](file:///d:/fz/0601-2
 
 Windows v10 密钥的获取在 [_get_windows_v10_key()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1013-L1037)：读取浏览器 `Local State` JSON 文件，取 `os_crypt.encrypted_key`，Base64 解码后去掉 `DPAPI` 前缀，调用 [_decrypt_windows_dpapi()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1073-L1105)（通过 `CryptUnprotectData` Win32 API）得到 AES-GCM 密钥。
 
+#### 属性转换边界
+
+[_process_chrome_cookie()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L372-L393) 是 Chromium Cookie 属性转换的核心函数，将 SQLite 行数据逐字段映射为 `http.cookiejar.Cookie` 对象。各字段的转换边界如下：
+
+**过期时间（expires_utc → expires）**：
+
+Chromium 数据库中的 `expires_utc` 字段直接作为 `expires` 参数传入 Cookie 构造函数，仅做了零值判断：
+
+```python
+if not expires_utc:
+    expires_utc = None
+```
+
+- **会话 Cookie**：`expires_utc == 0` 时转为 `None`，表示该 Cookie 没有持久过期时间，属于会话 Cookie
+- **持久 Cookie**：`expires_utc` 为非零整数时直接使用其值
+- **边界模糊**：`not expires_utc` 的判断覆盖了 `0`、`None`、空值等全部 falsy 值，这些都会被当作会话 Cookie 处理
+
+> 注意：代码中**未对 `expires_utc` 做单位转换**。Chromium `cookies` 表的 `expires_utc` 为微秒级时间戳（基于 FILETIME epoch 或 Unix epoch 取决于具体版本），而 Python `http.cookiejar.Cookie` 的 `expires` 期望的是秒级 POSIX 时间戳。实际使用中 Chromium 版本差异可能导致过期时间量级偏差。
+
+**域名（host_key → domain / domain_specified / domain_initial_dot）**：
+
+```python
+domain=host_key,
+domain_specified=bool(host_key),
+domain_initial_dot=host_key.startswith('.'),
+```
+
+- `domain`：直接使用 `host_key` 原值
+- `domain_specified`：只要 `host_key` 非空就为 `True`（所有数据库中的 Cookie 都有域名）
+- `domain_initial_dot`：检测 `host_key` 是否以 `.` 开头，用于判断是否匹配子域名
+
+**路径（path → path / path_specified）**：
+
+```python
+path=path,
+path_specified=bool(path),
+```
+
+- `path`：直接使用原值
+- `path_specified`：只要路径非空就为 `True`
+
+**安全标志（secure）**：
+
+```python
+secure=is_secure,
+```
+
+`is_secure` 的列名需要先探测——新旧版本 Chromium 分别使用 `secure` 和 `is_secure` 作为列名：
+
+```python
+secure_column = 'is_secure' if 'is_secure' in column_names else 'secure'
+```
+
+这是为了兼容 Chromium schema 变更而做的动态适配。
+
+**discard 标志**：
+
+代码中**硬编码为 `False`**：
+
+```python
+discard=False,
+```
+
+这意味着即使是会话 Cookie（`expires=None`），其 `discard` 标志也为 `False`。在 Python `http.cookiejar` 中，会话性由 `expires is None` 主导判断，`discard` 更多是 RFC 2965 语义的补充，因此该硬编码不影响功能，但与浏览器原生语义不完全一致。
+
+**rest / 其他属性**：
+
+`rest={}` 为空字典，表示 **HttpOnly、SameSite 等属性在提取时被丢弃**。Chromium 数据库中 `cookies` 表有 `is_httponly`、`samesite` 等字段，但代码的 SQL 查询没有选择这些字段，导致这些安全属性在导入后丢失。这是一个属性转换边界上的信息损失。
+
 ### 2.4 Safari Cookie 提取
 
 [_extract_safari_cookies()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L568-L591) → [parse_safari_cookies()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L723-L737)：
@@ -216,6 +285,77 @@ Safari 使用自定义的二进制格式 `Cookies.binarycookies`，结构为：
 
 - [get_cookie_header(url)](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1405-L1409)：返回给定 URL 对应的 `Cookie` HTTP 头字符串
 - [get_cookies_for_url(url)](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1411-L1416)：返回给定 URL 匹配的 `Cookie` 对象列表
+
+### 2.7 会话 Cookie 与持久 Cookie 的统一语义
+
+各来源对会话/持久 Cookie 的表示方式不同，进入统一 jar 时需要对齐到 `http.cookiejar.Cookie` 的语义。以下为四个来源的对照：
+
+| 来源 | 会话 Cookie 标识 | 持久 Cookie 标识 | `discard` 字段 |
+|------|------------------|------------------|----------------|
+| **Chromium 浏览器** | `expires_utc == 0` → `expires = None` | `expires_utc` 非零值 | 恒为 `False` |
+| **Firefox 浏览器** | 数据库中 `expiry` 直接传入（未做零值特殊处理） | 同左 | 恒为 `False` |
+| **Safari 浏览器** | 二进制格式中未做特殊区分，直接使用 `expiration_date` | 同左 | 恒为 `False` |
+| **Netscape 文件** | `expires` 字段为空或 `0` → `expires = None`，`discard = True` | `expires` 为正整数时间戳 | 会话 Cookie 为 `True` |
+
+#### Chromium 与会话 Cookie
+
+Chromium 中会话 Cookie 的判断依据是 `expires_utc == 0`，由 [_process_chrome_cookie()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L384-L387) 转换：
+
+```python
+if not expires_utc:
+    expires_utc = None
+```
+
+转换后 `expires=None`，在 `http.cookiejar` 语义中即表示「无过期时间」，等同于会话 Cookie。但 `discard` 字段硬编码为 `False`，与标准会话 Cookie 语义（关闭浏览器即丢弃）存在细微差异——实际使用中影响不大，因为 `CookieJar` 判断过期主要依赖 `expires` 字段。
+
+#### Firefox 与会话 Cookie
+
+Firefox 的 `moz_cookies` 表同样用 `expiry = 0` 表示会话 Cookie，但代码中**未显式处理零值**，而是直接把 `expiry` 原样传入 `expires` 参数。这意味着 Firefox 的会话 Cookie 进入 jar 后 `expires` 为 `0`，与标准语义（`None` 表示会话）不一致。
+
+这个差异在文件加载阶段会被修正——Netscape 文件中 `expires=0` 会被转为 `expires=None`，但浏览器提取路径不会经过这个修正。不过 `http.cookiejar` 对 `expires=0` 的处理是将其视为 1970 年已过期，实际行为可能与预期不符。
+
+#### 文件加载与会话 Cookie
+
+Netscape 文件格式本身没有专门的会话 Cookie 标记，yt-dlp 通过约定 `expires = 0` 表示会话 Cookie。[YoutubeDLCookieJar.load()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1399-L1403) 中的处理：
+
+```python
+for cookie in self:
+    if cookie.expires == 0:
+        cookie.expires = None
+        cookie.discard = True
+```
+
+文件加载路径同时设置了 `discard=True`，这比浏览器提取路径更规范。
+
+#### 持久化回写时的对齐
+
+[YoutubeDLCookieJar.save()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1345-L1348) 在写回文件前，会把所有 `expires is None` 的会话 Cookie 改为 `expires = 0`：
+
+```python
+for cookie in self:
+    if cookie.expires is None:
+        cookie.expires = 0
+```
+
+这样保证了「浏览器导入 → 写入文件 → 再次从文件加载」的往返过程中，会话 Cookie 的语义得以保留（虽然往返过程中 `discard` 会从 `False` 变为 `True`）。
+
+#### 属性转换汇总表
+
+| 属性 | Chromium 提取 | Firefox 提取 | Safari 提取 | Netscape 文件加载 |
+|------|:---:|:---:|:---:|:---:|
+| name | ✓ 原封传入 | ✓ 原封传入 | ✓ 原封传入 | ✓ 原封传入 |
+| value | 解密后传入 | ✓ 原封传入 | ✓ 原封传入 | ✓ 原封传入 |
+| domain | host_key 直接使用 | host 直接使用 | 原封传入 | domain_name 直接使用 |
+| domain_specified | `bool(host_key)` | `bool(host)` | `bool(domain)` | 由父类设置 |
+| domain_initial_dot | `host_key.startswith('.')` | `host.startswith('.')` | `domain.startswith('.')` | 由父类设置 |
+| path | ✓ 原封传入 | ✓ 原封传入 | ✓ 原封传入 | ✓ 原封传入 |
+| secure | is_secure / secure 列动态适配 | isSecure 列 | flags 位运算 | https_only 列 |
+| expires | 0 → None，其余原样 | 原样传入（毫秒级需除以 1000） | Mac Absolute Time → POSIX | 0 → None，其余原样 |
+| discard | 恒 False | 恒 False | 恒 False | 会话 Cookie 为 True |
+| HttpOnly | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✓ 行前缀 `#HttpOnly_` |
+| SameSite | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✗ 不支持 |
+
+> **关键观察**：浏览器来源都不保留 HttpOnly 和 SameSite 属性，只有 Netscape 文件格式通过行前缀 `#HttpOnly_` 保留 HttpOnly 标记。这意味着从浏览器导入的 Cookie 在 yt-dlp 中**全部表现为非 HttpOnly**，这在安全属性上比浏览器原生环境更宽松。
 
 ---
 
