@@ -345,8 +345,9 @@ _extract_embeds(url, webpage)
     │     │                 a) Youtube 相关 IE 提前（__module__ 含 '.youtube'）
     │     │                 b) 除 GenericIE 外的其他所有 IE（按原字母序）
     │     │                 c) GenericIE 单独放最后（兜底）
-    │     │           3. YoutubeDL.add_default_info_extractors() 把 _CLASS_LOOKUP 按序
-    │     │                 存入 self._ies（YoutubeDL.py 第 928-940 行）
+    │     │           3. gen_extractor_classes() 按 _CLASS_LOOKUP 顺序产出提取器类
+    │     │           4. YoutubeDL.add_default_info_extractors() 通过 add_info_extractor
+    │     │                 按序写入 self._ies（YoutubeDL.py 第 928-940 行）
     │     │
     │     ├── 对每个 IE:
     │     │     ├── 跳过 block_ies 中的 IE（防止递归，如 A 嵌入 B 再回 A）
