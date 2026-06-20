@@ -452,3 +452,375 @@ process_video_result(info_dict, download=True)
 | `info_dict['__postprocessors']` | 动态注入的 PP（merger、fixup） | `process_info` 下载/修复阶段 |
 | `info_dict['__files_to_move']` | 需移动的附属文件映射 | 贯穿 pre_process / post_process |
 | `info_dict['__write_download_archive']` | 是否写入归档（True/False/'ignore'） | process_info 各分支 |
+
+---
+
+## 9. 失败状态与返回码传播机制
+
+### 9.1 核心错误方法：`trouble` → `report_error`
+
+错误传播的根方法为 [trouble](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L1068-L1100)，[report_error](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L1155-L1160) 是其封装（加上 `ERROR:` 前缀）。
+
+```
+trouble(message, tb=None, is_error=True)
+├─ 输出错误信息到 stderr
+├─ [verbose] 输出 traceback
+├─ [is_error=False] → 仅警告，不影响返回码
+├─ [ignoreerrors=False] → 抛出 DownloadError(message, exc_info) ← 进程级中断
+└─ [ignoreerrors=True]  → self._download_retcode = 1 ← 继续运行，但标记失败
+```
+
+**关键双轨逻辑**：`ignoreerrors` 参数决定 `report_error` 的行为是"抛异常中断"还是"置返回码继续"。返回码只有 `0`（成功）和 `1`（失败）两种，一旦任何 `report_error(is_error=True)` 被调用且 `ignoreerrors=True`，返回码就会变为 1 且无法恢复。
+
+### 9.2 返回码 `_download_retcode` 的生命周期
+
+| 阶段 | 位置 | 操作 |
+|------|------|------|
+| 初始化 | [L647](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L647) | `self._download_retcode = 0` |
+| 置 1 | [L1100](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L1100) | `report_error` 内 `self._download_retcode = 1` |
+| 保存/恢复 | [L2281-L2293](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L2281-L2293) | `_check_formats` 测试格式时暂存并恢复，避免测试失败污染返回码 |
+| 最终返回 | [L3708](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3708) | `download()` 返回 `self._download_retcode` |
+
+### 9.3 下载器 `dl()` 的 `success` 返回值传播
+
+[FileDownloader.download](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/common.py#L430-L482) 返回 `(success, real_download)`：
+
+| 场景 | success | real_download |
+|------|---------|--------------|
+| 文件已存在（`continuedl` 或 `nooverwrites`） | `True` | `False` |
+| `real_download` 成功 | 子类 `real_download()` 返回值 | `True` |
+| 下载失败 | 子类返回 `False` | `True` |
+
+`success` 在 `process_info` 中的传播路径：
+
+```
+# 单文件分支 (L3579)
+success, real_download = self.dl(temp_filename, info_dict)
+
+# 多格式逐个下载分支 (L3561)
+partial_success, real_download = self.dl(fname, new_info)
+success = success and partial_success     ← 任何一个失败则整体失败
+
+# 多格式同时下载分支 (L3526)
+success, real_download = self.dl(temp_filename, info_dict)
+```
+
+**`success` 决定是否进入 fixup + post_process**（[L3597](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3597)）：`if success and full_filename != '-':`。若 `success=False`，则跳过所有后处理和归档写入——这表示下载确实失败了。
+
+### 9.4 异常在各层级的传播
+
+```
+异常发生位置                    │ __download_wrapper    │ _handle_extraction_exceptions
+──────────────────────────────│──────────────────────│──────────────────────────────
+DownloadError(raise)          │ 未捕获 → 向上抛出     │ 未捕获 → 向上抛出
+                              │ (process 终止)        │
+──────────────────────────────│──────────────────────│──────────────────────────────
+report_error(ignoreerrors=T)  │ — (不抛异常)          │ — (不抛异常)
+  → _download_retcode=1       │   返回码已标记失败     │   返回码已标记失败
+──────────────────────────────│──────────────────────│──────────────────────────────
+UnavailableVideoError         │ report_error(e)       │ —
+                              │ → retcode=1 继续      │
+──────────────────────────────│──────────────────────│──────────────────────────────
+DownloadCancelled             │ to_screen(e)          │ —
+  break_per_url=False         │ 重新 raise → 终止     │
+  break_per_url=True          │ _num_downloads=0      │
+                              │ 继续下一个 URL        │
+──────────────────────────────│──────────────────────│──────────────────────────────
+CookieLoadError               │ 直接 raise            │ 直接 raise
+──────────────────────────────│──────────────────────│──────────────────────────────
+ReExtractInfo                 │ —                     │ while True 重试
+                              │                       │ (expected=True 不警告)
+──────────────────────────────│──────────────────────│──────────────────────────────
+network_exceptions            │ —                     │ —
+  (in process_info)           │ report_error → retcode=1 + return
+──────────────────────────────│──────────────────────│──────────────────────────────
+OSError                       │ —                     │ —
+  (in process_info)           │ raise UnavailableVideoError
+                              │ → 被 __download_wrapper 捕获 → report_error
+──────────────────────────────│──────────────────────│──────────────────────────────
+ContentTooShortError          │ —                     │ —
+  (in process_info)           │ report_error → retcode=1 + return
+──────────────────────────────│──────────────────────│──────────────────────────────
+PostProcessingError           │ —                     │ —
+  (in process_info)           │ report_error → retcode=1 + return
+  ignoreerrors=True           │ 或 run_pp 内吞掉     │
+──────────────────────────────│──────────────────────│──────────────────────────────
+MaxDownloadsReached           │ —                     │ —
+  (in process_video_result)   │ 捕获后重新 raise
+  (in process_info)           │ check_max_downloads() raise
+```
+
+### 9.5 `_raise_pending_errors` 机制
+
+某些 PP（如 `pre_process`）不直接抛异常，而是将错误信息写入 `info_dict['__pending_error']`。在 `process_video_result` 和 `process_info` 中调用 `_raise_pending_errors` 统一检查并抛出。这意味着 PP 失败可以被延迟到安全的检查点再中断。
+
+---
+
+## 10. 归档写入时机详解
+
+### 10.1 `__write_download_archive` 三态
+
+`info_dict['__write_download_archive']` 有三种取值：
+
+| 值 | 含义 | 后果 |
+|----|------|------|
+| `True` | 应当写入归档 | 在 `process_video_result` 的汇总判断中被计为"成功" |
+| `False` | 不写入归档 | 在汇总判断中被计为"失败" |
+| `'ignore'` | 被过滤/跳过，不参与归档判断 | 不影响汇总判断 |
+
+### 10.2 所有赋值点
+
+| 赋值点 | 代码位置 | 值 | 触发条件 |
+|--------|---------|-----|---------|
+| `_match_entry` 过滤命中 | [L3341](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3341) | `'ignore'` | 视频/格式被 `--match-title`/`--date` 等过滤掉 |
+| `simulate` 模拟 | [L3371](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3371) | `force_write_download_archive` 的值 | `--simulate` 不下载但可选写归档 |
+| `skip_download` 模式 | [L3457](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3457) | `force_write_download_archive` 的值 | `--skip-download` 不下载媒体文件 |
+| 下载 + 后处理成功 | [L3667](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3667) | `True` | 完整走完下载 → fixup → post_process → post_hooks |
+| `force_write_download_archive` | [L3671](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3671) | `True` | `--force-write-download-archive` 全局覆盖 |
+| `extract_flat` 模式 | [L1936](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L1936) | 直接调用 `record_download_archive` | 不展开提取，直接记录 |
+
+### 10.3 多格式归档汇总判断
+
+在 `process_video_result` 的下载循环结束后（[L3140-L3143](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3140-L3143)）：
+
+```python
+write_archive = {f.get('__write_download_archive', False) for f in downloaded_formats}
+assert write_archive.issubset({True, False, 'ignore'})
+if True in write_archive and False not in write_archive:
+    self.record_download_archive(info_dict)
+```
+
+**判断逻辑**：收集所有格式（每个 `process_info` 调用一个）的 `__write_download_archive` 值，仅当：
+- 至少有一个 `True`（有格式成功下载完成）
+- 且没有任何 `False`（没有格式失败或被提前 return）
+
+才会写入归档。`'ignore'` 不阻止写入。
+
+**这意味着**：如果一个视频选择了 2 个格式，格式 1 下载成功（`True`）但格式 2 下载失败（`False`），则 **不会** 写入归档——重试时两个格式都会重新下载。
+
+### 10.4 `record_download_archive` 实现
+
+位置：[L3876-L3887](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3876-L3887)
+
+```python
+def record_download_archive(self, info_dict):
+    fn = self.params.get('download_archive')
+    if fn is None:
+        return
+    vid_id = self._make_archive_id(info_dict)
+    assert vid_id
+    if is_path_like(fn):
+        with locked_file(fn, 'a', encoding='utf-8') as archive_file:
+            archive_file.write(vid_id + '\n')
+    self.archive.add(vid_id)
+```
+
+- 同时写入文件（`locked_file` 防并发）和内存集合 `self.archive`
+- `vid_id` 由 `_make_archive_id(extractor_key, video_id)` 生成
+- 下次 `extract_info` 时 `in_download_archive` 检查内存集合，命中则跳过
+
+---
+
+## 11. 多格式合并在不同下载器和 FFmpeg 条件下的分支逻辑
+
+### 11.1 前置：`get_suitable_downloader` 的决策树
+
+位置：[downloader/__init__.py#L4-L20](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/__init__.py#L4-L20)
+
+当 `requested_formats` 存在时，`info_dict['protocol']` 为各格式协议用 `+` 连接（如 `https+m3u8_native`）。`get_suitable_downloader` 对每个子协议分别匹配下载器，然后做合并判断：
+
+```
+protocols = info_dict['protocol'].split('+')    # 如 ['https', 'm3u8_native']
+downloaders = [为每个 proto 选下载器]
+
+if 所有子协议都选了 FFmpegFD and FFmpegFD.can_merge_formats():
+    → 返回 FFmpegFD（一步到位：ffmpeg 同时下载+合并）
+elif 所有子协议都是 DashSegmentsFD 且满足条件:
+    → 返回 DashSegmentsFD
+elif 只有一个子协议:
+    → 返回该下载器
+else:
+    → 返回 None ← 关键！无合适下载器可一步完成
+```
+
+### 11.2 `FFmpegFD.can_merge_formats` 条件
+
+位置：[downloader/external.py#L387-L393](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L387-L393)
+
+```python
+@classmethod
+def can_merge_formats(cls, info_dict, params):
+    return (
+        info_dict.get('requested_formats')            # 有多格式
+        and info_dict.get('protocol')                  # 有协议信息
+        and not params.get('allow_unplayable_formats') # 不允许不可播放格式
+        and 'no-direct-merge' not in params.get('compat_opts', [])  # 无兼容选项
+        and cls.can_download(info_dict)                # ffmpeg 可用 + 协议支持
+    )
+```
+
+`cls.can_download` 依赖 `cls.supports`（[L106-L112](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L106-L112)），需满足：
+- ffmpeg 已安装（`available`）
+- 不输出到 stdout 或 stdout 是 `SUPPORTED_FEATURES`
+- 协议含 `+` 时需 `MULTIPLE_FORMATS` 特性（FFmpegFD 有此特性）
+- 不含 HLS AES 加密参数
+- 所有子协议都在 `SUPPORTED_PROTOCOLS` 内
+
+### 11.3 `process_info` 中多格式合并的三大分支
+
+当 `requested_formats` 不为 None 时（[L3482-L3572](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3482-L3572)），根据 `fd`（`get_suitable_downloader` 返回值）和 `merger.available`（FFmpegMergerPP 是否可用）进入不同分支：
+
+#### 分支 1：`fd` 存在（`get_suitable_downloader` 返回了非 None 下载器）
+
+```
+if fd is FFmpegFD:   ← 所有子协议都是 FFmpegFD 可处理的
+    # ffmpeg 一步完成多格式下载（内含合并逻辑）
+    # 不需要预分文件
+    # _call_downloader 内部处理 -map 等合并参数
+
+if fd is not FFmpegFD and temp_filename != '-':  ← 非ffmpeg下载器，输出到文件
+    for f in requested_formats:
+        f['filepath'] = prepend_extension(temp_filename, 'f{format_id}', ext)
+        downloaded.append(fname)           # 记录分文件路径
+    info_dict['url'] = '\n'.join(各格式URL) # 拼接所有URL
+    success, real_download = self.dl(...)  # 用该下载器一次性下载
+
+# 之后判断是否注入 merger：
+if downloaded and merger.available and not allow_unplayable_formats:
+    __postprocessors.append(merger)
+    __files_to_merge = downloaded
+    __real_download = True
+else:
+    for file in downloaded:
+        files_to_move[file] = None   # 不合并，分文件各自移动到最终目录
+```
+
+#### 分支 2：`fd` 为 None（`get_suitable_downloader` 无法一步完成）+ 无 ffmpeg
+
+```
+if not merger.available:      ← ffmpeg 未安装
+    if not ignoreerrors:
+        report_error → return       # 中止
+    report_warning → 继续但不合并
+
+# 逐个格式独立下载
+for f in requested_formats:
+    new_info = dict(info_dict)      # 复制，去掉 requested_formats
+    new_info.update(f)
+    fname = prepend_extension(temp_filename, 'f{format_id}', ext)
+    f['filepath'] = fname
+    downloaded.append(fname)
+    partial_success, real_download = self.dl(fname, new_info)
+    success = success and partial_success
+
+# 同样判断 merger 可用性
+```
+
+#### 分支 3：`fd` 为 None + 输出到 stdout (`temp_filename == '-'`)
+
+```
+# 逐个格式流式输出（无法合并到 stdout）
+for f in requested_formats:
+    fname = '-'                     # stdout
+    partial_success, real_download = self.dl(fname, new_info)
+    success = success and partial_success
+
+# 无法合并到 stdout，仅给出警告
+```
+
+### 11.4 完整决策流程图
+
+```
+requested_formats 不为 None
+│
+├─ 扩展名预处理
+│   ├─ merge_output_format 未指定 + webm + EmbedThumbnailPP → 改用 mkv
+│   └─ correct_ext 统一文件扩展名
+│
+├─ existing_video_file 检查（已下载则跳过）
+│
+├─ fd = get_suitable_downloader(info_dict, params)
+│
+├─ [fd is not None]
+│   │
+│   ├─ [fd is FFmpegFD] ─── ffmpeg 一步下载+合并
+│   │   └─ self.dl(temp_filename, info_dict)
+│   │       → FFmpegFD._call_downloader 内部 -map 合并
+│   │       → 返回 (success, real_download)
+│   │
+│   └─ [fd is not FFmpegFD, temp_filename != '-']
+│       ├─ 为每个格式计算分文件路径 f{format_id}.ext
+│       ├─ 拼接所有URL: info_dict['url'] = '\n'.join(...)
+│       └─ self.dl(temp_filename, info_dict)
+│           → 下载器处理多URL输入
+│
+├─ [fd is None]
+│   │
+│   ├─ [allow_unplayable_formats] → 警告：不合并以防数据损坏
+│   ├─ [not merger.available] → 警告/错误：ffmpeg 未安装
+│   │
+│   ├─ [temp_filename == '-']
+│   │   ├─ FFmpegFD.can_merge_formats → "using a downloader other than ffmpeg"
+│   │   ├─ merger.available → "formats are incompatible for simultaneous download"
+│   │   └─ else → "ffmpeg is not installed"
+│   │   → 逐个格式流式输出到 stdout
+│   │
+│   └─ [temp_filename != '-']
+│       └─ 逐个格式独立下载到分文件
+│
+├─ 合并判断（通用）
+│   ├─ downloaded 非空 + merger.available + not allow_unplayable_formats
+│   │   → 注入 FFmpegMergerPP 到 __postprocessors
+│   │   → __files_to_merge = downloaded
+│   │   → __real_download = True
+│   │
+│   └─ 否则
+│       → files_to_move[file] = None（分文件各自移动）
+│
+└─ 后续进入 fixup + post_process
+    → FFmpegMergerPP.run() 执行 ffmpeg -c copy -map 合并
+       输入：info['__files_to_merge']（分文件列表）
+       输出：info['filepath']（合并后文件）
+       返回：需删除的文件列表 = __files_to_merge
+```
+
+### 11.5 FFmpegMergerPP 合并实现
+
+位置：[postprocessor/ffmpeg.py#L822-L847](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L822-L847)
+
+```python
+class FFmpegMergerPP(FFmpegPostProcessor):
+    def run(self, info):
+        filename = info['filepath']
+        temp_filename = prepend_extension(filename, 'temp')
+        args = ['-c', 'copy']
+        for (i, fmt) in enumerate(info['requested_formats']):
+            if fmt.get('acodec') != 'none':
+                args.extend(['-map', f'{i}:a:0'])
+                # m3u8 + aac 需要比特流滤镜修复
+                if fmt['protocol'].startswith('m3u8') and self.get_audio_codec(fmt['filepath']) == 'aac':
+                    args.extend([f'-bsf:a:{audio_streams}', 'aac_adtstoasc'])
+            if fmt.get('vcodec') != 'none':
+                args.extend(['-map', f'{i}:v:0'])
+        self.run_ffmpeg_multiple_files(info['__files_to_merge'], temp_filename, args)
+        os.rename(temp_filename, filename)
+        return info['__files_to_merge'], info
+```
+
+要点：
+- 使用 `-c copy` 不重新编码，仅容器层合并
+- `-map` 精确映射每个输入文件的音频/视频流
+- 输出先写临时文件，`os.rename` 原子替换
+- 返回的 `info['__files_to_merge']` 作为待删除文件列表，由 `run_pp` 根据 `keepvideo` 决定是否删除
+
+### 11.6 各条件组合速查表
+
+| 条件组合 | 下载方式 | 合并方式 | 归档写入 |
+|---------|---------|---------|---------|
+| fd=FFmpegFD, merger 可用 | ffmpeg 一步下载+合并 | ffmpeg 内部 `-map` | 下载成功后 `__write_download_archive=True` |
+| fd≠FFmpegFD, merger 可用, 输出到文件 | 非ffmpeg下载器一步下载 | FFmpegMergerPP 后处理合并 | 合并成功后写入 |
+| fd=None, merger 可用, 输出到文件 | 逐格式独立下载 | FFmpegMergerPP 后处理合并 | 合并成功后写入 |
+| fd=None, merger 不可用, ignoreerrors=True | 逐格式独立下载 | **不合并**，分文件各自保留 | 部分成功可写入（取决于各格式 `__write_download_archive`） |
+| fd=None, merger 不可用, ignoreerrors=False | 报错中止 | — | — |
+| 任何, 输出到 stdout (`-`) | 逐格式流式输出 | **不可合并** | 取决于各格式成功与否 |
+| 任何, `allow_unplayable_formats=True` | 视情况 | **强制不合并**（防数据损坏） | 下载成功可写入 |
