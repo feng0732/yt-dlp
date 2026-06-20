@@ -246,7 +246,68 @@ if self.params.get('force_write_download_archive'):
 
 ---
 
-## 5. 其他提前 return 导致不写入的场景
+## 5. after_video 阶段与归档写入的先后关系
+
+### 5.1 执行顺序
+
+在 `process_video_result` 中，当 `download=True` 时的关键执行顺序：
+
+```
+1. 循环处理每个 format，调用 process_info(new_info)
+   → 每个 format 独立设置 __write_download_archive 标记
+
+2. 多格式决策 & 写入归档（L3140-3143）
+   write_archive = {f.get('__write_download_archive', False) for f in downloaded_formats}
+   if True in write_archive and False not in write_archive:
+       self.record_download_archive(info_dict)   ← 归档落盘
+
+3. 运行 after_video 后处理（L3145-3146）
+   info_dict['requested_downloads'] = downloaded_formats
+   info_dict = self.run_all_pps('after_video', info_dict)  ← after_video 阶段
+
+4. 若 max_downloads_reached 则抛出异常
+```
+
+**结论：归档写入发生在 after_video 阶段之前。**
+
+### 5.2 after_video 阶段包含什么
+
+after_video 是视频级别的最后一个后处理时机，在所有格式都下载处理完成后执行一次。
+
+默认没有内置的 after_video 后处理器，用户可通过配置添加自定义 PP。
+
+`run_all_pps('after_video', info)` 内部执行：
+1. `_forceprint('after_video', info)` — 打印 after_video 时机的模板
+2. 遍历所有注册在 `after_video` 时机的 PP，依次调用 `run_pp`
+
+### 5.3 after_video 阶段失败时的归档状态
+
+**after_video 阶段失败，归档已经落盘。**
+
+具体分析：
+
+| 失败场景 | 归档是否已写入 | 异常是否向上抛出 | 归档是否回滚 |
+|---|---|---|---|
+| after_video PP 抛出 PostProcessingError（ignoreerrors≠True） | ✅ 已写入 | ✅ 向上抛出 | ❌ 不回滚 |
+| after_video PP 抛出 PostProcessingError（ignoreerrors=True） | ✅ 已写入 | ❌ 被 run_pp 捕获，继续 | ❌ 不回滚 |
+| max_downloads_reached 抛出 MaxDownloadsReached | ✅ 已写入 | ✅ 向上抛出 | ❌ 不回滚 |
+
+**关键原因**：
+- `record_download_archive` 是同步写入文件的（locked_file + write + close），执行完毕即落盘
+- 写入后没有任何回滚机制
+- 即使 after_video 阶段随后失败并抛出异常，归档文件和内存中的 `self.archive` set 都已经包含了该记录
+
+### 5.4 设计含义
+
+这种"先归档、后 after_video"的顺序意味着：
+
+1. **at-least-once 语义**：只要下载成功就归档，after_video 阶段的失败不影响归档记录。下次运行时该视频会被跳过。
+2. **after_video 适合做"锦上添花"的操作**：如元数据上报、统计、通知等。这些操作失败不应影响视频已下载的事实。
+3. **如果 after_video 失败需要重试**：不能依赖归档去重，需要手动清理归档记录或使用其他机制。
+
+---
+
+## 6. 其他提前 return 导致不写入的场景
 
 以下场景均在位置 B 之前 return，无法享受兜底覆盖，标记保持 False：
 
@@ -271,7 +332,7 @@ if self.params.get('force_write_download_archive'):
 
 ---
 
-## 6. 扁平提取（extract_flat）场景
+## 7. 扁平提取（extract_flat）场景
 
 在 `process_ie_result` 中，当使用 `extract_flat` 时：
 ```python
@@ -285,7 +346,7 @@ if self.params.get('force_write_download_archive', False):
 
 ---
 
-## 7. 总结：归档写入边界表
+## 8. 总结：归档写入边界表
 
 | 场景 | 无 force_write | 有 force_write | 能否被兜底覆盖 |
 |---|---|---|---|
@@ -295,6 +356,7 @@ if self.params.get('force_write_download_archive', False):
 | 下载抛出异常 | ❌ 不写入 | ❌ 不写入 | ❌ 不能（提前 return） |
 | 下载返回 success=False | ❌ 不写入 | ✅ 写入 | ✅ 能 |
 | 后处理失败 | ❌ 不写入 | ❌ 不写入 | ❌ 不能（提前 return） |
+| after_video 阶段失败 | ✅ 已写入 | ✅ 已写入 | -（归档已落盘） |
 | 前期准备失败 | ❌ 不写入 | ❌ 不写入 | ❌ 不能（提前 return） |
 | extract_flat | ❌ 不写入 | ✅ 写入 | -（直接调用） |
 
@@ -303,3 +365,4 @@ if self.params.get('force_write_download_archive', False):
 2. **强制写入**：force_write_download_archive 能覆盖"无异常但失败"（success=False）和 skip_download 场景
 3. **强制写入边界**：只要 process_info 因异常或错误提前 return，即使 force_write 也无法写入
 4. **simulate 特殊**：提前 return 导致无法兜底，必须依赖路径中的显式设置
+5. **after_video 在归档之后**：归档写入先于 after_video 阶段执行，after_video 失败不影响归档记录（已落盘，无回滚）
