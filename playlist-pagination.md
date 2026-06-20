@@ -301,7 +301,7 @@ if not playlist_items:
 | `'1:inf:2'` / `'1:infinite:2'` | `slice(1, float('inf'), 2)` | 1,3,5,7,9 | 无限终点，正向步长 2，不触发 `len(self)` |
 | `'-2:inf'` | `slice(-2, float('inf'), None)` | 9,10 | 倒数第 2 条到末尾，先触发 `len(self)` 算起点 |
 | `':inf:-1'` | `slice(None, float('inf'), -1)` | 空 | 反向 + 终点=inf 永远不进入 frange |
-| `'0-2:2'` | `slice(0, 2, 2)` | 2 | start=0 被 `-1` 后变成 -1，`i<0` 跳过；下一个 i=1 → 下标 2 |
+| `'0-2:2'` | `slice(0, 2, 2)` | 2 | start=0 → `0-1=-1`，i=-1 被 `if i<0: continue` 跳过；下一个 i=-1+2=1 → `_getter(1)` → yield `(2, entry)` |
 | `'1-:2'` | `slice(1, None, 2)` | 1,3,5,7,9 | 省略 end 的正步长区间写法 |
 | `'0--2:2'` | `slice(0, -2, 2)` | 2,4,6,8 | 触发 `len(self)`，等价 `[1:-1:2]` |
 | `'0'` | `0` | 空 | int(0) 经 `-1` 得 i=-1，被 `if i<0: continue` 跳过 |
@@ -376,23 +376,51 @@ def __getitem__(self, idx):
 @functools.cached_property
 def _getter(self):
     if isinstance(self._entries, list):
-        def get_entry(i): ...  # 直接索引，IndexError 抛 self.IndexError / EntryNotInPlaylist
-    else:
+        # ── list 分支：直接索引，处理 MissingEntry ──
         def get_entry(i):
             try:
-                # ⭐ 单个索引访问套上 _handle_extraction_exceptions 装饰器
-                # 页面请求失败等 ExtractorError 会被 report_error；
-                # LazyList.IndexError / PagedList.IndexError 在装饰器白名单内原样 re-raise
+                entry = self._entries[i]
+            except IndexError:
+                entry = self.MissingEntry
+                if not self.is_incomplete:
+                    raise self.IndexError      # 越界 → 抛 IndexError 停止迭代
+            if entry is self.MissingEntry:
+                raise EntryNotInPlaylist(f'Entry {i + 1} cannot be found')
+            return entry
+    else:
+        # ── 非 list 分支（LazyList / PagedList / 生成器）──
+        def get_entry(i):
+            try:
+                # ⭐ 调用形式解析：
+                #   type(self.ydl)                         → YoutubeDL 类
+                #   ._handle_extraction_exceptions(...)    → 拿到装饰后的 wrapper 函数
+                #   (self.ydl, i)                          → 传 self 作为 wrapper 的第一个参数 + i
+                # 装饰器内部：wrapper(self, *args, **kwargs) → func(self, *args, **kwargs)
+                # 也就是：func(self.ydl, i) → self._entries[i]
+                #
+                # LazyList.IndexError / PagedList.IndexError 在装饰器白名单内 → 原样 re-raise
+                # ExtractorError（翻页 HTTP 失败等） → 装饰器吞掉 + report_error + 返回 None
+                # 但 None 返回后会被外层 except 过滤，所以实际上只有白名单异常能出去
                 return type(self.ydl)._handle_extraction_exceptions(
                     lambda _, i: self._entries[i])(self.ydl, i)
             except (LazyList.IndexError, PagedList.IndexError):
+                # 白名单 re-raise 出来的，转成 PlaylistEntries.IndexError
                 raise self.IndexError
+            # ⚠️ 注意：如果 _handle_extraction_exceptions 吞掉了 ExtractorError 返回 None
+            # 此时 get_entry(i) 返回 None → __getitem__ 会 yield (i+1, None)
+            # 后续 __process_playlist 的 for 循环中 `if not entry: continue` 会跳过
+            # 这和 IndexError 不同：IndexError 停止整个 __getitem__ 迭代，None 只是跳过
     return get_entry
 ```
 
-装饰器内的异常处理（见第 10 节详细说明）：
-- 属于白名单的 4 种异常（含 `LazyList.IndexError`、`PagedList.IndexError`）原样抛出，被上面 `except` 捕获并转成 `self.IndexError`
-- 其它异常（翻页 HTTP 失败等 `ExtractorError` / 普通 `Exception`）：若 `--ignore-errors` 开启则 `report_error` + 返回 None（单条视为失败），否则原样 re-raise 冒泡
+**装饰器对 `_getter` 调用的影响**：
+
+| 底层 `self._entries[i]` 产生的异常 | 装饰器处理 | `get_entry(i)` 的行为 | `__getitem__` 的行为 |
+|---|---|---|---|
+| `LazyList.IndexError` / `PagedList.IndexError` | 白名单 re-raise | `except` 转成 `self.IndexError` | 正向：`break` 停止迭代；反向：`continue` |
+| `ExtractorError`（翻页失败） | `report_error` + 返回 None | 返回 None | `yield (i+1, None)` → for 循环 `if not entry: continue` |
+| `DownloadCancelled` 子类 | 白名单 re-raise | 冒泡出 `get_entry` | 冒泡出 `__getitem__` → 冒泡出 `get_requested_items` 生成器 |
+| 其它 `Exception` | `ignoreerrors=True` → 吞 + None；`False` → re-raise | 同上 | 同上 |
 
 ---
 
@@ -404,7 +432,7 @@ def _getter(self):
 
 | 用户参数 | 内部 slice | 触发 `len(self)` 全量消费？ | 实际消费到的最大 0-based 索引 | 实际触发的页 | 说明 |
 |---|---|---|---|---|---|
-| （无筛选，全量） | `slice(1, '', None)` → `slice(1, None)` → start=0, stop=∞ | 否 | 999（迭代到 IndexError） | page 0 ~ 9（全部 10 页） | stop=∞ 不强制 exhaust，但会一直迭代直到耗尽 |
+| （无筛选，全量） | `playliststart=1, playlistend=''` → parse `f'1:'` → `slice(1, None)` → start=0, stop=∞ | 否 | 999（迭代到 IndexError） | page 0 ~ 9（全部 10 页） | stop=∞ 不强制 exhaust，但会一直迭代直到耗尽 |
 | `--playlist-start 1 --playlist-end 50` | `slice(1, 50)` → start=0, stop=50（经过 step>0 偏移） | 否 | 49 | page 0（前 50 条都在第一页） | ✅ 只请求第 0 页 |
 | `--playlist-end 50` | 同上 | 否 | 49 | page 0 | ✅ 同 start=1 end=50 |
 | `--playlist-end -1`（⚠️ 历史兼容） | `-1` 被转成空字符串 → `slice(1, None)` 等价全量 | 否 | 999（迭代到 IndexError） | page 0 ~ 9（全部） | ❗ `-1` **不是负索引**，被兼容为"不设终点" |
@@ -563,7 +591,7 @@ for i, (playlist_index, entry) in enumerate(entries):
 |---|---|---|---|
 | **负索引 start/stop** 如 `--playlist-items ':-5'` / `'2:-3'` | PlaylistEntries.__getitem__：`len(self) + idx.start/stop` | `len(self)` → `tuple(self[:])` 立即触发 LazyList 全量 exhaust | ❌ 是 |
 | **反向 step** 如 `--playlist-items '::-1'` / `'5:1:-2'` | PlaylistEntries.__getitem__：start 缺省且 step<0 → `start = len(self) - 1` 调 `len(self)` | 同上，负起点也会先全量 | ❌ 是 |
-| **`--playlist-items '[:]'` 全切片 / 省略 stop** | LazyList.__getitem__：`stop is None and step > 0` 判断 → `_exhaust()` | LazyList 判定无法找到终点 → 全量消费 | ❌ 是 |
+| **内部全切片 `self[:]` / `--playlist-items ':'` 省略 stop** | LazyList.__getitem__：`stop is None and step > 0` 判断 → `_exhaust()` | LazyList 判定无法找到终点 → 全量消费 | ❌ 是 |
 | **显式调用 `len(PlaylistEntries)`** | `__len__` = `len(tuple(self[:]))` | 直接全切片 self[:] → 全量 | ❌ 是 |
 | **`--playlistreverse`（非 lazy，默认）** | __process_playlist L2122：`entries.reverse()` | 此时 entries 已经是 `list(entries)` 消费完的结果 → reverse 只是对内存 list 反转，**不额外触发翻页** | ⚠️ 翻页请求已在 `list(entries)` 时完成，不是 reverse 导致的 |
 | **`--playlistreverse`（lazy 模式）** | __process_playlist L2120-2121：`report_warning` + 不做任何操作 | **不会触发任何翻页**，只是告警然后用原顺序继续 | ✅ 不会额外翻页 |
@@ -754,9 +782,24 @@ watch 页面右侧的"正在播放"列表（inline playlist）使用 `next` API�
 
 ## 10. 提前终止的完整拦截点图与异常传播路径
 
-### 10.1 _handle_extraction_exceptions —— 装饰器的真实行为
+### 10.1 异常继承链（先明确类层次，再谈装饰器行为）
 
-首先明确这个被大量方法（`__extract_info`、`__process_iterable_entry`、`PlaylistEntries._getter` 内部调用）都套着的装饰器到底吞哪些异常、不吞哪些：
+```
+Exception
+  └─ YoutubeDLError (utils/_utils.py L968)
+       ├─ ExtractorError (L980)
+       │    └─ GeoRestrictedError (L1036)
+       ├─ DownloadCancelled (L1102)        ← ⭐ 关键中间类
+       │    ├─ ExistingVideoReached (L1107)   --break-on-existing 触发
+       │    ├─ RejectedVideoReached (L1112)   --break-match-filter 触发
+       │    └─ MaxDownloadsReached (L1117)    --max-downloads 触发
+       ├─ ReExtractInfo (L1122)            → 重试循环
+       └─ CookieLoadError
+```
+
+**关键事实**：`ExistingVideoReached`、`RejectedVideoReached`、`MaxDownloadsReached` **都继承自 `DownloadCancelled`**，不是直接继承 `Exception`。
+
+### 10.2 _handle_extraction_exceptions 装饰器的真实行为
 
 ```python
 def _handle_extraction_exceptions(func):
@@ -764,18 +807,19 @@ def _handle_extraction_exceptions(func):
     def wrapper(self, *args, **kwargs):
         while True:
             try:
-                return func(self, *args, *kwargs)
-            except (CookieLoadError, DownloadCancelled, LazyList.IndexError, PagedList.IndexError):
-                raise             # ⭐ 白名单：原样 re-raise，不 report_error
+                return func(self, *args, **kwargs)
+            except (CookieLoadError, DownloadCancelled,
+                    LazyList.IndexError, PagedList.IndexError):
+                raise                     # ⭐ 白名单：原样 re-raise，不 report_error
             except ReExtractInfo as e:
-                ...; continue     # 重试：重新跑 while
+                ...; continue             # 重试：重新跑 while
             except GeoRestrictedError as e:
-                self.report_error(msg)   # 吞掉 + report_error，然后 break 退出 while（函数返回 None）
+                self.report_error(msg)    # 吞掉 + report_error + break（函数返回 None）
             except ExtractorError as e:
-                self.report_error(str(e), ...)  # 吞掉 + report_error，返回 None
+                self.report_error(...)    # 吞掉 + report_error + break（函数返回 None）
             except Exception as e:
                 if self.params.get('ignoreerrors'):
-                    self.report_error(str(e), tb=...)  # ⚠️ ignoreerrors 才吞，否则 re-raise
+                    self.report_error(...)    # ⚠️ ignoreerrors 才吞，否则 re-raise
                 else:
                     raise
             break
@@ -784,121 +828,137 @@ def _handle_extraction_exceptions(func):
 
 **分类汇总**：
 
-| 异常类型 | 装饰器行为 | 是否"吞掉"（返回 None） |
-|---|---|---|
-| `CookieLoadError`, `DownloadCancelled`, `LazyList.IndexError`, `PagedList.IndexError` | 直接 re-raise | 否 |
-| `ReExtractInfo` | continue 重试 | 否（重试） |
-| `GeoRestrictedError` | report_error + break | 是（函数返回 None） |
-| `ExtractorError` | report_error + break | 是（函数返回 None） |
-| 其它 Exception（含 `ExistingVideoReached`, `RejectedVideoReached` 等） | `ignoreerrors=True` → 吞；`ignoreerrors=False` → re-raise | 视参数而定 |
+| 异常类型 | 继承链 | 装饰器匹配的 except 分支 | 行为 | 函数返回 |
+|---|---|---|---|---|
+| `LazyList.IndexError` | `IndexError` | 白名单 `except` | re-raise | — |
+| `PagedList.IndexError` | `IndexError` | 白名单 `except` | re-raise | — |
+| `DownloadCancelled` | `YoutubeDLError` | 白名单 `except` | re-raise | — |
+| **`ExistingVideoReached`** | `DownloadCancelled` → `YoutubeDLError` | **白名单 `except`**（因为 `DownloadCancelled` 在白名单，子类也匹配） | **re-raise，不吞** | — |
+| **`RejectedVideoReached`** | `DownloadCancelled` → `YoutubeDLError` | **白名单 `except`** | **re-raise，不吞** | — |
+| **`MaxDownloadsReached`** | `DownloadCancelled` → `YoutubeDLError` | **白名单 `except`** | **re-raise，不吞** | — |
+| `CookieLoadError` | `YoutubeDLError` | 白名单 `except` | re-raise | — |
+| `ReExtractInfo` | `YoutubeDLError` | 专用 `except ReExtractInfo` | continue 重试 | — |
+| `GeoRestrictedError` | `ExtractorError` → `YoutubeDLError` | `except ExtractorError`（父类先匹配） | report_error + break | None |
+| `ExtractorError`（其它） | `YoutubeDLError` | `except ExtractorError` | report_error + break | None |
+| 其它普通 `Exception` | — | `except Exception` | `ignoreerrors=True` → 吞 + None；`False` → re-raise | 视参数 |
 
-`ExistingVideoReached` 和 `RejectedVideoReached` **不在白名单里**，它们是普通 Exception 子类：
-- 默认 `ignoreerrors=False` → 会原样 re-raise，整个命令**直接失败终止
-- 只有显式开了 `--ignore-errors` 才会被吞掉返回 None，计入 failures
+**易错点**：`ExistingVideoReached` / `RejectedVideoReached` 不是普通 Exception 路径；它们继承 `DownloadCancelled`，会命中白名单并被 re-raise，`--ignore-errors` 对它们无效。
 
----
-
-### 10.2 三层终止拦截点（按代码执行顺序）
+### 10.3 三层终止拦截点（按代码执行顺序）
 
 ```
 用户开 --break-on-existing / --break-on-reject / --skip-playlist-after-errors N
                 │
                 ▼
- ┌─ __process_playlist() ──────────────────────────────────────────────────┐
- │                                                                     │
- │                                                                     │
- │  ① get_requested_items() 内的预检查（仅非 lazy 生效）                       │
- │  ┌──────────────────────────────────────────────────────────┐         │
- │  │ for index in parse_playlist_items(playlist_items):          │         │
- │  │     for i, entry in self[index]:                       │         │
- │  │         yield i, entry                                   │         │
- │  │         if not entry: continue                         │         │
- │  │         if not lazy_playlist:                              │         │
- │  │             try:                                       │         │
- │  │                 _match_entry(entry, incomplete=True, silent=True) │         │
- │  │             except (ExistingVideoReached,                │         │
- │  │                     RejectedVideoReached):                  │         │
- │  │                 return  ← ⭐ 直接 return，结束整个生成器        │         │
- │  │                                                       │         │
- │  └──────────────────────────────────────────────────────────┘         │
- │     ⚠️ 注意：这段 try/except 独立于 _handle_extraction_exceptions       │
- │        不经过装饰器，直接捕获 → 生成器静默结束                              │
- │     效果：后面条目不再 yield，后续翻页请求不发 ✅                       │
- │                                                                     │
- │  ② __process_playlist for 循环内（lazy + 非 lazy 都有）                       │
- │  ┌───────────────────────────────────────────────────────────┐         │
- │  │ for i, (playlist_index, entry) in enumerate(entries):   │         │
- │  │     _match_entry(entry_copy, incomplete=True)              │         │
- │  │     ├─ 返回 None 不匹配但未 break_on_* → resolved_entries   │         │
- │  │     │  [i] = NO_DEFAULT; continue  # 不终止，继续下一条 │         │
- │  │     │                                                   │         │
- │  │     └─ 命中 break_on_existing / break_on_reject → 抛异常 │         │
- │  │        ExistingVideoReached / RejectedVideoReached       │         │
- │  │                                                       │         │
- │  │     entry_result = __process_iterable_entry(entry, ...)  │         │
- │  │     ↑ 方法本身带 @_handle_extraction_exceptions 装饰器       │         │
- │  │                                                       │         │
- │  │     → ignoreerrors=False（默认）→ 异常原样 re-raise ↗    │         │
- │  │        ↑ 不在装饰器白名单 → Exception 分支：raise，命令整体失败     │         │
- │  │     → ignoreerrors=True → 被 except Exception 分支吞掉   │         │
- │  │        report_error + 返回 None                         │         │
- │  │                                                       │         │
- │  │     if not entry_result: failures += 1                     │         │
- │  │     if failures >= max_failures: break 退出循环             │         │
- │  └───────────────────────────────────────────────────────────┘         │
- │                                                                     │
- │  ③ failures >= max_failures（--skip-playlist-after-errors N）                    │
- │     → report_error + break                                              │
- │     → 非lazy：翻页请求已全部打完，只能省后续下载                              │
- │     → lazy  ：生成器未消费完，✅ 翻页和下载都省                             │
- │                                                                     │
- │  ④ MaxDownloadsReached（--max-downloads N）                                  │
- │     → process_info 中 check_max_downloads() 抛出                                │
- │     → 不在装饰器白名单内（普通 Exception）
- │     → ignoreerrors=False → re-raise，冒泡到 for 循环外层             │
- └─────────────────────────────────────────────────────────────────────────────┘
+ ┌─ __process_playlist() ──────────────────────────────────────────────────────┐
+ │                                                                           │
+ │  ① get_requested_items() 内的预检查（仅非 lazy 生效）                              │
+ │  ┌───────────────────────────────────────────────────────────────┐        │
+ │  │ for index in parse_playlist_items(playlist_items):                │        │
+ │  │     for i, entry in self[index]:                              │        │
+ │  │         yield i, entry                                        │        │
+ │  │         if not entry: continue                                │        │
+ │  │         if not lazy_playlist:                                  │        │
+ │  │             try:                                              │        │
+ │  │                 _match_entry(entry, incomplete=True, silent=True)│        │
+ │  │             except (ExistingVideoReached,                      │        │
+ │  │                     RejectedVideoReached):                        │        │
+ │  │                 return  ← ⭐ 直接 return，结束整个生成器           │        │
+ │  └───────────────────────────────────────────────────────────────┘        │
+ │     ⚠️ 这段 try/except 独立于 _handle_extraction_exceptions                  │
+ │        不经过装饰器，直接在生成器内部捕获 → 生成器静默结束                       │
+ │     效果：后面条目不再 yield，后续翻页请求不发 ✅                             │
+ │                                                                           │
+ │  ② __process_playlist for 循环内（lazy + 非 lazy 都有）                           │
+ │  ┌───────────────────────────────────────────────────────────────┐        │
+ │  │ for i, (playlist_index, entry) in enumerate(entries):        │        │
+ │  │     _match_entry(entry_copy, incomplete=True)                    │        │
+ │  │     ├─ 返回 None → 不匹配 → resolved_entries[i] = NO_DEFAULT   │        │
+ │  │     │  continue（不终止，继续下一条）                            │        │
+ │  │     │                                                         │        │
+ │  │     └─ 返回非 None 且 break_on_* 开启 → 抛异常                  │        │
+ │  │        ExistingVideoReached / RejectedVideoReached              │        │
+ │  │        ↑ 这些异常在 for 循环体里直接抛出（不在 __process_iterable_entry 内）│
+ │  │        ↑ 没有被 _handle_extraction_exceptions 包裹               │        │
+ │  │        ↑ 直接冒泡出 for 循环，终止整个 __process_playlist           │        │
+ │  │                                                               │        │
+ │  │     实际代码路径：                                              │        │
+ │  │     if self._match_entry(entry_copy, incomplete=True) is not None:│      │
+ │  │         resolved_entries[i] = (playlist_index, NO_DEFAULT)     │        │
+ │  │         continue   ← ⭐ 注意！代码里是 continue，不是 break！     │        │
+ │  │         _match_entry 内部如果开了 break_on_* 会直接 raise，       │        │
+ │  │         异常冒泡出 for 循环，不是走 continue 这条线                 │        │
+ │  │                                                               │        │
+ │  │     entry_result = __process_iterable_entry(entry, ...)        │        │
+ │  │     ↑ 此方法带 @_handle_extraction_exceptions                     │        │
+ │  │     → 如果 __process_iterable_entry 内部产生 ExistingVideoReached    │        │
+ │  │       （例如 extract_info 中 extract_info 的 archive 检查）         │        │
+ │  │       → 装饰器白名单 re-raise → 冒泡出 for 循环                    │        │
+ │  │     → 其它 ExtractorError → 装饰器吞掉返回 None → failures += 1    │        │
+ │  │                                                               │        │
+ │  │     if not entry_result: failures += 1                            │        │
+ │  │     if failures >= max_failures: break 退出循环                    │        │
+ │  └───────────────────────────────────────────────────────────────┘        │
+ │                                                                           │
+ │  ③ failures >= max_failures（--skip-playlist-after-errors N）                       │
+ │     → report_error + break                                                    │
+ │     → 非lazy：翻页请求已全部打完，只能省后续下载                                  │
+ │     → lazy  ：生成器未消费完，✅ 翻页和下载都省                                 │
+ │                                                                           │
+ │  ④ MaxDownloadsReached（--max-downloads N）                                      │
+ │     → process_info 中 check_max_downloads() 抛出                                    │
+ │     → 继承 DownloadCancelled → 在 __process_iterable_entry 的装饰器白名单内     │
+ │     → re-raise → 冒泡出 for 循环 → 终止 __process_playlist                      │
+ │     → 不管 ignoreerrors 设置如何，MaxDownloadsReached 永远终止下载               │
+ └───────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 10.3 _match_entry() 本身不抛异常（除非开了 break 选项）
+### 10.4 _match_entry() 的完整逻辑
 
 ```python
-# _match_entry 逻辑（简化）：
 def _match_entry(self, info_dict, incomplete=False, silent=False):
+    # ── 第一阶段：archive 检查 ──
     if self.in_download_archive(info_dict):
-        reason = "has already been recorded in the archive"
+        reason = ''.join((
+            format_field(info_dict, 'id', f'{self._format_screen("%s", self.Styles.ID)}: '),
+            format_field(info_dict, 'title', f'{self._format_screen("%s", self.Styles.EMPHASIS)} '),
+            'has already been recorded in the archive'))
         break_opt, break_err = 'break_on_existing', ExistingVideoReached
     else:
+        # ── 第二阶段：match_filter / date / view_count / age 等检查 ──
         try:
-            reason = check_filter()     # match_filter / date / duration 等
-        except DownloadCancelled:
-            ...
+            reason = check_filter()          # 内部调用 match_filter(info_dict)
+        except DownloadCancelled as e:
+            # match_filter 可以主动 raise DownloadCancelled(msg) 来中止
+            reason, break_opt, break_err = e.msg, 'match_filter', type(e)
         else:
             break_opt, break_err = 'break_on_reject', RejectedVideoReached
 
+    # ── 第三阶段：决定是否抛异常 ──
     if reason is not None:
         if not silent:
             self.to_screen('[download] ' + reason)
-        if self.params.get(break_opt, False):   # ⭐ 只有用户显式开了 break_on_*
-            raise break_err()              #    才抛异常
-    return reason    # 返回值非 None 表示"被过滤"但不抛异常
+        if self.params.get(break_opt, False):    # ⭐ 只有用户显式开启 break_on_*
+            raise break_err()                     #    才抛异常
+    return reason    # 返回值非 None = "被过滤"，None = "通过"
 ```
 
 关键点：
-- 默认不开 `break_on_existing` / `break_on_reject`，`_match_entry` **只返回 reason**（非 None 表示"被过滤"）但**不抛异常** → for 循环里只是 `continue` 跳过，不会中断整个播放列表
+- 默认不开 `break_on_existing` / `break_on_reject`，`_match_entry` **只返回 reason**（非 None 表示"被过滤"）但**不抛异常** → for 循环里只是 `resolved_entries[i] = NO_DEFAULT; continue` 跳过，不会中断整个播放列表
 - 只有显式开了相应的 `break_on_*` 参数才会抛 `ExistingVideoReached` / `RejectedVideoReached`
-- 这两个异常类本身是普通 Exception 子类，会走装饰器的 `except Exception` 分支，取决于 `ignoreerrors` 是否开启：
-  - 不开 → 冒泡直接失败
-  - 开 → 被吞返回 None → failures++ → 到 `failures >= max_failures` 判断是否中止整个循环
+- `match_filter` 可以主动 `raise DownloadCancelled(msg)` → 此时 `break_opt = 'match_filter'`，`self.params.get('match_filter', False)` 返回 match_filter callable 本身（真值），所以 `raise break_err()` 必定执行 → 即 `raise type(e)()` → 抛出 `DownloadCancelled` 子类实例 → 终止下载
+- `ExistingVideoReached` / `RejectedVideoReached` 继承自 `DownloadCancelled`，它们在 `_handle_extraction_exceptions` 的白名单里 → **永远 re-raise**，不受 `--ignore-errors` 影响
 
-### 10.4 break_on_existing 的两层拦截对比
+### 10.5 break_on_existing 的两层拦截对比
 
-| 拦截层 | 生效模式 | 触发条件 | 能否省翻页请求 |
-|---|---|---|---|
-| ① `get_requested_items` 内独立 try/except | 仅非 lazy | `break_on_*` 开 + 命中 | ✅ 生成器 return，后续翻页不发 |
-| ② `__process_iterable_entry` 装饰器 | lazy + 非 lazy 都有 | `break_on_*` 开 + 命中 + `ignoreerrors=True` | 非 lazy：翻页请求已打完 ❌；lazy：✅ 可以省 |
-| ③ `failures >= max_failures` | 都生效 | 前面 N 条失败累积到阈值 | 非 lazy ❌ / lazy ✅ |
+| 拦截层 | 代码位置 | 生效模式 | 异常如何抛出 | 异常如何被处理 | 能否省翻页请求 |
+|---|---|---|---|---|---|
+| ① 预检查 | `get_requested_items` 内独立 try/except | 仅非 lazy | `_match_entry` 直接 raise → 被生成器内 `except (ExistingVideoReached, RejectedVideoReached): return` 捕获 | 生成器静默结束（不冒泡到外层） | ✅ 生成器 return，后续翻页不发 |
+| ② for 循环内 | `_match_entry(entry_copy)` 直接在循环体调用 | lazy + 非 lazy | `_match_entry` 直接 raise → 冒泡出 for 循环（没有 try 包裹） | 终止 `__process_playlist`（非 lazy 时翻页已打完 ❌；lazy 时 ✅ 可以省） | 非 lazy ❌ / lazy ✅ |
+| ③ for 循环内（间接） | `__process_iterable_entry` 内的 `extract_info` → archive 检查 | lazy + 非 lazy | `extract_info` 中 L1712-1713：`raise ExistingVideoReached` → 装饰器白名单 re-raise | 同 ②，冒泡终止 | 非 lazy ❌ / lazy ✅ |
+| ④ failures 计数 | `if not entry_result: failures += 1` | 都生效 | 不抛异常，只计失败数 | 到 `failures >= max_failures` 时 break | 非 lazy ❌ / lazy ✅ |
 
-> 这就是为什么 `get_requested_items` 里要有一层预检查：非 lazy 模式下 `list(entries)` 会先把范围内所有翻页请求打完，所以必须在生成器消费期提供一次提前终止机会，否则等进了 for 循环再 break 就省不了翻页请求了。
+> **预检查存在的理由**：非 lazy 模式下 `list(entries)` 会先把范围内所有翻页请求打完，必须在生成器消费期提供一次提前终止机会。预检查的 `except (ExistingVideoReached, RejectedVideoReached): return` 直接在生成器内部静默结束，**不经过任何装饰器**，是最干净的终止方式——连 `__process_playlist` 都不会收到异常，只是发现生成器结束了。
 
 ---
 
@@ -912,6 +972,7 @@ def _match_entry(self, info_dict, incomplete=False, silent=False):
 | **分派递归** | `_type` 字段驱动 `process_ie_result` 递归处理嵌套/引用结构 | `process_ie_result` 的 _type 分支 |
 | **闭包 list 回传** | YouTube 用 `continuation_list = [None]` 在 renderer 解析函数中回传翻页 token | `_extract_entries(continuation_list)` |
 | **引用条目** | playlist 内的视频以 `_type='url'` 浅层返回，递归时才深度展开，`--flat-playlist` 据此止步 | `_extract_video()` + `ie_key` |
-| **ChainMap 注入上下文** | playlist 元数据（playlist_index/playlist_title 等）用 `collections.ChainMap` 叠加到每个 entry，避免深拷贝 | `__process_playlist` L2148 |
+| **ChainMap 注入上下文** | playlist 元数据（playlist_index/playlist_title 等）用 `collections.ChainMap` 叠加到每个 entry，避免深拷贝 | `__process_playlist` |
 | **双重循环防死循环** | `_playlist_urls`（playlist 级别）+ `seen_continuations`（YouTube API 级别） | `process_ie_result` / `_entries()` |
-| **两处 break 拦截** | 生成器消费期（非 lazy）和 下载循环期（lazy）各有一次 break 机会，lazy 下能省后续翻页请求 | `get_requested_items` + `__process_playlist` for |
+| **DownloadCancelled 继承链** | `ExistingVideoReached`/`RejectedVideoReached`/`MaxDownloadsReached` 继承 `DownloadCancelled`，在装饰器白名单内永远 re-raise，不受 `--ignore-errors` 影响 | `_handle_extraction_exceptions` 白名单 `except` |
+| **预检查 + 循环内双拦截** | 生成器消费期（非 lazy 预检查）和下载循环期（for 内 continue/raise）各有一次终止机会 | `get_requested_items` 内 try/except + `__process_playlist` for 循环 |
