@@ -33,11 +33,14 @@ POSTPROCESS_WHEN = (
 
 ### 2.2 链的构建：get_postprocessors()
 
-所有后处理器在 [yt_dlp/__init__.py](yt_dlp/__init__.py#L627-L736) 的 `get_postprocessors()` 函数中按 yield 顺序构建：
+所有后处理器在 [yt_dlp/__init__.py](yt_dlp/__init__.py#L627-L736) 的 `get_postprocessors()` 函数中按 yield 顺序构建。每个后处理器通过 `add_post_processor()` 追加到 `self._pps[when] 列表末尾（[YoutubeDL.py](yt_dlp/YoutubeDL.py#L942-L946)），因此同阶段内的执行顺序与 yield 顺序完全一致。
+
+### 2.2.1 后处理器总表
 
 | 后处理器 | when 阶段 | 说明 |
 |---------|----------|------|
-| MetadataParserPP | 用户指定（如 pre_process） | 元数据解析/替换 |
+| 用户自定义PP | 用户指定 | 通过 `--use-postprocessor` 添加（最先） |
+| MetadataParserPP | 用户指定（默认 pre_process） | 元数据解析/替换 |
 | **SponsorBlockPP** | **after_filter** | 获取 SponsorBlock 片段 |
 | FFmpegSubtitlesConvertorPP | before_dl | 字幕格式转换 |
 | FFmpegThumbnailsConvertorPP | before_dl | 缩略图格式转换 |
@@ -51,7 +54,27 @@ POSTPROCESS_WHEN = (
 | FFmpegSplitChaptersPP | post_process | 按章节切分 |
 | XAttrMetadataPP | post_process | xattr 属性写入 |
 | FFmpegConcatPP | playlist | 播放列表合并 |
-| ExecPP | 各阶段 | 外部命令执行 |
+| ExecPP | 各阶段 | 外部命令执行（每阶段最后） |
+
+### 2.2.2 post_process 阶段精确顺序
+
+当用户通过 `--parse-metadata "post_process:..."` 或 `--replace-in-metadata "post_process:..."` 指定 MetadataParserPP 在 `post_process` 阶段运行时，该阶段内的完整执行顺序（按 [yt_dlp/__init__.py](yt_dlp/__init__.py#L627-L736) 的 yield 顺序）：
+
+| 序号 | 后处理器 | 对 info 的主要修改 |
+|-----|---------|------------------|
+| 1 | **MetadataParserPP** | 改写 `info['title']`, `info['artist']`, `info['meta_xxx']` 等顶层字段 |
+| 2 | FFmpegExtractAudioPP | 提取音频，修改 `filepath`, `ext` 等 |
+| 3 | FFmpegVideoRemuxerPP | 视频重封装 |
+| 4 | FFmpegVideoConvertorPP | 视频转码 |
+| 5 | FFmpegEmbedSubtitlePP | 字幕嵌入容器 |
+| 6 | **ModifyChaptersPP** | 改写 `info['chapters']`（合并/删除/重命名章节），剪切视频文件 |
+| 7 | **FFmpegMetadataPP** | 读取 `info['chapters']` 和通用元数据，写入文件 |
+| 8 | EmbedThumbnailPP | 缩略图嵌入 |
+| 9 | FFmpegSplitChaptersPP | 按章节切分文件 |
+| 10 | XAttrMetadataPP | 写入 xattr 属性 |
+| 11 | ExecPP | 执行外部命令 |
+
+**关键三者相对顺序：MetadataParserPP → ModifyChaptersPP → FFmpegMetadataPP**
 
 关键代码（第 636-706 行）：
 
@@ -634,16 +657,108 @@ SponsorBlockPP 固定在 `after_filter` 阶段运行，而 MetadataParserPP 的�
 
 #### 8.2.3 各阶段效果对比
 
-| 阶段 | 可改写的 info 字段 | 对 SponsorBlock 的影响 |
-|-----|-------------------|----------------------|
-| `pre_process` | `title`, `artist`, `description`, `uploader` 等原始字段 | 改写发生在 SponsorBlockPP **之前**，SponsorBlock API 调用不依赖这些字段 |
-| `after_filter` | 同上 + 筛选后的字段 | 改写后，ModifyChaptersPP 才能看到修改后的值 |
-| `before_dl` | 同上 + 格式选择后的字段 | 改写发生在 SponsorBlockPP **之后**，ModifyChaptersPP 之前 |
-| `post_process` | 同上 + `filepath`, `duration` 等下载后字段 | 改写发生在 ModifyChaptersPP **之后**，FFmpegMetadataPP 之前 |
+| 阶段 | 可改写的 info 字段 | 与关键处理器的顺序关系 |
+|-----|-------------------|-------------------|
+| `pre_process`（默认） | `title`, `artist`, `description`, `uploader` 等原始字段 | 在 SponsorBlockPP **之前** |
+| `after_filter` | 同上 + 筛选后的字段 | 在 SponsorBlockPP **之前**（同阶段先被 yield） |
+| `video` / `before_dl` | 同上 + 格式选择后的字段 | 在 SponsorBlockPP **之后**，在 ModifyChaptersPP **之前** |
+| `post_process` | 同上 + `filepath`, `duration` 等下载后字段 | 在 ModifyChaptersPP **之前**，在 FFmpegMetadataPP **之前** |
+| `after_move` | 同上 + 最终文件路径 | 在 FFmpegMetadataPP **之后** |
 
-### 8.3 元数据改写对章节标题的影响
+**重要修正**：在 `post_process` 阶段内，MetadataParserPP 在 ModifyChaptersPP **之前**运行（见 [§2.2.2 post_process 阶段精确顺序](#222-post_process-阶段精确顺序)），而不是之后。
 
-#### 8.3.1 SponsorBlock 章节标题的生成机制
+### 8.3 post_process 阶段：三者顺序与影响边界
+
+当 MetadataParserPP 被指定在 `post_process` 阶段运行时，三个核心后处理器的执行顺序为：
+
+```
+MetadataParserPP → ModifyChaptersPP → FFmpegMetadataPP
+```
+
+#### 8.3.1 三者数据读写边界
+
+| 后处理器 | 读取的 info 字段 | 修改的 info 字段 | 修改文件？ |
+|---------|----------------|----------------|-----------|
+| **MetadataParserPP** | 任意顶层字段（字符串） | 顶层字段（`title`, `artist`, `meta_xxx` 等） | ❌ |
+| **ModifyChaptersPP** | `chapters`, `sponsorblock_chapters`, `filepath`, `duration` | `chapters`（整体替换）, `duration` | ✅ 剪切视频 |
+| **FFmpegMetadataPP** | `chapters`（只读）, `title`, `artist`, `description` 等 | 无（info 不变） | ✅ 写入元数据 |
+
+#### 8.3.2 对章节标题的影响边界
+
+**MetadataParserPP 改写通用元数据 → 不影响 SponsorBlock 章节标题**
+
+原因：
+1. **数据隔离**：SponsorBlock 章节标题模板求值时传入 `c.copy()`（[modify_chapters.py](yt_dlp/postprocessor/modify_chapters.py#L304-L304)），即章节字典自身的拷贝，不包含 `info` 级别的 `title`, `artist` 等字段。
+2. **模板字段限制**：章节标题默认模板 `'[SponsorBlock]: %(category_names)l'` 只引用 `category_names` 等章节内部字段。
+3. **即使 MetadataParserPP 在 ModifyChaptersPP 之前也没用**：因为两者操作的是 info 字典的不同层级——MetadataParserPP 改顶层，ModifyChaptersPP 改 `chapters` 列表内各章节对象的 `title`。
+
+**ModifyChaptersPP 生成章节标题 → 影响文件中的章节元数据**
+
+- ModifyChaptersPP 生成/修改每个章节的 `title` 字段
+- FFmpegMetadataPP 读取 `info['chapters']` 中每个章节的 `title`，写入 FFMETADATA1 文件
+
+#### 8.3.3 对章节列表的影响边界
+
+| 操作 | 能否改变 info['chapters'] 列表 | 说明 |
+|-----|:---:|------|
+| MetadataParserPP 改 `title` | ❌ | 只能改顶层键，不能遍历修改列表内元素 |
+| MetadataParserPP 改 `chapters` 整体 | ⚠️ 理论上可以 | 需模板直接生成整个列表，实际几乎不可行 |
+| ModifyChaptersPP | ✅ | 合并、删除、拆分章节，完全重写列表 |
+| FFmpegMetadataPP | ❌ | 只读，不改写 info |
+
+#### 8.3.4 对最终文件元数据的影响边界
+
+**通用元数据（title, artist, comment 等）：**
+- MetadataParserPP 改写 → ✅ 有效（在 FFmpegMetadataPP 之前）
+- ModifyChaptersPP → ❌ 不涉及
+- FFmpegMetadataPP → 最终写入文件
+
+**章节元数据：**
+- MetadataParserPP → ❌ 不影响章节列表和章节标题
+- ModifyChaptersPP → ✅ 决定章节数量、时间、标题
+- FFmpegMetadataPP → 最终写入文件
+
+**边界总结表：**
+
+| 改写目标 | MetadataParserPP<br/>能否影响 | ModifyChaptersPP<br/>能否影响 | FFmpegMetadataPP<br/>是否消费 |
+|---------|:---:|:---:|:---:|
+| 文件 `title` 元数据 | ✅ | ❌ | ✅ 读取 `info['title']` |
+| 文件 `artist` 元数据 | ✅ | ❌ | ✅ 读取 `info['artist']` |
+| 自定义 `comment` 元数据 | ✅（`meta_comment`） | ❌ | ✅ 读取 `meta_*` |
+| 章节数量 | ❌ | ✅ | ✅ 读取 `info['chapters']` |
+| 章节时间点 | ❌ | ✅ | ✅ 读取章节 `start_time/end_time` |
+| 章节标题文字 | ❌ | ✅ | ✅ 读取章节 `title` |
+| 视频文件时长 | ❌（可改 `info['duration']` 但不影响文件） | ✅（剪切改变实际时长） | ❌ |
+
+#### 8.3.5 典型场景验证
+
+**场景 1：post_process 阶段改标题 + SponsorBlock 标记**
+
+```bash
+yt-dlp --parse-metadata "post_process:title:'%(title)s [已去广告]'" \
+       --sponsorblock-mark all \
+       URL
+```
+
+结果：
+- ✅ 文件 `title` 元数据变为 "原标题 [已去广告]"
+- ❌ SponsorBlock 章节标题不变（仍为 "[SponsorBlock]: Sponsor" 等）
+- ✅ 章节数量和时间点正确
+
+**场景 2：替换章节标题中的关键词**
+
+MetadataParserPP **无法**直接替换每个章节的 `title` 字段，因为：
+- 章节在 `info['chapters']` 列表中，是嵌套结构
+- INTERPRET/REPLACE 动作只操作顶层键，不遍历列表
+- 没有 "对每个章节应用替换" 的机制
+
+要修改章节标题，需要自定义后处理器或使用 `--exec` 调用外部工具。
+
+### 8.4 章节标题生成机制详解
+
+本节深入说明 SponsorBlock 章节标题如何生成，以及为什么通用元数据改写不影响它。
+
+#### 8.4.1 生成代码
 
 SponsorBlock 章节标题由 ModifyChaptersPP 的 `_remove_tiny_rename_sponsors()` 生成（[yt_dlp/postprocessor/modify_chapters.py](yt_dlp/postprocessor/modify_chapters.py#L294-L304)）：
 
@@ -657,7 +772,7 @@ if cats:
         'name': category_name,
         'category_names': orderedSet(x[3] for x in cats),
     })
-    # 使用 sponsorblock_chapter_title 模板生成标题
+    # 关键：用 c.copy() 作为模板上下文，不是 info 字典
     c['title'] = self._downloader.evaluate_outtmpl(
         self._sponsorblock_chapter_title, c.copy())
 ```
@@ -668,7 +783,7 @@ if cats:
 DEFAULT_SPONSORBLOCK_CHAPTER_TITLE = '[SponsorBlock]: %(category_names)l'
 ```
 
-#### 8.3.2 模板可用字段
+#### 8.4.2 模板可用字段
 
 **SponsorBlock 章节标题模板仅使用章节自身的字段**，不使用 `info` 字典中的通用元数据字段：
 
@@ -683,26 +798,26 @@ DEFAULT_SPONSORBLOCK_CHAPTER_TITLE = '[SponsorBlock]: %(category_names)l'
 
 **不使用** `info['title']`、`info['artist']`、`info['uploader']` 等通用元数据字段。
 
-#### 8.3.3 结论：改写通用元数据不影响 SponsorBlock 章节标题
+#### 8.4.3 解耦结论
 
-因为：
-1. SponsorBlock 章节标题模板只引用章节自身的 `_categories` 数据
-2. 模板求值时传入的是 `c.copy()`（章节对象的拷贝），不是整个 `info` 字典
-3. `category_names` 来自 SponsorBlock API 返回的类别名称，与视频标题无关
+通用元数据改写与 SponsorBlock 章节标题完全解耦，因为：
+1. **上下文隔离**：模板求值传入 `c.copy()`（章节字典），而非整个 `info` 字典
+2. **字段不重叠**：章节模板使用的 `category_names` 等字段与 `info` 顶层字段不在同一层级
+3. **来源不同**：`category_names` 来自 SponsorBlock API 返回的类别名称映射，与视频标题无关
 
-**示例**：
+**示例验证**：
 ```bash
-# 即使这样改写 title，SponsorBlock 章节标题仍为 "[SponsorBlock]: Sponsor"
+# 即使改写了 info['title']，SponsorBlock 章节标题仍为 "[SponsorBlock]: Sponsor"
 yt-dlp --parse-metadata "title:'%(title)s [无广告]'" \
        --sponsorblock-mark sponsor \
        URL
 ```
 
-### 8.4 元数据改写对文件元数据的影响
+### 8.5 元数据改写对文件元数据的影响
 
 FFmpegMetadataPP 的 `_get_metadata_opts()`（[yt_dlp/postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py#L728-L795)）使用修改后的 `info` 字段生成文件元数据。
 
-#### 8.4.1 字段优先级机制
+#### 8.5.1 字段优先级机制
 
 ```python
 def add(meta_list, info_list=None):
@@ -716,7 +831,7 @@ def add(meta_list, info_list=None):
 2. `info['title']` — 主字段
 3. `info['track']` — 别名字段
 
-#### 8.4.2 改写不同字段的效果
+#### 8.5.2 改写不同字段的效果
 
 | 改写目标 | 命令示例 | 对文件元数据的影响 |
 |---------|---------|------------------|
@@ -725,7 +840,7 @@ def add(meta_list, info_list=None):
 | **自定义字段** | `--parse-metadata "meta_comment:'自定义备注'"` | 添加自定义 `comment` 元数据 |
 | **替换标题内容** | `--replace-in-metadata title "原版" "修复版"` | 正则替换后写入 `title` |
 
-#### 8.4.3 自定义元数据字段的处理
+#### 8.5.3 自定义元数据字段的处理
 
 通过 `meta_<key>` 或 `meta<i>_<key>` 语法可以添加自定义元数据（[yt_dlp/postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py#L765-L769)）：
 
@@ -746,25 +861,29 @@ yt-dlp --parse-metadata "meta_comment:'下载自 YouTube'" \
        --embed-metadata URL
 ```
 
-#### 8.4.4 执行顺序对文件元数据的影响
+#### 8.5.4 执行顺序对文件元数据的影响
 
-MetadataParserPP 必须在 **`post_process` 阶段或更早** 运行才能影响文件元数据，因为：
-- FFmpegMetadataPP 在 `post_process` 阶段运行
-- 如果 MetadataParserPP 在 `after_move` 阶段运行，FFmpegMetadataPP 已经执行完毕，改写不会写入文件
+MetadataParserPP 必须在 **`post_process` 阶段结束前**运行才能影响文件元数据。在 `post_process` 阶段内，实际顺序为：
 
-**正确顺序**（`post_process` 阶段内）：
 ```
 post_process 链:
-    ...
-    ModifyChaptersPP → 改写 info['chapters']
-    ...
-    MetadataParserPP → 改写 info['title'], info['artist'] 等
-    ...
-    FFmpegMetadataPP → 使用修改后的 info 写入文件元数据
+    MetadataParserPP   ← 1. 改写 info['title'], info['artist'] 等（顶层字段）
+    FFmpegExtractAudioPP
+    FFmpegVideoRemuxerPP
+    FFmpegVideoConvertorPP
+    FFmpegEmbedSubtitlePP
+    ModifyChaptersPP   ← 2. 改写 info['chapters']（章节列表和标题）
+    FFmpegMetadataPP   ← 3. 读取 info 并写入文件元数据
+    EmbedThumbnailPP
     ...
 ```
 
-### 8.5 执行
+**关键结论：**
+- 通用元数据（title, artist 等）：MetadataParserPP 在 FFmpegMetadataPP **之前**，✅ 改写有效
+- 章节列表和章节标题：MetadataParserPP 在 ModifyChaptersPP **之前**，但因数据层级不同，❌ 无法影响章节
+- 如果 MetadataParserPP 在 `after_move` 阶段运行：FFmpegMetadataPP 已执行完毕，❌ 改写不会写入文件
+
+### 8.6 执行
 
 `run()` 方法依次执行所有 action，仅修改 `info` 字典，不触碰文件：
 
@@ -928,15 +1047,19 @@ post_process 阶段: FFmpegMetadataPP.run(info)
 
 7. **仅删除不嵌入**：只使用 `--sponsorblock-remove` 时，视频会被剪切但章节不会嵌入文件；只有 `--sponsorblock-mark` 才会自动触发 `addchapters = True`。
 
-8. **MetadataParserPP 执行阶段灵活性**：可通过 `[WHEN:]` 前缀指定任意 `POSTPROCESS_WHEN` 阶段，默认 `pre_process`；与 SponsorBlockPP 的顺序取决于阶段配置。
+8. **MetadataParserPP 执行阶段灵活性**：可通过 `[WHEN:]` 前缀指定任意 `POSTPROCESS_WHEN` 阶段，默认 `pre_process`；与 SponsorBlockPP、ModifyChaptersPP 的顺序取决于阶段配置。
 
-9. **通用元数据与章节标题解耦**：改写 `info['title']`、`info['artist']` 等通用元数据 **不会影响** SponsorBlock 章节标题，因为章节标题模板仅使用章节自身的 `_categories` 数据，求值时传入 `c.copy()` 而非整个 `info` 字典。
+9. **post_process 阶段精确顺序**：同阶段内按 yield 顺序执行，三者相对顺序为 **MetadataParserPP → ModifyChaptersPP → FFmpegMetadataPP**，由 `get_postprocessors()` 中的 yield 顺序决定。
 
-10. **文件元数据改写时机**：MetadataParserPP 必须在 `post_process` 阶段或更早运行才能影响文件元数据；`after_move` 阶段运行时 FFmpegMetadataPP 已执行完毕，改写不会写入文件。
+10. **通用元数据与章节标题解耦**：改写 `info['title']`、`info['artist']` 等通用元数据 **不会影响** SponsorBlock 章节标题。原因有二：一是数据层级不同（顶层字段 vs 章节列表内嵌套字段），二是章节标题模板求值时传入 `c.copy()`（仅章节自身字段）而非整个 `info` 字典。
 
-11. **字段优先级机制**：FFmpegMetadataPP 采用 `meta_<key>` > 主字段 > 别名字段的三级优先级；自定义元数据通过 `meta_<key>`（全局）或 `meta<i>_<key>`（指定流）语法添加。
+11. **数据层级隔离**：MetadataParserPP 只能修改 `info` 字典的**顶层字符串字段**，不能遍历 `info['chapters']` 列表逐个修改章节属性。要修改章节标题需通过 `--sponsorblock-chapter-title` 模板或自定义后处理器。
 
-12. **内部字段约定**：
+12. **文件元数据改写有效性**：MetadataParserPP 在 `post_process` 阶段内位于 FFmpegMetadataPP **之前**，因此对通用元数据（title, artist, meta_xxx 等）的改写会被 FFmpegMetadataPP 消费并写入文件；但在 `after_move` 阶段运行则无效。
+
+13. **字段优先级机制**：FFmpegMetadataPP 采用 `meta_<key>` > 主字段 > 别名字段的三级优先级；自定义元数据通过 `meta_<key>`（全局）或 `meta<i>_<key>`（指定流）语法添加。
+
+14. **内部字段约定**：
     - `c['_categories']` — SponsorBlock 章节的原始类别列表（用于合并后追踪）
     - `c['remove']` — 标记该时间段需要被剪切
     - `c['cut_idx']` — 指向第一个落在该章节内的 cut 的索引
