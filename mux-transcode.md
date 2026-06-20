@@ -1197,42 +1197,59 @@ ydl.add_post_processor(MyCustomMuxerPP(ydl), when='post_process')
 
 ## 关键文件速查表（带精确行号锚点）
 
-| 功能 | 仓库内路径 | 精确行范围 |
-|------|---------|-----------|
-| 后处理器注册 | [postprocessor/__init__.py](yt_dlp/postprocessor/__init__.py) | L51-L68 |
-| PP 基类 + 元类包装 | [postprocessor/common.py](yt_dlp/postprocessor/common.py) | L16-L135 |
-| 后处理器 PP 链追加 | [common.py:100-103](yt_dlp/postprocessor/common.py#L100-L103) | get_param 实现 |
-| 文件搬移 PP | [movefilesafterdownload.py](yt_dlp/postprocessor/movefilesafterdownload.py) | L11-L53 |
-| overwrites 参数文档 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L291-L293) | 参数三态注释 |
-| overwrites=None 时 pop key | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L778-L779) | None 处理机制 |
-| PP 实例化循环 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L827-L834) | 初始化时注册 |
-| add_post_processor | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L942-L946) | PP 加入链 |
-| prepare_filename | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L1551-L1570) | 文件名生成 |
-| _ensure_dir_exists | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L2038-L2041) | 目录创建 |
-| _merge 格式合并决策 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L2450-L2522) | 多格式组合 |
-| existing_file (含 default_overwrite) | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3320-L3328) | 存在性检查 |
-| process_info 主流程入口 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3331-L3668) | 完整处理链 |
-| files_to_move 初始化 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3361-L3361) | L3361 |
-| 字幕文件加入移动表 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3389-L3389) | L3389 |
-| 缩略图加入移动表 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3395-L3395) | L3395 |
-| Internet link 特殊覆盖逻辑 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3418-L3420) | link 文件不重写 |
-| existing_video_file 视频专用入口 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3463-L3470) | default_overwrite=False |
-| 视频 default_overwrite=False 调用点 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3466-L3467) | ★ 视频差异化核心 |
-| 动态注册 MergerPP | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3565-L3567) | 多格式后处理 |
-| 合并取消时保留中间文件 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3570-L3572) | ffmpeg 不可用场景 |
-| _delete_downloaded_files 删除实现 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3774-L3783) | 物理删除中间文件 |
-| run_pp 单个 PP 执行 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3798-L3819) | 删除/保留决策核心 |
-| run_all_pps 批量调度 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3821-L3826) | 动态+静态 PP 合并 |
-| pre_process 阶段处理 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3828-L3837) | before_dl 时机 |
-| post_process 入口方法 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3839-L3846) | 后处理总入口 |
-| __files_to_move 设置 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3842-L3842) | L3842 |
-| __files_to_move 清理 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L3845-L3845) | L3845 |
-| report_file_already_downloaded | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L1172-L1177) | 已下载报告 |
-| report_file_delete | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L1179-L1184) | 文件删除报告 |
-| info.json 覆盖写入 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L4396-L4396) | L4396 overwrites,True |
-| description 覆盖写入 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L4425-L4425) | L4425 overwrites,True |
-| 字幕 existing_file 检查 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L4460-L4460) | L4460 default=True |
-| 缩略图 existing_file 检查 | [YoutubeDL.py](yt_dlp/YoutubeDL.py#L4524-L4524) | L4524 default=True |
-| 搬移覆盖判断核心 | [movefilesafterdownload.py](yt_dlp/postprocessor/movefilesafterdownload.py#L37-L38) | overwrites=None→True→覆盖 |
-| 搬移跨卷 shutil.move | [movefilesafterdownload.py](yt_dlp/postprocessor/movefilesafterdownload.py#L50-L50) | L50 |
-| 搬移无条件更新 filepath | [movefilesafterdownload.py](yt_dlp/postprocessor/movefilesafterdownload.py#L52-L52) | ⚠️ 状态风险点 |
+> **核准说明**：所有条目均按「功能名称 = 锚点实际代码 = 说明描述」三方对齐原则逐一核实。
+> 单行锚点标注为 `Lxxxx`，多行范围标注为 `Lxxxx-Lyyyy`；说明列描述该行/范围真实功能，避免重复行号。
+
+### PP 基础与调度层
+
+| 功能 | 仓库内路径 | 精确行 | 锚点真实代码 / 说明 |
+|------|---------|--------|-------------------|
+| get_postprocessor 按名称查 PP 类 | [__init__.py:L51-L52](yt_dlp/postprocessor/__init__.py#L51-L52) | L51-L52 | `return postprocessors.value[key + 'PP']`，将字符串 key 映射为 PP 类 |
+| _default_pps 默认 PP 注册表构建 | [__init__.py:L62-L68](yt_dlp/postprocessor/__init__.py#L62-L68) | L62-L68 | 收集模块内所有 `*PP` 类注入全局注册表 |
+| PP 基类 + 元类 run_wrapper 包装 | [common.py:L16-L135](yt_dlp/postprocessor/common.py#L16-L135) | L16-L135 | PostProcessorMetaClass(L16-33) + PostProcessor 基类(L36-135) |
+| PP.get_param() 参数读取封装 | [common.py:L100-L103](yt_dlp/postprocessor/common.py#L100-L103) | L100-L103 | `self._downloader.params.get(name, default)` —— 所有 PP 读取配置的统一入口 |
+| PP._restrict_to 装饰器 | [common.py:L115-L115](yt_dlp/postprocessor/common.py#L115-L115) | L115 | 控制 PP 在视频/音频/图片场景下是否跳过 |
+| PP.run() 抽象接口 | [common.py:L135-L135](yt_dlp/postprocessor/common.py#L135-L135) | L135 | 所有 PP 必须实现的抽象方法 |
+| YoutubeDL.add_post_processor | [YoutubeDL.py:L942-L946](yt_dlp/YoutubeDL.py#L942-L946) | L942-L946 | `self._pps[when].append(pp)` —— PP 真正加入调度链的唯一入口 |
+| YoutubeDL PP 实例化循环 | [YoutubeDL.py:L827-L834](yt_dlp/YoutubeDL.py#L827-L834) | L827-L834 | 遍历 params['postprocessors']，按 key 查找类、实例化后调用 add_post_processor |
+| run_pp 单个 PP 执行（删除/保留决策） | [YoutubeDL.py:L3798-L3819](yt_dlp/YoutubeDL.py#L3798-L3819) | L3798-L3819 | 调用 pp.run()，处理 files_to_delete：keepvideo 则转移动表，否则物理删除 |
+| run_all_pps 批量调度 | [YoutubeDL.py:L3821-L3826](yt_dlp/YoutubeDL.py#L3821-L3826) | L3821-L3826 | 合并执行 additional_pps (动态注入) + self._pps[key] (静态配置)，info 链式传递 |
+| pre_process 阶段处理 | [YoutubeDL.py:L3828-L3837](yt_dlp/YoutubeDL.py#L3828-L3837) | L3828-L3837 | before_dl / pre_process 时机入口，弹出并返回 files_to_move |
+| post_process 后处理总入口 | [YoutubeDL.py:L3839-L3846](yt_dlp/YoutubeDL.py#L3839-L3846) | L3839-L3846 | 依次执行 post_process 阶段 PP → MoveFilesAfterDownloadPP → after_move 阶段 PP |
+
+### overwrites 三态覆盖控制
+
+| 功能 | 仓库内路径 | 精确行 | 锚点真实代码 / 说明 |
+|------|---------|--------|-------------------|
+| overwrites 参数三态注释 | [YoutubeDL.py:L291-L293](yt_dlp/YoutubeDL.py#L291-L293) | L291-L293 | 文档定义：True=全部覆盖 / None=仅非视频覆盖 / False=全不覆盖 |
+| overwrites=None 时移除 key | [YoutubeDL.py:L778-L779](yt_dlp/YoutubeDL.py#L778-L779) | L778-L779 | `params.pop('overwrites', None)` —— 差异化覆盖的核心机制（让 default_overwrite 生效） |
+| existing_file() 覆盖判定核心 | [YoutubeDL.py:L3320-L3328](yt_dlp/YoutubeDL.py#L3320-L3328) | L3320-L3328 | `not params.get('overwrites', default_overwrite)` —— 为 True 则返回已有文件=跳过下载 |
+| existing_video_file() 视频专用入口 | [YoutubeDL.py:L3463-L3470](yt_dlp/YoutubeDL.py#L3463-L3470) | L3463-L3470 | 调用 existing_file 时传 **default_overwrite=False**，实现 None 时视频不覆盖 |
+| info.json 覆盖参数读取 | [YoutubeDL.py:L4396-L4396](yt_dlp/YoutubeDL.py#L4396-L4396) | L4396 | `overwrite = params.get('overwrites', True)` —— None→True→覆盖 |
+| description 覆盖条件检查 | [YoutubeDL.py:L4425-L4425](yt_dlp/YoutubeDL.py#L4425-L4425) | L4425 | `not params.get('overwrites', True) and os.path.exists(descfn)` —— None→True→覆盖 |
+| 字幕 existing_file 检查 | [YoutubeDL.py:L4460-L4460](yt_dlp/YoutubeDL.py#L4460-L4460) | L4460 | `existing_file(...)` default_overwrite 默认为 True —— None→覆盖 |
+| 缩略图 existing_file 检查 | [YoutubeDL.py:L4524-L4524](yt_dlp/YoutubeDL.py#L4524-L4524) | L4524 | 同上，default_overwrite=True —— None→覆盖 |
+| Internet link 文件特殊分支 | [YoutubeDL.py:L3418-L3420](yt_dlp/YoutubeDL.py#L3418-L3420) | L3418-L3420 | overwrites=True 且 link 文件已存在 → 视为成功直接 return，**不重写**（与普通非视频行为不同） |
+| 搬移覆盖判断核心 | [movefilesafterdownload.py:L37-L38](yt_dlp/postprocessor/movefilesafterdownload.py#L37-L38) | L37-L38 | `get_param('overwrites', True)` —— None→True→先 os.remove 再移动 |
+| report_file_already_downloaded | [YoutubeDL.py:L1172-L1177](yt_dlp/YoutubeDL.py#L1172-L1177) | L1172-L1177 | 「文件已下载」提示输出 |
+| report_file_delete | [YoutubeDL.py:L1179-L1184](yt_dlp/YoutubeDL.py#L1179-L1184) | L1179-L1184 | 「删除已有文件」提示输出 |
+
+### 主流程与产物搬移
+
+| 功能 | 仓库内路径 | 精确行 | 锚点真实代码 / 说明 |
+|------|---------|--------|-------------------|
+| prepare_filename 文件名生成 | [YoutubeDL.py:L1551-L1570](yt_dlp/YoutubeDL.py#L1551-L1570) | L1551-L1570 | 根据 dir_type / outtmpl 计算最终路径 |
+| _ensure_dir_exists 目录创建检查 | [YoutubeDL.py:L2038-L2044](yt_dlp/YoutubeDL.py#L2038-L2044) | L2038-L2044 | `make_parent_dirs(path)` 并捕获异常返回 True/False |
+| _merge 格式合并决策 | [YoutubeDL.py:L2450-L2522](yt_dlp/YoutubeDL.py#L2450-L2522) | L2450-L2522 | 多格式组合 + get_compatible_ext 计算输出容器 |
+| process_info 主流程入口 | [YoutubeDL.py:L3331-L3668](yt_dlp/YoutubeDL.py#L3331-L3668) | L3331-L3668 | 单个视频完整处理链：准备→下载→fixup→post_process |
+| files_to_move 初始化 | [YoutubeDL.py:L3361-L3361](yt_dlp/YoutubeDL.py#L3361-L3361) | L3361 | `files_to_move = {}` 空字典创建 |
+| 字幕文件加入移动表 | [YoutubeDL.py:L3389-L3389](yt_dlp/YoutubeDL.py#L3389-L3389) | L3389 | `files_to_move.update(dict(sub_files))` |
+| 缩略图加入移动表 | [YoutubeDL.py:L3395-L3395](yt_dlp/YoutubeDL.py#L3395-L3395) | L3395 | `files_to_move.update(dict(thumb_files))` |
+| 动态注册 MergerPP | [YoutubeDL.py:L3565-L3567](yt_dlp/YoutubeDL.py#L3565-L3567) | L3565-L3567 | `info_dict['__postprocessors'].append(merger)` —— 多格式下载后动态注入合并 PP |
+| 合并取消时保留中间文件 | [YoutubeDL.py:L3570-L3572](yt_dlp/YoutubeDL.py#L3570-L3572) | L3570-L3572 | merger 不可用时，所有 downloaded 文件加入 files_to_move 保留输出 |
+| _delete_downloaded_files 删除实现 | [YoutubeDL.py:L3774-L3783](yt_dlp/YoutubeDL.py#L3774-L3783) | L3774-L3783 | 物理删除文件，并同步从 __files_to_move 中移除 |
+| __files_to_move 在 post_process 入口设置 | [YoutubeDL.py:L3842-L3842](yt_dlp/YoutubeDL.py#L3842-L3842) | L3842 | `info['__files_to_move'] = files_to_move` |
+| __files_to_move 在 post_process 结束清理 | [YoutubeDL.py:L3845-L3845](yt_dlp/YoutubeDL.py#L3845-L3845) | L3845 | `del info['__files_to_move']` |
+| MoveFilesAfterDownloadPP 文件搬移 PP | [movefilesafterdownload.py:L11-L53](yt_dlp/postprocessor/movefilesafterdownload.py#L11-L53) | L11-L53 | 完整搬移类：主文件追加 + 遍历移动表 + 覆盖判断 + shutil.move |
+| 搬移跨卷 shutil.move | [movefilesafterdownload.py:L50-L50](yt_dlp/postprocessor/movefilesafterdownload.py#L50-L50) | L50 | `shutil.move(oldfile, newfile)` —— 自动 fallback copy+delete 支持跨卷 |
+| 搬移无条件更新 filepath（⚠️风险点） | [movefilesafterdownload.py:L52-L52](yt_dlp/postprocessor/movefilesafterdownload.py#L52-L52) | L52 | `info['filepath'] = finalpath` —— 无论移动是否成功都会更新，可能导致路径与实际文件位置不一致 |
