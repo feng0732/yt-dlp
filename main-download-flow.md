@@ -824,20 +824,233 @@ _prepare_frag_download(ctx)
 - 单个分片也支持续传：`_download_fragment` 中检查 `frag_resume_len = self.filesize_or_none(self.temp_name(fragment_filename))`（[L120-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/fragment.py#L120-L122)）
 - 成功完成后删除 `.ytdl` 簿记文件，`try_rename(.part → 最终名)`
 
-#### 10.6.5 外部下载器的续传行为
+#### 10.6.5 外部下载器续传机制深度分析
 
-位置：[external.py#L42-L70](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L42-L70)
+位置：[external.py#L37-L590](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L37-L590)
 
-外部下载器的 `real_download` 接收 `filename`（最终文件名），内部用 `self.temp_name(filename)` 得到 `.part` 文件名，将 `.part` 传给 `_call_downloader`。成功后 `try_rename(.part → 最终名)`。
+##### 10.6.5.1 外部下载器的继承关系与调用链
 
-| 下载器 | 续传标志 | 行为 |
-|--------|---------|------|
-| **curl** | `--continue-at -`（`continuedl=True` 时） | 自动续传 `.part` 文件 |
-| **aria2c** | `-c`（硬编码始终开启） | 始终尝试续传 `.part` 文件 |
-| **wget** | 无显式续传标志 | wget 默认对已有文件尝试续传 |
-| **FFmpegFD** | 无续传 | 不支持续传，每次从头下载 |
+```
+FragmentFD (分片下载基类，含 .ytdl 簿记续传)
+  └── ExternalFD (外部下载器基类)
+        ├─ CurlFD      — curl
+        ├─ WgetFD      — wget
+        ├─ AxelFD      — axel
+        ├─ Aria2cFD    — aria2c
+        ├─ HttpieFD    — httpie
+        └─ FFmpegFD    — ffmpeg
+```
 
-**注意**：外部下载器的续传发生在 `.part` 文件级别。如果子格式已完全下载（`.part` 已 rename 为最终名），则 `FileDownloader.download()` 的 `continuedl_and_exists` 检查会先命中，直接返回 `(True, False)`，根本不会调用 `real_download`。
+**关键注意**：`ExternalFD` 虽然继承自 `FragmentFD`，但其 `real_download` 方法（[L42-L81](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L42-L81)）完全重写了父类逻辑，**不经过** `_prepare_frag_download` / `_start_frag_download` 流程。因此 FragmentFD 的 `.ytdl` 簿记文件和分片级续传**不会在普通单文件下载时触发**——只有在 `fragments` 模式（HLS/DASH 分片 URL 列表）下才会用到分片续传能力。
+
+调用链（单文件模式）：
+
+```
+FileDownloader.download(filename, info_dict)
+├─ [continuedl_and_exists 命中] → 跳过，返回 (True, False)   ← 外层检测
+└─ [未命中] → real_download(filename, info_dict)
+    └─ ExternalFD.real_download
+        ├─ tmpfilename = self.temp_name(filename)  ← filename.part
+        ├─ retval = self._call_downloader(tmpfilename, info_dict)
+        │   └─ _make_cmd(tmpfilename, info_dict)   ← 各子类实现
+        ├─ [retval == 0]
+        │   ├─ fsize = os.path.getsize(tmpfilename)
+        │   └─ self.try_rename(tmpfilename, filename)  ← .part → 最终名
+        └─ return success
+```
+
+##### 10.6.5.2 CurlFD：`--continue-at -` 自动续传
+
+位置：[external.py#L195-L259](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L195-L259)
+
+**续传参数**：
+
+```python
+cmd += self._bool_option('--continue-at', 'continuedl', '-', '0')
+```
+
+| `continuedl` 参数 | curl 命令行参数 | 行为 |
+|------------------|---------------|------|
+| `True`（默认） | `--continue-at -` | 自动检测本地文件大小，从末尾续传 |
+| `False` | `--continue-at 0` | 从字节 0 开始，即从头下载 |
+
+**part 文件复用条件**：
+1. 磁盘上存在 `tmpfilename`（即 `filename.part` 文件）
+2. 服务器支持 HTTP Range 请求
+3. 续传后返回的 Content-Range 起始位置与请求一致
+
+**特殊处理**：
+- curl 会自动处理重定向（`--location`）
+- `--compressed` 启用压缩但续传时可能需要服务器支持
+- 失败时由 curl 自己决定是否重试（`--retry` 参数）
+
+##### 10.6.5.3 Aria2cFD：`-c` 硬编码始终续传 + 多连接并发
+
+位置：[external.py#L304-L348](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L304-L348)
+
+**续传参数**：
+
+```python
+cmd = [self.exe, '-c', '--no-conf', ...]
+```
+
+`-c`（`--continue`）是**硬编码**的，**不受 `continuedl` 参数控制**——无论 `continuedl` 是 True 还是 False，aria2c 都会尝试续传。
+
+**并发与续传**：
+- `-s16 -x16 -j16`：16 连接并发下载，单文件最多 16 个分片
+- `--min-split-size 1M`：分片最小 1MB
+- `--file-allocation=none`：不预分配磁盘空间（续传兼容性更好）
+- `--auto-file-renaming=false`：禁止自动重命名，确保文件名可预测
+
+**part 文件复用条件**：
+1. 磁盘上存在目标文件（`filename.part`）
+2. 文件大小 < 远程文件大小
+3. 服务器支持 Range 请求
+4. aria2c 的 `.aria2` 控制文件可能也参与续传状态管理
+
+**重要**：aria2c 在续传时会检查已有 `.aria2` 控制文件（如果存在），以恢复多连接下载的进度。如果只有 `.part` 文件但没有 `.aria2` 控制文件，aria2c 仍然可以续传，但会退化为单连接续传模式。
+
+##### 10.6.5.4 WgetFD：**无续传支持**
+
+位置：[external.py#L278-L301](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L278-L301)
+
+**续传参数**：**无**。WgetFD 的 `_make_cmd` 没有添加任何续传标志。
+
+```python
+cmd = [self.exe, '-O', tmpfilename, '-nv', '--compression=auto']
+```
+
+**行为分析**：
+- `-O tmpfilename` 指定输出文件
+- wget 的 `-O` 选项：如果目标文件已存在，**会截断文件并从头开始写入**（不续传）
+- 没有 `-c`（`--continue`）标志，因此**不支持续传**
+
+**part 文件复用**：**否**。即使 `.part` 文件已存在且有部分数据，wget 也会直接覆盖。
+
+**retries 参数**：`--tries` 控制重试次数，但每次重试都是从头开始下载，不是续传。
+
+##### 10.6.5.5 AxelFD：无显式续传标志
+
+位置：[external.py#L262-L275](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L262-L275)
+
+- 没有显式续传参数
+- axel 的默认行为是**自动续传**（如果目标文件存在）
+- 但 `-o tmpfilename` 可能改变行为
+- 由于 yt-dlp 代码未显式传续传标志，行为依赖 axel 版本默认值
+
+##### 10.6.5.6 FFmpegFD：**无续传支持**
+
+位置：[external.py#L372-L571](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L372-L571)
+
+**续传参数**：**无**。FFmpegFD 的 `_call_downloader` 构造的 ffmpeg 命令不包含任何续传参数。
+
+```python
+args = [ffpp.executable, '-y']  # -y: 覆盖输出文件
+...
+args += ['-c', 'copy']  # 直接复制流
+...
+args.append(tmpfilename)
+```
+
+**关键特征**：
+- `-y`：**强制覆盖**输出文件（如果存在则直接覆盖）
+- ffmpeg 是**流式处理工具**，从输入流的开头读取到结尾，不支持 HTTP 续传
+- 对于 m3u8/HLS：ffmpeg 自己管理分片下载，但不支持整体续传（重新开始会重新下载所有分片）
+- 对于多格式合并（`requested_formats`）：ffmpeg 用 `-map` 合并多个输入，同样不支持续传
+
+**part 文件复用**：**完全不支持**。每次调用都会从字节 0 开始覆盖写入。
+
+**适用场景**：FFmpegFD 主要用于：
+1. m3u8 协议（原生 HlsFD 不支持的特性）
+2. 直播流
+3. 多格式直接合并（一步下载+合并）
+4. 分段下载（`section_start` / `section_end`）
+
+##### 10.6.5.7 外部下载器续传对比总表
+
+| 维度 | **CurlFD** | **Aria2cFD** | **WgetFD** | **FFmpegFD** |
+|-----|-----------|-------------|-----------|-------------|
+| **续传能力** | ✅ 支持 | ✅ 支持（更强） | ❌ 不支持 | ❌ 不支持 |
+| **续传开关** | 受 `continuedl` 参数控制 | `-c` 硬编码，始终开启 | 无 | 无 |
+| **续传标志** | `--continue-at -` / `--continue-at 0` | `-c`（始终存在） | — | — |
+| **对 part 文件的行为** | 存在则续传，否则新建 | 存在则续传，否则新建 | 存在则覆盖 | 存在则覆盖（`-y`） |
+| **并发下载** | ❌ 单连接 | ✅ 16 连接（`-s16 -x16`） | ❌ 单连接 | ❌ 单连接（输入流） |
+| **重试方式** | `--retry`（重新建立连接） | 内部多连接重试 | `--tries`（重试次数） | 无内置重试 |
+| **控制文件** | 无 | `.aria2` 控制文件（多连接状态） | 无 | 无 |
+| **协议支持** | http/https/ftp/ftps | http/https/ftp/ftps | http/https/ftp | http/https/ftp/m3u8/rtsp/rtmp 等 |
+| **多格式合并支持** | ❌ | ❌ | ❌ | ✅（`MULTIPLE_FORMATS` 特性） |
+| **受 FileDownloader.download() 外层检测保护** | ✅ 完整文件存在时直接跳过 | ✅ 完整文件存在时直接跳过 | ✅ 完整文件存在时直接跳过 | ✅ 完整文件存在时直接跳过 |
+
+##### 10.6.5.8 两层续传检测机制
+
+外部下载器有**两层**续传/跳过检测：
+
+**第一层：`FileDownloader.download()` 外层检测**（所有下载器共享）
+
+```python
+# common.py L430-L455
+if filename != '-' and (nooverwrites_and_exists or continuedl_and_exists):
+    self.report_file_already_downloaded(filename)
+    return True, False
+```
+
+- 检查的是**最终文件名**（非 `.part`）
+- 只有当文件已**完整下载**（`.part` 已 rename 为最终名）时才命中
+- 命中后直接返回 `(True, False)`，**不会调用** `real_download`
+
+**第二层：具体下载器内部的 .part 文件续传**
+
+- 只有第一层未命中时才进入
+- 各家下载器对 `.part` 文件的处理方式不同（见上表）
+- CurlFD 和 Aria2cFD 支持续传 `.part`；WgetFD 和 FFmpegFD 会覆盖
+
+**完整决策流程图**（以 `continuedl=True` 为例）：
+
+```
+FileDownloader.download(filename='video.f137.mp4')
+│
+├─ os.path.isfile('video.f137.mp4')?   ← 最终文件存在？
+│   ├─ 是 → continuedl_and_exists = True
+│   │    → 报告已完成 → return (True, False)
+│   │    零成本，零下载
+│   │
+│   └─ 否 → 进入 real_download
+│       │
+│       └─ ExternalFD.real_download
+│           ├─ tmpfilename = 'video.f137.mp4.part'
+│           └─ _call_downloader(tmpfilename, info_dict)
+│               │
+│               ├─ [CurlFD] --continue-at -
+│               │   └─ .part 存在 ? 续传剩余字节 : 从头下载
+│               │
+│               ├─ [Aria2cFD] -c (始终开启)
+│               │   └─ .part 存在 ? 多连接续传 : 多连接新下载
+│               │
+│               ├─ [WgetFD] 无 -c
+│               │   └─ .part 存在 ? 直接覆盖 : 从头下载
+│               │
+│               └─ [FFmpegFD] -y
+│                   └─ .part 存在 ? 直接覆盖 : 从头下载
+│
+└─ 成功后 try_rename(.part → 最终名)
+```
+
+##### 10.6.5.9 在子格式部分失败场景下的差异
+
+假设外层格式组 `bestvideo+bestaudio`，子格式 137（视频）完整下载成功，子格式 140（音频）部分下载失败（`.part` 存在但不完整），重试时：
+
+| 下载器 | 子格式 137（完整） | 子格式 140（部分） | 总重试成本 |
+|--------|-------------------|-------------------|-----------|
+| **HttpFD**（默认） | `continuedl` 检测到完整文件 → 跳过 | HttpFD 检测 `.part` → Range 续传剩余字节 | **低**（仅续传音频） |
+| **CurlFD** | `continuedl` 检测到完整文件 → 跳过 | `--continue-at -` → 续传剩余字节 | **低**（仅续传音频） |
+| **Aria2cFD** | `continuedl` 检测到完整文件 → 跳过 | `-c` 多连接续传（可能更快） | **低**（并发续传音频） |
+| **WgetFD** | `continuedl` 检测到完整文件 → 跳过 | `-O` 截断覆盖，从头下载 | **中**（音频重新下载） |
+| **FFmpegFD** | `continuedl` 检测到完整文件 → 跳过 | `-y` 覆盖，从头下载 | **中**（音频重新下载） |
+
+**关键结论**：
+1. 第一层检测（最终文件存在性）对所有下载器都生效，已完整下载的子格式永远不会被重新下载
+2. 第二层检测（`.part` 文件续传）差异很大：Curl/Aria2c 可以续传，Wget/FFmpeg 会覆盖
+3. 因此在"部分子格式下载失败"场景下，使用支持续传的下载器（HttpFD/CurlFD/Aria2cFD）可以显著降低重试成本
 
 #### 10.6.6 完整重试场景表（含续传与复用细节）
 
