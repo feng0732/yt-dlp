@@ -103,7 +103,21 @@ FormatSelector = namedtuple('FormatSelector', ['type', 'selector', 'filters'])
 8. 顶层构造 `MERGE(SINGLE('a'), [MERGE(SINGLE('b'), [SINGLE('c')])])`
 
 最终结构（伪代码）：`MERGE(a, [MERGE(b, [c])])`。
-编译后执行顺序为 `_merge(_merge(b, c), a)`，即先合并右侧的 `b+c`，再与 `a` 合并。
+
+**编译后的执行顺序**：
+1. 先递归计算右侧：`_merge(b, c)` → 得到合并结果 `bc`，其 `requested_formats = [b, c]`
+2. 再做外层合并：`_merge(a, bc)` → 第一个参数是左侧 `a`，第二个参数是右侧合并结果 `bc`
+
+这个顺序会影响 `_merge` 内部 `formats_info` 的展开顺序：
+```python
+# _merge(a, bc) 中：
+formats_info = a.requested_formats + bc.requested_formats
+#              = [a]                    + [b, c]
+#              = [a, b, c]
+```
+
+即最终合并格式的 `requested_formats` 列表按"从左到右"的顺序展开：**越靠左的选择器，其格式在列表中越靠前**。
+这一点很重要，因为多流策略关闭时 `_merge` 会按遍历顺序**保留先遇到的流**，列表顺序直接决定了哪条流会被留下。
 
 ### 3.4 递归入口的约束
 
@@ -471,11 +485,10 @@ PICKFIRST
 ```
 
 执行流程：
-1. `bv*` → 最佳含视频格式
-2. `ba` → 最佳纯音频
-3. `ba.2` → 第二佳纯音频
-4. 两次 MERGE 将三者合并为一个格式
-5. 若开启多音频流，合并结果保留两个音频轨道
+1. 先递归计算右侧 `ba+ba.2` → 合并结果 `ba_merged`，`requested_formats = [ba, ba.2]`
+2. 再做外层合并 `_merge(bv*, ba_merged)` → 左侧 `bv*` 在前，右侧合并结果在后
+3. 最终 `requested_formats = [bv*, ba, ba.2]`（从左到右展开）
+4. 若开启多音频流，合并结果保留两个音频轨道，顺序为 `ba` 在前、`ba.2` 在后
 
 ### `all[height<=480]`
 
