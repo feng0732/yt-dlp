@@ -581,32 +581,191 @@ self._remove_sponsor_segments = set(remove_sponsor_segments or []) - set(Sponsor
 
 文件：[yt_dlp/postprocessor/metadataparser.py](yt_dlp/postprocessor/metadataparser.py)
 
-### 8.1 两种动作
+### 8.1 两种动作详解
 
-**INTERPRET** — 从模板解析字段（第 67-81 行）：
+MetadataParserPP 支持两种动作，分别由 `--parse-metadata` 和 `--replace-in-metadata` 触发。
 
-```python
-# 例：从 "%(title)s - %(artist)s" 解析 title 和 artist
-def interpretter(self, inp, out):
-    def f(info):
-        data_to_parse = self._downloader.evaluate_outtmpl(template, info)
-        match = out_re.search(data_to_parse)
-        for attribute, value in filter_dict(match.groupdict()).items():
-            info[attribute] = value
-    # ...
-    return f
+#### 8.1.1 INTERPRET 动作（`--parse-metadata FROM:TO`）
+
+**命令格式**：`--parse-metadata "[WHEN:]FROM:TO"`
+
+**两阶段处理流程**：
+
+```
+阶段 1: FROM → 模板求值 → 得到字符串 data_to_parse
+阶段 2: TO → 编译为正则 → 命名分组匹配 data_to_parse → 写入 info 字段
 ```
 
-**REPLACE** — 正则替换字段（第 84-101 行）：
+**阶段 1：FROM 模板求值**（[field_to_template](yt_dlp/postprocessor/metadataparser.py#L26-L35) + [evaluate_outtmpl](yt_dlp/postprocessor/metadataparser.py#L69-L69)）
+
+FROM 参数经过 `field_to_template()` 转换后，由 `evaluate_outtmpl()` 求值为字符串：
+
+```python
+template = self.field_to_template(inp)  # "title" → "%(title)s"
+data_to_parse = self._downloader.evaluate_outtmpl(template, info)
+```
+
+- 如果 FROM 是纯字段名（如 `title`），转换为 `%(title)s` 模板
+- 如果 FROM 已包含 `%(...)s` 语法（如 `%(title)s - %(artist)s`），直接使用
+- 求值结果是一个字符串，例如 `"My Video - My Artist"`
+
+**阶段 2：TO 正则匹配与命名分组写入**（[format_to_regex](yt_dlp/postprocessor/metadataparser.py#L38-L59) + [interpretter](yt_dlp/postprocessor/metadataparser.py#L67-L81)）
+
+TO 参数通过 `format_to_regex()` 转换为正则表达式，其中 `%(...)s` 变为命名捕获组：
+
+```python
+out_re = re.compile(self.format_to_regex(out))
+match = out_re.search(data_to_parse)
+for attribute, value in filter_dict(match.groupdict()).items():
+    info[attribute] = value
+```
+
+`format_to_regex()` 的转换规则（[metadataparser.py](yt_dlp/postprocessor/metadataparser.py#L38-L59)）：
+
+| TO 参数 | 生成的正则 | 说明 |
+|--------|----------|------|
+| `%(title)s - %(artist)s` | `(?P<title>.+)\ \-\ (?P<artist>.+)` | 每个 `%(...)s` 变为 `(?P<name>.+)` |
+| `%(title)s` | `(?P<title>.+)` | 单字段，匹配整个字符串 |
+| `title`（纯字段名） | `(?s)(?P<title>.+)` | 纯字段名自动转为匹配全部的正则 |
+| `非模板文本` | 原样保留 | 无 `%(...)s` 则不转换（字面量正则） |
+
+**关键机制**：匹配结果的 `groupdict()` 中，**只有成功匹配的命名组**才会被写入 `info`。`filter_dict()` 过滤掉值为 `None` 的组（即未参与匹配的可选组）。
+
+**完整示例推导**：
+
+```bash
+--parse-metadata "%(title)s - %(artist)s:%(artist)s - %(title)s"
+```
+
+1. FROM: `%(title)s - %(artist)s` → 求值 → `"My Video - My Artist"`
+2. TO: `%(artist)s - %(title)s` → 正则 → `(?P<artist>.+)\ \-\ (?P<title>.+)`
+3. 匹配: `match.groupdict() = {'artist': 'My Video', 'title': 'My Artist'}`
+4. 写入: `info['artist'] = 'My Video'`, `info['title'] = 'My Artist'`
+5. 结果: title 和 artist 被互换了
+
+**单字段提取示例**：
+
+```bash
+--parse-metadata "title:%(artist)s - %(title)s"
+```
+
+1. FROM: `title` → 转换为 `%(title)s` → 求值 → `"My Video - My Artist"`
+2. TO: `%(artist)s - %(title)s` → 正则 → `(?P<artist>.+)\ \-\ (?P<title>.+)`
+3. 匹配: 仅当 title 包含 `" - "` 时才成功
+4. 写入: 从 title 中提取出 artist 和 title 两个字段
+
+**纯赋值不是直接赋值**：
+
+`--parse-metadata` **没有直接赋值语法**。它的本质是「模板求值 → 正则匹配 → 命名分组写入」，必须经过正则匹配这一步。要实现类似"直接赋值"的效果，需要让 TO 正则匹配整个 FROM 求值结果：
+
+```bash
+# ✅ 正确：用纯字段名作为 TO，format_to_regex 会生成匹配全体的 (?P<title>.+)
+--parse-metadata "title:artist"
+
+# 等价过程：
+#   FROM "title" → "%(title)s" → 求值 → "My Video"
+#   TO   "artist" → (?s)(?P<artist>.+) → 匹配 → {'artist': 'My Video'}
+#   结果: info['artist'] = 'My Video'（将 title 值复制到 artist）
+```
+
+```bash
+# ❌ 错误理解：这不是"把 title 设为字面量 '新标题'"
+--parse-metadata "title:新标题"
+
+# 实际过程：
+#   FROM "title" → "%(title)s" → 求值 → "My Video"（不是字面量 "新标题"！）
+#   TO   "新标题" → 正则中无 %(...)s → 当作字面量正则 新标题
+#   在 "My Video" 中搜索字面量 "新标题" → 匹配失败
+#   结果: 不修改任何字段
+```
+
+**正确的赋值方式**：利用 FROM 模板生成字面量，再让 TO 正则捕获它：
+
+```bash
+# 将 title 设为字面量 "新标题"
+--parse-metadata "新标题:title"
+
+# 过程：
+#   FROM "新标题" → 模板中无 %(...)s → 求值后仍为字面量 "新标题"
+#   TO   "title" → (?s)(?P<title>.+) → 匹配 → {'title': '新标题'}
+#   结果: info['title'] = '新标题'
+```
+
+**FROM 中的冒号转义**：`MetadataFromFieldPP.to_action()` 使用 `(?<!\\):` 分割 FROM 和 TO（[metadataparser.py](yt_dlp/postprocessor/metadataparser.py#L109-L109)），因此 FROM 中的冒号需要用 `\:` 转义：
+
+```bash
+# FROM 包含冒号时需要转义
+--parse-metadata "http\://example.com/%(id)s:url"
+```
+
+#### 8.1.2 REPLACE 动作（`--replace-in-metadata FIELDS REGEX REPLACE`）
+
+**命令格式**：`--replace-in-metadata "[WHEN:]FIELDS REGEX REPLACE"`
+
+REPLACE 动作对 **info 字典中已有的字符串字段** 执行正则替换，核心代码（[replacer](yt_dlp/postprocessor/metadataparser.py#L84-L101)）：
 
 ```python
 def replacer(self, field, search, replace):
     def f(info):
         val = info.get(field)
+        if val is None:
+            self.to_screen(f'Video does not have a {field}')
+            return
+        elif not isinstance(val, str):
+            self.report_warning(
+                f'Cannot replace in field {field} since it is a {type(val).__name__}')
+            return
         info[field], n = search_re.subn(replace, val)
-    # ...
+        # ...
+    search_re = re.compile(search)
     return f
 ```
+
+**三个关键守卫条件**：
+
+| 条件 | 字段状态 | 行为 |
+|-----|---------|------|
+| `val is None` | 字段不存在 | 跳过，输出 "Video does not have a {field}" |
+| `not isinstance(val, str)` | 字段存在但非字符串（如 list, int） | 跳过并警告，**不会**修改该字段 |
+| `isinstance(val, str)` | 字段存在且为字符串 | 执行 `re.subn(search, replace, val)` |
+
+**FIELDS 参数支持逗号分隔的多字段**：在 `__init__.py` 的 `metadataparser_actions()` 中（[yt_dlp/__init__.py](yt_dlp/__init__.py#L429-L429)），逗号分隔的字段名展开为多个独立的 REPLACE 动作：
+
+```python
+# --replace-in-metadata "title,description" "old" "new"
+# 展开为两个动作：
+#   (REPLACE, 'title', 'old', 'new')
+#   (REPLACE, 'description', 'old', 'new')
+actions = ((MetadataParserPP.Actions.REPLACE, x, *f[1:]) for x in f[0].split(','))
+```
+
+**与 INTERPRET 动作的本质区别**：
+
+| 维度 | INTERPRET (`--parse-metadata`) | REPLACE (`--replace-in-metadata`) |
+|-----|------|------|
+| 输入来源 | FROM 模板求值后的字符串 | info 中指定字段的**现有值** |
+| 输出目标 | TO 正则的**命名捕获组**决定写入哪些字段 | 替换结果写回**原字段** |
+| 字段要求 | FROM 引用缺失字段时会得到占位值或空串，可能导致 TO 匹配不到预期内容 | 目标字段必须存在**且为字符串** |
+| 能否创建新字段 | ✅ TO 中的命名组可创建新字段 | ❌ 只能修改已有字符串字段 |
+| 能否修改非字符串字段 | ❌ 模板求值依赖字符串 | ❌ 显式守卫 `not isinstance(val, str)` |
+| 能否修改列表/字典字段 | ❌ | ❌ |
+
+**示例**：
+
+```bash
+# 在 title 中替换 "官方MV" 为 "音乐视频"
+--replace-in-metadata title "官方MV" "音乐视频"
+
+# 同时在 title 和 description 中替换
+--replace-in-metadata "title,description" "旧词" "新词"
+
+# 使用正则反向引用
+--replace-in-metadata title "(\d{4})-(\d{2})-(\d{2})" "\2/\3/\1"
+```
+
+**REPLACE 无法修改章节标题的原因**：
+
+即使指定 `--replace-in-metadata chapters "old" "new"`，也会因为 `info['chapters']` 是一个**列表**（不是字符串）而触发守卫条件，输出警告并跳过。
 
 ### 8.2 执行阶段与顺序关系
 
@@ -735,13 +894,14 @@ MetadataParserPP → ModifyChaptersPP → FFmpegMetadataPP
 **场景 1：post_process 阶段改标题 + SponsorBlock 标记**
 
 ```bash
-yt-dlp --parse-metadata "post_process:title:'%(title)s [已去广告]'" \
+# 正确写法：FROM 模板拼接后缀，TO 用纯字段名捕获
+yt-dlp --parse-metadata "post_process:%(title)s [已去广告]:title" \
        --sponsorblock-mark all \
        URL
 ```
 
 结果：
-- ✅ 文件 `title` 元数据变为 "原标题 [已去广告]"
+- ✅ 文件 `title` 元数据变为 "原标题 [已去广告]"（FROM 模板求值后由 TO 正则捕获写入）
 - ❌ SponsorBlock 章节标题不变（仍为 "[SponsorBlock]: Sponsor" 等）
 - ✅ 章节数量和时间点正确
 
@@ -807,10 +967,22 @@ DEFAULT_SPONSORBLOCK_CHAPTER_TITLE = '[SponsorBlock]: %(category_names)l'
 
 **示例验证**：
 ```bash
-# 即使改写了 info['title']，SponsorBlock 章节标题仍为 "[SponsorBlock]: Sponsor"
+# 目标：将 title 改为 "原标题 [无广告]"
+# ❌ 错误解法：这不会生效
+#   FROM "title" → "%(title)s" → 求值 → "原标题"
+#   TO   "%(title)s [无广告]" → 正则 → (?P<title>.+)\ \[无广告\]
+#   在 "原标题" 中搜索 → 无匹配（缺少 " [无广告]" 后缀）
 yt-dlp --parse-metadata "title:'%(title)s [无广告]'" \
-       --sponsorblock-mark sponsor \
-       URL
+       --sponsorblock-mark sponsor URL
+
+# ✅ 正确解法：用 FROM 模板拼接后缀，TO 用纯字段名捕获全部
+#   FROM "%(title)s [无广告]" → 求值 → "原标题 [无广告]"
+#   TO   "title" → (?s)(?P<title>.+) → 匹配 → info['title'] = '原标题 [无广告]'
+yt-dlp --parse-metadata "%(title)s [无广告]:title" \
+       --sponsorblock-mark sponsor URL
+
+# 即使改写了 info['title']，SponsorBlock 章节标题仍为 "[SponsorBlock]: Sponsor"
+# 因为章节标题模板使用 c.copy() 上下文，不引用 info['title']
 ```
 
 ### 8.5 元数据改写对文件元数据的影响
@@ -833,12 +1005,13 @@ def add(meta_list, info_list=None):
 
 #### 8.5.2 改写不同字段的效果
 
-| 改写目标 | 命令示例 | 对文件元数据的影响 |
-|---------|---------|------------------|
-| **标题** | `--parse-metadata "title:'新标题'"` | 修改文件的 `title` 元数据 |
-| **作者** | `--parse-metadata "artist:'新作者'"` | 修改文件的 `artist` 元数据 |
-| **自定义字段** | `--parse-metadata "meta_comment:'自定义备注'"` | 添加自定义 `comment` 元数据 |
-| **替换标题内容** | `--replace-in-metadata title "原版" "修复版"` | 正则替换后写入 `title` |
+| 改写目标 | 命令示例 | 实际行为 | 对文件元数据的影响 |
+|---------|---------|---------|------------------|
+| **复制字段值** | `--parse-metadata "title:artist"` | FROM: `%(title)s`→`"My Video"` → TO: `(?P<artist>.+)`→匹配 → `info['artist']='My Video'` | 文件 `artist` 设为 title 的值 |
+| **交换字段** | `--parse-metadata "%(title)s - %(artist)s:%(artist)s - %(title)s"` | FROM 求值→`"My Video - My Artist"` → TO 正则提取两组 → 互写 | 文件 title/artist 互换 |
+| **赋值字面量** | `--parse-metadata "新标题:title"` | FROM: 无模板语法→字面量`"新标题"` → TO: `(?P<title>.+)`→匹配 | 文件 `title` 设为 "新标题" |
+| **替换字段内容** | `--replace-in-metadata title "原版" "修复版"` | 在 `info['title']` 中正则替换 | 文件 `title` 中 "原版"→"修复版" |
+| **自定义元数据** | `--parse-metadata "自定义值:meta_comment"` | FROM→字面量 → TO→`info['meta_comment']='自定义值'` | 文件添加 `comment` 元数据 |
 
 #### 8.5.3 自定义元数据字段的处理
 
@@ -857,7 +1030,8 @@ for key, value in info.items():
 **示例**：
 ```bash
 # 添加自定义 comment 元数据
-yt-dlp --parse-metadata "meta_comment:'下载自 YouTube'" \
+# FROM "下载自 YouTube" → 字面量 → TO "meta_comment" → (?P<meta_comment>.+) → 匹配
+yt-dlp --parse-metadata "下载自 YouTube:meta_comment" \
        --embed-metadata URL
 ```
 
@@ -972,17 +1146,17 @@ title=[SponsorBlock]: Sponsor
 
 ```
 用户选项: --sponsorblock-mark all --sponsorblock-remove sponsor,intro
-          --parse-metadata "title:'%(title)s [无广告]'"
+          --parse-metadata "%(title)s [无广告]:title"
           |
           v
 validate_options() [yt_dlp/__init__.py]
   ├─ sponsorblock_query = mark | remove
   ├─ addchapters = True (因 sponsorblock_mark 为真且 addchapters is None)
-  └─ parse_metadata = { 'pre_process': [ (INTERPRET, ...) ] }
+  └─ parse_metadata = { 'pre_process': [ (INTERPRET, '%(title)s [无广告]', 'title') ] }
           |
           v
 get_postprocessors()
-  ├─ MetadataParserPP (when=pre_process, actions=解析 title)
+  ├─ MetadataParserPP (when=pre_process, actions=INTERPRET)
   ├─ SponsorBlockPP (when=after_filter, categories=all)
   ├─ ModifyChaptersPP (when=post_process, remove_sponsor_segments={sponsor,intro})
   └─ FFmpegMetadataPP (when=post_process, add_chapters=True, add_metadata=False)
@@ -991,8 +1165,11 @@ get_postprocessors()
 YouTube 提取器 → info dict { title: '原视频标题', artist: '上传者', ... }
           |
           v
-pre_process 阶段: MetadataParserPP.run(info)   ← 改写通用元数据
-  └─ info['title'] = '原视频标题 [无广告]'    （不影响 SponsorBlock 章节标题）
+pre_process 阶段: MetadataParserPP.run(info)
+  └─ INTERPRET 动作:
+       FROM "%(title)s [无广告]" → evaluate_outtmpl → "原视频标题 [无广告]"
+       TO   "title" → format_to_regex → (?s)(?P<title>.+)
+       匹配 → info['title'] = '原视频标题 [无广告]'    （不影响 SponsorBlock 章节标题）
           |
           v
 _match_entry() 筛选
