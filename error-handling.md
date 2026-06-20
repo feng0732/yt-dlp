@@ -411,60 +411,227 @@ if count > retries:
     raise e
 ```
 
-## 9. 错误处理完整流程图
+## 9. 四大错误处理机制的层级与关系
+
+上一版流程图把重试、提示降级、忽略错误、等待直播串成一条线，
+暗示它们是同一条管道上的先后环节，这是**错误的**。
+实际上这四套机制分布在**三个不同的架构层**，各有独立入口，
+只通过异常的抛出/捕获产生单向关联，不存在逐级递进关系。
+
+### 9.1 架构分层
 
 ```
-异常发生
-   ↓
-┌─ 是否为 network_exceptions? ──是──→ expected=True ──┐
-│                                                      ↓
-│  否                                                   │
-│   ↓                                                   │
-└─→ 检查 expected 参数                                  │
-     ↓                                                 │
-┌─→ ExtractorError 消息生成                             │
-│    (expected=False 时附加 bug 报告)                  │
-│                                                      │
-├──────────────────────────────────────────────────────┘
-│
-↓
-进入 RetryManager 重试循环
-   ↓
-┌─ 重试次数 < 最大重试? ──是──→ 报告重试 → 等待 → 重试
-│
-│  否
-│   ↓
-└─→ 检查 fatal 参数
-     ↓
-┌─ fatal=True? ──是──→ 调用 error callback → 抛出错误
-│
-│  否
-│   ↓
-└─→ 调用 warning callback → 发出警告 → 返回 None/默认
-     ↓
-┌─ 是否为 登录/地理限制/无格式 类型? ──┐
-│                                      │
-│  是 → 检查 metadata_available        │
-│       AND (ignore_no_formats_error   │
-│            OR wait_for_video)?       │
-│           ↓                          │
-│           是 → 降级为 Warning        │
-│           否 → 保持 Error            │
-│                                      │
-└──────────────────────────────────────┘
-     ↓
-┌─ ignoreerrors 检查 ────────────────────────────┐
-│                                                │
-│  False → 抛出 DownloadError → 程序终止         │
-│  'only_download' → 下载错误继续，后处理终止     │
-│  True → 所有错误继续，设置 _download_retcode=1 │
-└────────────────────────────────────────────────┘
-     ↓
-┌─ wait_for_video 检查 (针对 UserNotLive等) ──┐
-│                                             │
-│  已设置 → 等待 → 抛出 ReExtractInfo → 重试提取 │
-│  未设置 → 保持错误状态                       │
-└─────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────┐
+│ Layer C: 进程退出层                                         │
+│ 入口: main()                                                │
+│ 作用: 根据 top-level 异常类型决定退出码                       │
+│ 代码: yt_dlp/__init__.py#L1077-L1093                        │
+├─────────────────────────────────────────────────────────────┤
+│ Layer B: YoutubeDL 调度层                                   │
+│ 入口: __extract_info (被 _handle_extraction_exceptions 包装) │
+│ 作用: 捕获提取器抛出的异常，决定重提取 / 报错 / 忽略          │
+│       同时在提取前后插入 wait_for_video 逻辑                  │
+│ 代码: yt_dlp/YoutubeDL.py#L1721-L1882                       │
+├─────────────────────────────────────────────────────────────┤
+│ Layer A: 提取器/下载器内部层                                 │
+│ 入口: ie.extract() / fd.download() 内部的各方法              │
+│ 作用: 重试(RetryManager)、降级(fatal/ignore_no_formats_error)│
+│       这些机制在提取器/下载器内部消化错误，                    │
+│       只有未被消化的异常才会向上传播到 Layer B                 │
+│ 代码: yt_dlp/extractor/common.py, yt_dlp/downloader/common.py│
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 9.2 四大机制各自的入口、适用条件与作用范围
+
+#### 机制一：RetryManager 重试
+
+| 属性 | 说明 |
+|------|------|
+| **所在层** | Layer A（提取器/下载器内部） |
+| **入口** | 提取器：`for retry in self.RetryManager(fatal=...)` — `yt_dlp/extractor/common.py#L4073`<br>下载器：`report_retry(err, count, retries, fatal=...)` — `yt_dlp/downloader/common.py#L410` |
+| **触发条件** | 提取器/下载器方法内部捕获到异常后设置 `retry.error = err` |
+| **适用场景** | 网络请求失败、API 限流、不完整读取等可恢复的临时错误 |
+| **出口** | 重试成功 → 正常返回结果，异常不向上传播<br>重试耗尽 + `fatal=True` → 向上抛出异常（进入 Layer B）<br>重试耗尽 + `fatal=False` → 调用 `report_warning()`，返回 None，**异常被消化** |
+| **关键特点** | 重试循环在提取器/下载器方法内部完成，Layer B 完全不知道发生了重试 |
+
+#### 机制二：提示降级（fatal / ignore_no_formats_error / wait_for_video）
+
+| 属性 | 说明 |
+|------|------|
+| **所在层** | Layer A（提取器内部） |
+| **入口** | `raise_login_required(metadata_available=)` — `yt_dlp/extractor/common.py#L1249`<br>`raise_geo_restricted(metadata_available=)` — `yt_dlp/extractor/common.py#L1259`<br>`raise_no_formats(expected=)` — `yt_dlp/extractor/common.py#L1268`<br>`_search_regex(fatal=)` / `_download_json(fatal=)` 等 |
+| **触发条件** | fatal: 调用方传入 `fatal=False`（如可选字段提取）<br>降级: `metadata_available=True` 且 (`ignore_no_formats_error=True` 或 `wait_for_video` 有值) |
+| **适用场景** | 可选字段缺失、DRM 保护、登录受限但元数据可用、地理限制但元数据可用 |
+| **出口** | 不降级 → 抛出 ExtractorError/GeoRestrictedError（进入 Layer B）<br>降级 → 调用 `report_warning()`，return None/正常返回，**异常被消化** |
+| **关键特点** | 降级判断在异常抛出之前，决定了**是否会抛出异常**而非如何处理已抛出的异常 |
+
+#### 机制三：ignoreerrors 忽略错误
+
+| 属性 | 说明 |
+|------|------|
+| **所在层** | Layer B（YoutubeDL 调度层） |
+| **入口** | `trouble()` 方法 — `yt_dlp/YoutubeDL.py#L1068`<br>被 `report_error()` 调用 — `yt_dlp/YoutubeDL.py#L1155`<br>被 `_handle_extraction_exceptions` 中的 `report_error()` 调用 — `yt_dlp/YoutubeDL.py#L1742-L1747` |
+| **触发条件** | 异常已经从 Layer A 传播到 Layer B，且异常类型不是 ReExtractInfo |
+| **适用场景** | 提取失败、下载失败、后处理失败等不可恢复的错误 |
+| **出口** | `ignoreerrors=False` → 抛出 `DownloadError`（进入 Layer C）<br>`ignoreerrors=True/'only_download'` → 设 `_download_retcode=1`，**异常被消化**，继续下一个视频 |
+| **关键特点** | 只在 `report_error()` → `trouble()` 路径上生效<br>不参与 Layer A 的任何决策<br>后处理阶段 `True` 和 `'only_download'` 行为不同（见第 4.2 节） |
+
+#### 机制四：wait_for_video 等待直播
+
+| 属性 | 说明 |
+|------|------|
+| **所在层** | Layer B（YoutubeDL 调度层），但其降级效果影响 Layer A |
+| **入口①** | `__extract_info` 中捕获 `UserNotLive` — `yt_dlp/YoutubeDL.py#L1862-L1867`<br>→ 调用 `_wait_for_video()` → 抛出 `ReExtractInfo` |
+| **入口②** | `__extract_info` 提取成功后，结果无 formats/url — `yt_dlp/YoutubeDL.py#L1881`<br>→ 调用 `_wait_for_video(ie_result)` → 抛出 `ReExtractInfo` |
+| **入口③** | Layer A 中的降级判断 — `ignore_no_formats_error or wait_for_video` 条件<br>→ 影响是否抛出异常（见机制二） |
+| **触发条件** | `wait_for_video` 参数已设置，且视频无可用格式 |
+| **适用场景** | 预定直播尚未开始、即将上线的视频 |
+| **出口** | 等待结束 → 抛出 `ReExtractInfo(expected=True)`<br>→ 被 `_handle_extraction_exceptions` 捕获 → `continue` 重新执行 `__extract_info` |
+| **关键特点** | 这是一个**独立的重新提取循环**，与重试(RetryManager)无关<br>通过 `_handle_extraction_exceptions` 装饰器的 while True 循环实现 |
+
+### 9.3 各机制之间的影响关系
+
+```
+                    ┌────────────────────────────┐
+                    │  机制四: wait_for_video     │
+                    │  (参数传入)                 │
+                    └─────┬──────────┬───────────┘
+                          │          │
+                 ┌────────┘          └────────┐
+                 ↓                            ↓
+    ┌──────────────────────┐     ┌──────────────────────────┐
+    │  机制四入口①②         │     │  机制二: 提示降级          │
+    │  Layer B: 等待→重提取  │     │  Layer A: 决定是否抛异常   │
+    │  wait_for_video 参与   │     │  wait_for_video 作为      │
+    │  ReExtractInfo 循环    │     │  降级条件 (OR 关系)       │
+    └──────────────────────┘     └──────────┬───────────────┘
+                                            │
+                    异常抛出后向 Layer B 传播 ↓
+    ┌──────────────────────────────────────────────────────┐
+    │  机制三: ignoreerrors                                 │
+    │  Layer B: trouble() 决定终止还是继续                   │
+    │  仅在 report_error() 路径上生效                       │
+    └──────────────────────┬───────────────────────────────┘
+                           │
+                 抛出 DownloadError ↓
+    ┌──────────────────────────────────────────────────────┐
+    │  Layer C: main() 退出码                               │
+    └──────────────────────────────────────────────────────┘
+```
+
+**关键：这四个机制不在同一条管道上。**
+
+- 机制一（重试）和机制二（降级）在 Layer A 内部消化错误，
+  只有它们选择不消化时，异常才传播到 Layer B
+- 机制三（ignoreerrors）在 Layer B 的 `report_error()` 路径上起作用，
+  它从不参与 Layer A 的决策
+- 机制四（wait_for_video）横跨两层：作为 Layer A 的降级条件（机制二），
+  同时在 Layer B 拥有自己的重提取循环（入口①②）
+
+### 9.4 Layer B `_handle_extraction_exceptions` 的完整分支
+
+这是 Layer B 的核心分发点，代码位于 `yt_dlp/YoutubeDL.py#L1721-L1751`：
+
+```
+__extract_info 被 _handle_extraction_exceptions 装饰
+    │
+    │  while True:  ←── ReExtractInfo 循环
+    │      try:
+    │          return func(...)   ←── 正常提取成功，退出循环
+    │
+    │      except 层级判断（按代码顺序，先匹配先处理）：
+    │
+    │      ┌─ CookieLoadError / DownloadCancelled / *IndexError
+    │      │  → 直接 raise（不可忽略，进入 Layer C）
+    │      │
+    │      ├─ ReExtractInfo
+    │      │  → continue（重新执行 while True 循环，即重新提取）
+    │      │  ※ 这是 wait_for_video 的重提取出口
+    │      │
+    │      ├─ GeoRestrictedError
+    │      │  → report_error(msg + VPN建议)  → trouble() → 机制三
+    │      │  → break（退出循环）
+    │      │
+    │      ├─ ExtractorError（含 expected=True/False 的各种子类）
+    │      │  → report_error(str(e), tb)  → trouble() → 机制三
+    │      │  → break
+    │      │
+    │      └─ Exception（非 ExtractorError 的意外异常）
+    │          → ignoreerrors 有值? report_error + break : raise
+    │          → break 或 raise
+    │
+    └── 循环结束（break 后继续下一个视频 / raise 进入 Layer C）
+```
+
+### 9.5 `__extract_info` 内部的 wait_for_video 时序
+
+代码位于 `yt_dlp/YoutubeDL.py#L1857-L1882`：
+
+```
+__extract_info(url, ie, ...)
+    │
+    try:
+        ie_result = ie.extract(url)     ←── Layer A 在此执行
+    except UserNotLive:                  ←── 入口①
+        if wait_for_video: report_warning(e)
+        _wait_for_video()               ←── 等待 → 抛出 ReExtractInfo
+        raise                           ←── 向装饰器传播
+    │
+    ie_result 不为 None
+    │
+    if process:
+        _wait_for_video(ie_result)      ←── 入口②（无 formats 时等待 → 抛出 ReExtractInfo）
+        return process_ie_result(...)
+```
+
+**注意：** 入口①和入口②都会抛出 `ReExtractInfo`，
+但入口①的 `raise` 会**先**向上传播 `UserNotLive`，
+只有当装饰器不匹配该异常类型时才会被外层处理。
+实际上 `UserNotLive` 是 `ExtractorError` 的子类，
+所以装饰器会在 `ExtractorError` 分支处理它，
+调用 `report_error()` → `trouble()` → 机制三。
+而 `_wait_for_video()` 抛出的 `ReExtractInfo` 会在装饰器的 `ReExtractInfo` 分支触发重提取。
+
+### 9.6 `trouble()` 的完整分支
+
+代码位于 `yt_dlp/YoutubeDL.py#L1068-L1100`：
+
+```
+trouble(message, tb, is_error)
+    │
+    打印 message 和 traceback
+    │
+    is_error=False? → return（仅打印，不做其他处理）
+    │
+    ignoreerrors 为假值（False/None）?
+    │  → raise DownloadError(message, exc_info)    ←── 进入 Layer C
+    │
+    ignoreerrors 有值（True/'only_download'）?
+    │  → _download_retcode = 1                     ←── 标记有错误，但不终止
+    │  → return（继续处理下一个视频）
+```
+
+### 9.7 `main()` 的退出码分支
+
+代码位于 `yt_dlp/__init__.py#L1077-L1093`：
+
+```
+main()
+    │
+    try:
+        _exit(*_real_main(argv))
+    │
+    except 分支（按代码顺序）：
+    │
+    ├─ DownloadCancelled         → return 101（在 _real_main 内）
+    ├─ CookieLoadError           → _exit(1)
+    ├─ DownloadError             → _exit(1)
+    ├─ UnsafeExecExpansionError  → _exit(1)
+    ├─ SameFileError             → _exit(f'ERROR: {e}')
+    ├─ KeyboardInterrupt         → _exit('\nERROR: Interrupted by user')
+    ├─ BrokenPipeError           → _exit(f'\nERROR: {e}')
+    └─ OptParseError             → _exit(2, f'\n{e}')
 ```
 
 ## 10. 关键代码参考位置汇总
