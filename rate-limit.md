@@ -393,6 +393,359 @@ elif speed:
 - 这个异常会向上冒泡，影响整个分片下载流程
 - **不会等到所有分片都失败，第一个分片 3 秒后就会触发**
 
+### 3.3 节流异常进入重新提取流程的完整代码路径
+
+以下按代码执行顺序拆开 `raise ThrottledDownload` 后经过的每一层，直到被 `@_handle_extraction_exceptions` 装饰器捕获并重新提取的全过程。
+
+#### 第 1 层：HttpFD.real_download() 内部抛出点
+
+位置：[http.py#L315-L323](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L315-L323)
+
+```python
+if speed and speed < (self.params.get('throttledratelimit') or 0):
+    if ctx.throttle_start is None:
+        ctx.throttle_start = now
+    elif now - ctx.throttle_start > 3:
+        if ctx.stream is not None and ctx.tmpfilename != '-':
+            ctx.stream.close()          # 先关闭文件流
+        raise ThrottledDownload        # ← ① 在这里抛出
+elif speed:
+    ctx.throttle_start = None
+```
+
+- `ThrottledDownload` 继承链：`ThrottledDownload → ReExtractInfo → YoutubeDLError`
+- **expected=False**（[_utils.py#L1135](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/_utils.py#L1135)），表示是**非预期**异常，会打印 warning
+
+#### 第 2 层：RetryManager 的 except 分发（不捕获）
+
+位置：[http.py#L360-L375](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L360-L375)
+
+```python
+for retry in RetryManager(self.params.get('retries'), self.report_retry):
+    try:
+        establish_connection()
+        return download()                # ① 异常从 download() 冒泡上来
+    except RetryDownload as err:         # ← 只捕获 RetryDownload
+        retry.error = err.source_error
+        continue                          #    → 同连接内重试
+    except NextFragment:                  # ← 只捕获 NextFragment
+        retry.error = None
+        retry.attempt -= 1
+        continue
+    except SucceedDownload:               # ← 只捕获 SucceedDownload
+        return True
+    except:  # noqa: E722                 # ← ② 裸 except 捕获所有异常
+        close_stream()                     #    只做清理工作
+        raise                              # ③ ← 重新抛出，不吞掉异常
+```
+
+**关键点**：
+- `RetryDownload`、`NextFragment`、`SucceedDownload` 三个异常都是 **HttpFD 内部类**（定义在 [http.py#L66-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L66-L74)），作用域仅限 HttpFD 内部
+- `ThrottledDownload` 是**全局异常类**，不在这三个内部类中
+- 所以 ThrottledDownload 走到裸 except，清理后**重新 raise**，向 HttpFD.real_download() 外部冒泡
+- `RetryManager` 计数不增加，不算做一次"重试"
+
+#### 第 3 层：FileDownloader.download() 不捕获
+
+位置：[common.py#L480-L482](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L480-L482)
+
+```python
+ret = self.real_download(filename, info_dict)  # ④ 异常从这里冒泡
+self._finish_multiline_status()
+return ret, True                                # 没有任何 try-except，直接透传
+```
+
+- `FileDownloader.download()` 是**通用包装层**，负责检查文件是否已存在、sleep 等前置逻辑
+- 对 `real_download()` 返回值/异常完全透传，**不做任何异常捕获**
+- 异常继续向外 → 到达 YoutubeDL 层
+
+#### 第 4 层：YoutubeDL.dl() 不捕获
+
+位置：[YoutubeDL.py#L3304-L3318](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L3304-L3318)
+
+```python
+fd = get_suitable_downloader(info, params, ...)(self, params)
+if not test:
+    for ph in self._progress_hooks:
+        fd.add_progress_hook(ph)
+new_info = self._copy_infodict(info)
+if new_info.get('http_headers') is None:
+    new_info['http_headers'] = self._calc_headers(new_info)
+return fd.download(name, new_info, subtitle)  # ⑤ 异常从这里冒泡
+```
+
+- `YoutubeDL.dl()` 是**下载调度入口**，负责选择 FD、注册 hooks
+- 对 `fd.download()` 的异常**完全透传，不捕获**
+- 继续向外 → 到达 process_info()
+
+#### 第 5 层：process_info() 的 try 不捕获 ReExtractInfo
+
+位置：[YoutubeDL.py#L3461-L3594](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L3461-L3594)
+
+```python
+try:
+    # ... 一大段下载逻辑 ...
+    success, real_download = self.dl(temp_filename, info_dict)  # ⑤ 调用 dl()
+    # ... 后续后处理逻辑 ...
+
+except network_exceptions as err:        # 只捕获网络异常
+    self.report_error(f'unable to download video data: {err}')
+    return
+except OSError as err:                    # 只捕获操作系统错误
+    raise UnavailableVideoError(err)
+except ContentTooShortError as err:       # 只捕获内容过短
+    self.report_error(...)
+    return
+```
+
+**关键点**：process_info() 的 try-except **明确列出了 3 类要捕获的异常**，没有 `except ReExtractInfo`，也没有裸 except。
+
+所以 `ThrottledDownload`（= `ReExtractInfo` 子类）**不被捕获**，继续向上冒泡。
+
+#### 第 6 层：@_handle_extraction_exceptions 装饰器捕获
+
+位置：[YoutubeDL.py#L1721-L1750](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L1721-L1750)
+
+```python
+def _handle_extraction_exceptions(func):
+    @functools.wraps(func)
+    def wrapper(self, *args, **kwargs):
+        while True:                             # ← 无限循环！
+            try:
+                return func(self, *args, **kwargs)  # ⑥ 异常从 func() 冒泡
+            except (CookieLoadError, DownloadCancelled,
+                    LazyList.IndexError, PagedList.IndexError):
+                raise                               # 直接 re-raise
+            except ReExtractInfo as e:               # ⑦ ← 在这里被捕获！
+                if e.expected:
+                    self.to_screen(f'{e}; Re-extracting data')
+                else:
+                    self.to_stderr('\r')
+                    self.report_warning(f'{e}; Re-extracting data')
+                continue                          # ⑧ ← 回到 while True，重新执行 func()
+            except GeoRestrictedError as e:
+                ...
+            except ExtractorError as e:
+                ...
+            except Exception as e:
+                ...
+            break
+    return wrapper
+```
+
+装饰器应用在两个方法上：
+- [YoutubeDL.py#L1856](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L1856)：`__extract_info()` — 顶层提取入口
+- [YoutubeDL.py#L2194](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L2194)：`__process_iterable_entry()` — 播放列表单条处理入口
+
+#### 第 7 层：continue → 重新提取
+
+```
+continue 回到 while True:
+  try:
+    return __extract_info(...)     # ⑨ ← 从头重新提取！
+      │
+      ├─ ie.extract(url)          # 重新调用 Extractor 请求网页
+      ├─ 重新解析视频信息
+      ├─ 重新获取一组新的下载 URL   # 可能拿到不同的 CDN 节点
+      │
+      └─ process_ie_result(...)
+           └─ process_info(...)
+                └─ dl()
+                     └─ 新的 HttpFD.real_download()
+                          但 ratelimit=50K, throttledratelimit=100K 参数不变
+                          → 3 秒后又触发 ThrottledDownload
+                          → 回到装饰器 continue
+                          → 无限循环，直到被其他机制打断
+```
+
+#### 完整路径总结图
+
+```
+HttpFD.real_download() 内部
+  ┌─────────────────────────────────────────────────┐
+  │ 下载循环内                                       │
+  │   if speed < throttledratelimit 持续 3s:         │
+  │     raise ThrottledDownload ①                   │
+  └──────────────────────┬──────────────────────────┘
+                         │ 冒泡
+  RetryManager except 分发 ②
+  ├─ RetryDownload  → continue（连接内重试）
+  ├─ NextFragment   → continue（分片切换）
+  ├─ SucceedDownload → return True
+  └─ 其他所有异常   → close_stream() → raise ③
+                         │ 冒泡
+  FileDownloader.download()   → 透传 ④
+                         │ 冒泡
+  YoutubeDL.dl()          → 透传 ⑤
+                         │ 冒泡
+  process_info() except 分发
+  ├─ network_exceptions  → 报错 return
+  ├─ OSError             → 封装 UnavailableVideoError
+  ├─ ContentTooShortError → 报错 return
+  └─ ReExtractInfo       → 不捕获 ⑥
+                         │ 冒泡
+  @_handle_extraction_exceptions 装饰器 ⑦
+  └─ except ReExtractInfo:
+        打印 warning
+        continue → 重新进入 while True ⑧
+        └─ 重新执行 __extract_info() = 重新提取全过程 ⑨
+```
+
+### 3.4 与普通下载重试 (RetryDownload) 的区别
+
+`ThrottledDownload`（触发重新提取）和 `RetryDownload`（普通下载重试）虽然都表现为"重新下载"，但在代码路径、上下文保留、代价上有本质区别。
+
+#### 对比表
+
+| 维度 | RetryDownload（普通重试） | ThrottledDownload（重新提取） |
+|------|---------------------------|-------------------------------|
+| **异常类型** | HttpFD 内部类 [http.py#L69-L71](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L69-L71) | 全局类，继承 ReExtractInfo |
+| **抛出点** | `retry(e)` 函数内 [http.py#L237-L246](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L237-L246) | 节流检测代码块 [http.py#L323](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L323) |
+| **捕获位置** | RetryManager except 内 [http.py#L364](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L364) | 装饰器 @_handle_extraction_exceptions [YoutubeDL.py#L1729](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L1729) |
+| **冒泡层数** | HttpFD 内部就被捕获，不离开 real_download() | 穿越 6 层直到 YoutubeDL 装饰器 |
+| **上下文保留** | 完整保留 | **全部丢失** |
+| &nbsp;&nbsp;· resume_len | ✅ 重新从磁盘读取 `.part` 大小 [http.py#L240-L245](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L240-L245) | ❌ 重新提取后从头下载 |
+| &nbsp;&nbsp;· start 时间戳 | ✅ 重置（重建连接） | ❌ 完全重建 |
+| &nbsp;&nbsp;· 下载 URL | ✅ 保持同一个 URL | ❌ 重新提取得到新 URL |
+| &nbsp;&nbsp;· info_dict 内容 | ✅ 完全不变 | ❌ 重新生成，可能不同 |
+| &nbsp;&nbsp;· throttle_start | ❌ 重置（走新的 download() 迭代） | ❌ 重置 |
+| **RetryManager 计数** | ✅ 计一次重试（retry.attempt 不变） | ❌ RetryManager 不计数，算"全新任务" |
+| **HTTP 请求代价** | 1 次 HTTP Range 请求（断点续传） | N 次 HTTP 请求（重新提取的全过程 = 网页提取 + 格式选择 + 新的下载连接） |
+| **触发原因** | 5xx 错误、TransportError、连接超时等传输层问题 | 下载速度持续过低（应用层检测） |
+| **目标** | 从断点继续同一下载 | 切换 CDN 节点 / 获取新签名 URL |
+
+#### RetryDownload 的抛出和捕获流程（对照）
+
+抛出位置：[http.py#L237-L246](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L237-L246)
+
+```python
+def retry(e):
+    close_stream()
+    if ctx.tmpfilename == '-':
+        ctx.resume_len = byte_counter
+    else:
+        try:
+            ctx.resume_len = os.path.getsize(ctx.tmpfilename)  # ← 从磁盘读
+        except FileNotFoundError:
+            ctx.resume_len = 0
+    raise RetryDownload(e)              # ← 抛内部类异常
+```
+
+捕获位置：[http.py#L364-L366](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L364-L366)
+
+```python
+except RetryDownload as err:
+    retry.error = err.source_error
+    continue        # ← 继续 RetryManager 的下一次 for 迭代
+                    #    establish_connection() 重新连接
+                    #    用新的 ctx.resume_len 设置 Range 请求头
+                    #    从断点继续下载
+```
+
+**本质区别：RetryDownload 是"原地重试"，ThrottledDownload 是"推倒重来"。**
+
+### 3.5 低限速误判成立的前提条件
+
+误判（ratelimit < throttledratelimit 导致触发 ThrottledDownload）需要以下前提全部成立，缺少任一前提都不会触发。
+
+#### 前提 1：参数配置矛盾（必要条件）
+
+```python
+ratelimit < throttledratelimit
+# 或：ratelimit ≈ throttledratelimit（差距在 sleep 抖动范围内）
+```
+
+这是根本原因。如果 `ratelimit > throttledratelimit × 2`，基本不会误判。
+
+#### 前提 2：throttledratelimit 非零（隐式前提）
+
+```python
+# http.py#L315
+if speed and speed < (self.params.get('throttledratelimit') or 0):
+#                                                  ^^^^^^
+```
+
+- `throttledratelimit` 未设置时，`None or 0 = 0`
+- `speed < 0` 不可能成立（speed 永远 ≥ 0）
+- **用户必须显式设置了 --throttled-rate 参数**
+
+#### 前提 3：speed 不为 None（1ms 保护后的第一次真实计算）
+
+```python
+# common.py#L163
+if bytes == 0 or dif < 0.001:  # 1ms 保护
+    return None
+
+# http.py#L315
+if speed and speed < throttledratelimit:
+#   ^^^^^
+#   if speed 为 None，短路，条件整体为 False
+```
+
+- 下载开始后 **1ms 内**，`speed=None`，不检测
+- 1ms 后 `speed` 有了真实值，检测才开始
+
+#### 前提 4：限速实际生效（speed 被 ratelimit 限制在目标值附近）
+
+```python
+# slow_down() 必须成功地把速度拉下来：
+if speed_local > rate_limit:
+    sleep_time = bytes / rate_limit - elapsed
+    if sleep_time > 0:
+        time.sleep(sleep_time)   # ← sleep 实际被执行
+```
+
+- 如果**网络本身就慢**于 ratelimit，slow_down 不 sleep
+- 但这种情况下 speed 本来就低，依然可能触发节流检测（此时不是"误判"，而是真实的网络慢 = 与服务器限流难以区分）
+- 误判特指：**网络实际速度 > throttledratelimit，但被 ratelimit sleep 人为拉低到其下**
+
+#### 前提 5：3 秒内没有任何一次 speed 回升到 throttledratelimit 以上
+
+```python
+# http.py#L324-L325
+elif speed:
+    ctx.throttle_start = None   # ← 只要有一次 speed >= 阈值，就清零
+```
+
+- **有任何一次循环**中 `speed >= throttledratelimit`，`throttle_start` 就会被重置为 None
+- 计时从 0 重新开始
+- 但在 ratelimit < throttledratelimit 的配置下：
+  - ratelimit 生效后 speed 稳定在 ratelimit 值附近
+  - 这个值永远低于 throttledratelimit
+  - 所以 `throttle_start` **永远不会重置**
+  - 3 秒持续条件**必定成立**
+
+#### 前提 6：循环频率足够高（3 秒内至少执行了两次检测）
+
+- 节流检测在**每次循环末尾**执行（每次 read 一个数据块后）
+- 如果块大小极大或下载极慢，3 秒内只跑了一次循环 → throttle_start 刚被设置，`now - throttle_start` 可能还不足 3 → 延迟触发但不会阻止触发
+- 正常情况下（块大小被 best_block_size 调整到约 1 秒读取一次），每秒执行 1 次检测，3 秒内肯定会达到阈值
+- 最佳情况（4MB 块，1Gbps 网络）：每次 read 约 32ms → 每秒约 31 次检测，3 秒约 93 次，检测足够密集
+
+#### 前提 7：中途不被其他异常打断
+
+在 3 秒计时窗口内，如果发生以下情况，计时会被中断：
+- **RetryDownload 被触发**（如 5xx 错误）→ 连接重建，`throttle_start` 随新的 ctx 重置为 None
+- **下载提前完成**（文件太小，3 秒内下载完）→ 不会走到节流检测代码
+- **用户中断**（Ctrl+C → DownloadCancelled）→ 异常向上冒泡，不走节流路径
+- **进程被杀** → 直接退出
+- **NextFragment 异常**（分片下载时单分片完成）→ 单个分片的上下文销毁
+
+**对于分片下载场景：** 前提 7 有重要变化——`NextFragment` 会在单分片完成时抛出，重置该分片的上下文。所以对于小分片，可能每个分片都在 3 秒内完成，节流检测来不及触发。但如果分片较大或并发度低，3 秒足够触发第一个分片误判。
+
+#### 前提成立性判定表
+
+| 前提 | 正常配置 (r=2M, t=100K) | 冲突配置 (r=50K, t=100K) | 临界配置 (r=100K, t=100K) |
+|------|------------------------|--------------------------|--------------------------|
+| 1. 参数矛盾 | ❌ 不成立 | ✅ 成立 | ⚠️ 抖动范围 |
+| 2. t 非零 | 看用户设置 | ✅ 成立 | ✅ 成立 |
+| 3. speed != None | ✅ 1ms 后 | ✅ 1ms 后 | ✅ 1ms 后 |
+| 4. 限速生效 | ✅ 生效 | ✅ 生效 | ✅ 生效 |
+| 5. 3s 不回升 | ✅ speed ≈ 2M > 100K → 反复重置 | ❌ speed ≈ 50K < 100K → 永不重置 | ⚠️ 抖动下探可能不重置 |
+| 6. 循环足够密 | ✅ | ✅ | ✅ |
+| 7. 不被中断 | ✅ 一般情况 | ✅ 一般情况 | ✅ 一般情况 |
+| **误判？** | **否** | **是（必定）** | **是（大概率）** |
+
 ---
 
 ## 四、限速、节流与进度的关联全景
