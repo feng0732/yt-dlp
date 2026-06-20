@@ -720,13 +720,45 @@ if not line.startswith('#'):
 - 媒体片段 1 frag_index=1：`1 <= 3` → 跳过 ✓
 - 媒体片段 2 frag_index=2：`2 <= 3` → 跳过 ✓
 - 媒体片段 3 frag_index=3：`3 <= 3` → 跳过 ✓
-- 媒体片段 4 frag_index=4：`4 > 4` → 加入
+- 媒体片段 4 frag_index=4：`4 > 3` → 加入
 
 **结果**：所有已完成片段都正确跳过。
 
-#### 4.7.4 重复合并的完整流程（有缺陷的时序）
+#### 4.7.4 片段文件生命周期：Frag1 是否保留？
 
-恢复时 M=3，`.part` 文件已包含片段 1（初始化）+ 2 + 3 的数据：
+在分析重复下载和重复合并之前，先明确单个片段文件的完整生命周期：
+
+```
+文件名推导：
+  ctx['filename'] = video.mp4
+  ctx['tmpfilename'] = temp_name(video.mp4) = video.mp4.part
+
+  fragment_filename = '%s-Frag%d' % (ctx['tmpfilename'], 1)
+                    = video.mp4.part-Frag1
+
+  temp_name(fragment_filename) = video.mp4.part-Frag1.part   ← 下载中的临时文件
+
+片段下载与清理流程：
+  ① HttpFD 下载片段 N：写入 video.mp4.part-FragN.part
+  ② 下载成功：try_rename(video.mp4.part-FragN.part → video.mp4.part-FragN)
+  ③ _read_fragment：读取 video.mp4.part-FragN 的内容
+  ④ _append_fragment（L146-L155）
+       ├─ write + flush → 合并到 video.mp4.part
+       ├─ _write_ytdl_file
+       ├─ if not keep_fragments(default False):
+       │     try_remove(video.mp4.part-FragN)    ← ★ 默认删除正式片段文件
+       └─ del ctx['fragment_filename_sanitized']
+```
+
+**关键结论**：
+- `keep_fragments` 默认值为 `False`（[fragment.py L36](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/fragment.py#L36)）
+- 合并后 `video.mp4.part-FragN`（正式片段文件）会被 `try_remove` 删除
+- 因此**恢复时已合并的 FragN 文件不存在**，需要重新下载
+- 只有 `.part-FragN.part`（下载中的临时文件）可能残留（如果上次在片段下载中途中断）
+
+#### 4.7.5 重复下载和重复合并的完整时序（有缺陷）
+
+恢复时 M=3，`.part` 文件已包含片段 1（初始化）+ 2 + 3 的数据，且 `keep_fragments=False`（默认）：
 
 ```
 恢复启动
@@ -742,35 +774,60 @@ if not line.startswith('#'):
   └─ download_and_append_fragments 处理
        │
        ├─ 处理初始化片段（frag_index=1）
+       │   │
        │   ├─ L443: ctx['fragment_index'] = 1
-       │   ├─ 检测 Frag1 临时文件：已完整 → HttpFD 立即返回成功（不重复下载）
-       │   ├─ progress hook 触发：state.fragment_index = 3+1=4，ctx.fragment_index = 4
-       │   ├─ 合并：_append_fragment
-       │   │   ├─ ctx['dest_stream'].write(init_data)  // ★ 重复写入！open_mode='ab'
-       │   │   ├─ flush()
-       │   │   └─ _write_ytdl_file(ctx) → 写入 M=4  // ★ M 被错误更新！
-       │   └─ 此时 .part = init + 2 + 3 + init（损坏！）
+       │   │
+       │   ├─ _download_fragment：
+       │   │     ├─ fragment_filename = video.mp4.part-Frag1
+       │   │     ├─ 检测 temp_name(Frag1) = video.mp4.part-Frag1.part → 不存在（上次
+       │   │     │     合并后 Frag1 已删除，.part-Frag1.part 也不存在）
+       │   │     ├─ frag_resume_len = 0
+       │   │     └─ ctx['dl'].download(Frag1, ...)
+       │   │           ├─ ★ 重新下载整个片段（★ 重复下载！）
+       │   │           ├─ 写入 video.mp4.part-Frag1.part
+       │   │           ├─ 下载成功：rename(.part-Frag1.part → .part-Frag1)
+       │   │           └─ progress hook 触发：
+       │   │                 state.fragment_index = 3+1 = 4
+       │   │                 ctx.fragment_index = 4
+       │   │
+       │   └─ 合并：_append_fragment
+       │         ├─ _read_fragment → 读取 video.mp4.part-Frag1 内容（init 段）
+       │         ├─ ctx['dest_stream'].write(init_data)  // ★ 重复写入！open_mode='ab'
+       │         ├─ flush()
+       │         ├─ _write_ytdl_file(ctx) → 写入 M=4  // ★ M 被错误更新！
+       │         ├─ try_remove(video.mp4.part-Frag1)    // 删除重新下载的 Frag1
+       │         └─ 此时 .part = init + 2 + 3 + init（损坏！）
        │
        └─ 处理媒体片段 3（frag_index=4）
            ├─ L443: ctx['fragment_index'] = 4
-           ├─ 下载...
-           ├─ progress hook: state.fragment_index = 4+1=5，ctx.fragment_index = 5
+           ├─ _download_fragment → 下载 Frag4（正常首次下载，无重复）
+           ├─ progress hook: state.fragment_index = 4+1 = 5，ctx.fragment_index = 5
            ├─ 合并 → _write_ytdl_file → 写入 M=5
-           └─ 此时 M=5，但片段 4 尚未处理（如果再次中断恢复，M=5 会跳过它）
+           └─ 此时 M=5：表示片段 1..5 已完成，但实际上片段 2,3（媒体片段 1,2）
+                被跳过但 M 也统计了它们（1=初始化，4=媒体片段 3，5=媒体片段 4），
+                实际合并的是：初始化片段 + 媒体片段 3 + 媒体片段 4 = 3 个片段，
+                但 M=5 与实际不一致（因为媒体片段 1,2 被跳过未重新合并，
+                但 M 的自增是按 progress hook 触发次数，不是按实际合并次数）
 ```
 
-**缺陷 1：重复合并**
-- 初始化片段数据被再次写入 `.part` 文件（`open_mode='ab'`）
-- 对于 fMP4 格式，重复的 init 段会导致文件无法播放
+**缺陷 1：重复下载**
+- 默认 `keep_fragments=False`，合并后 Frag1 文件已被删除
+- 恢复时 `frag_resume_len = 0`，初始化片段从 0 字节**重新完整下载**
+- 若设置了 `keep_fragments=True`，Frag1 文件保留，HttpFD 检测到文件已完整则立即返回（不重复下载），但仍会重复合并
+
+**缺陷 2：重复合并**
+- `.part` 文件以 `ab` 追加模式打开（`open_mode='ab'`，因为 `.part` 文件已有数据且 `resume_len > 0`）
+- 初始化片段数据被**再次追加**到 `.part` 文件末尾
+- 对于 fMP4 格式，重复的 init 段会导致文件**无法播放**
 - 对于 MPEG-TS 格式，可能表现为播放开始处短暂卡顿
 
-**缺陷 2：M 被错误更新**
-- progress hook 自增的是全局 `state.fragment_index`（初始为 M=3）
-- 处理完初始化片段后，M 被更新为 4，但片段 2,3 并没有被重新合并
-- 若再次中断恢复，M=4 会跳过 frag_index<=4 的片段（包括媒体片段 1,2,3），但实际上它们在 `.part` 中是存在的——这次没问题
-- 但 M 实际上表示"最后一个已完成的片段索引"，此时 M=4 与实际合并进度（片段 1,2,3 已完成）**不一致**
+**缺陷 3：M 与实际合并进度不一致**
+- `state.fragment_index` 自增的是**全局计数器**，基于 progress hook 触发次数
+- 处理初始化片段后，M 从 3 → 4，语义上表示"片段 1..4 已完成"
+- 但实际上：片段 1 被重复合并、片段 2,3 被跳过（未重新合并）、片段 4 尚未处理
+- M 的语义（"最后一个已安全合并的片段索引"）在**恢复场景下被破坏**
 
-#### 4.7.5 DASH 的正确处理对比
+#### 4.7.6 DASH 的正确处理对比
 
 DASH 对所有片段（包括初始化片段）使用**统一的跳过判断** [dash.py L78-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/dash.py#L78-L82)：
 
@@ -785,7 +842,7 @@ for i, fragment in enumerate(fragments):
 
 DASH 不存在初始化片段跳过判断缺失的问题。
 
-#### 4.7.6 extra_state 防重复机制参考
+#### 4.7.7 extra_state 防重复机制参考
 
 其他分段下载器（ism.py、mhtml.py）使用 `extra_state` 记录特殊头部是否已写入，避免恢复时重复写入：
 
@@ -802,7 +859,7 @@ if not extra_state['ism_track_written']:
 
 `extra_state` 会被持久化到 `.ytdl` 中，恢复后可以正确跳过已写入的特殊头部。但 HLS 中虽然设置了 `extra_state = ctx.setdefault('extra_state', {})`，却**没有用它记录初始化片段是否已写入**。
 
-#### 4.7.7 修复思路（潜在）
+#### 4.7.8 修复思路（潜在）
 
 为 HLS 初始化片段添加与普通媒体片段相同的跳过判断：
 
