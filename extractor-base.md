@@ -271,96 +271,237 @@ if (not self.get_param('geo_bypass_country', None)   # 用户没手动指定国�
 
 ---
 
-## 五、嵌入提取边界 —— 重点讲透分层设计
+## 五、嵌入提取边界 —— 重点讲透执行顺序与独占异常
 
 嵌入提取解决的问题：一个普通网页（如博客文章页）里嵌入了 YouTube/Vimeo 等视频，用户给出这个网页 URL，希望能下载里面的视频。
 
-### 5.1 四层架构
+### 5.1 GenericIE 主流程：从 URL 到嵌入提取的完整路径
+
+`yt_dlp/extractor/generic.py` 第 763 行起，`_real_extract` 按以下**严格顺序**执行，每一步如果成功就直接 `return`，不会走到后面的步骤：
+
+```
+_real_extract(url)
+    ├── 阶段 1: URL 协议处理（第 763-793 行）
+    │     ├── URL 无 scheme → 尝试 https:// 或 fallback 到 youtube 搜索
+    │     └── 返回 url_result，让对应 IE 处理
+    │
+    ├── 阶段 2: 请求网页（第 818-850 行）
+    │     ├── _request_webpage 下载响应头和前 512 字节
+    │     ├── 3xx 重定向 → 返回 url_result 跟随重定向
+    │     └── Cloudflare 403 特殊处理 → 提示 impersonation
+    │
+    ├── 阶段 3: 直链检测（第 858-914 行）—— 最优先的快速路径
+    │     ├── Content-Type 是 audio/video/mpegurl → 直接构造 format（第 860-886 行）
+    │     ├── 前 512 字节 #EXTM3U → 解析 m3u8（第 894-899 行）
+    │     └── 前 512 字节不是 HTML → 直接返回为直链（第 903-914 行）
+    │
+    ├── 阶段 4: XML 格式检测（第 924-963 行）
+    │     ├── 尝试 XML 解析
+    │     ├── RSS → _extract_rss（第 930-932 行）
+    │     ├── SMIL → _parse_smil（第 937-940 行）
+    │     ├── XSPF → _parse_xspf（第 941-947 行）
+    │     ├── MPD → _parse_mpd_formats_and_subtitles（第 948-957 行）
+    │     ├── SmoothStreamingMedia → _parse_ism_formats（第 933-936 行）
+    │     └── F4M → _parse_f4m_formats（第 958-961 行）
+    │
+    ├── 阶段 5: 提取基本元数据（第 965-976 行）
+    │     ├── title / description / thumbnail / age_limit
+    │     └── 作为兜底信息，后续嵌入结果会 merge 这些字段
+    │
+    └── 阶段 6: 调用 _extract_embeds（第 978-984 行）
+          └── embeds = list(self._extract_embeds(...))
+              ├── 1 个嵌入 → merge_dicts(embeds[0], info_dict)
+              ├── 多个嵌入 → playlist_result(embeds, **info_dict)
+              └── 0 个嵌入 → raise UnsupportedError(url)
+```
+
+> **关键观察**：直链检测在阶段 3 就完成了，远早于嵌入提取。这意味着如果 URL 直接指向视频文件，不会进入嵌入扫描流程。
+
+### 5.2 `_extract_embeds` 内部顺序：嵌入遍历 vs 播放器兜底
+
+`yt_dlp/extractor/generic.py` 第 986 行起，`_extract_embeds` 内部按以下顺序执行：
+
+```
+_extract_embeds(url, webpage)
+    │
+    ├── 第一部分: 网页嵌入入口遍历（第 1000-1018 行）
+    │     │
+    │     ├── 遍历顺序来源: self._downloader._ies.values()
+    │     │     └── _ies 的注册顺序由 extractors.py 第 25-30 行精心设计:
+    │     │           1. Youtube 相关 IE 优先（提高匹配性能）
+    │     │           2. 其他所有 IE（按字母/模块导入顺序，约 1500+ 个）
+    │     │           3. GenericIE 最后（但 GenericIE 自己不参与嵌入扫描）
+    │     │
+    │     ├── 对每个 IE:
+    │     │     ├── 跳过 block_ies 中的 IE（防止递归）
+    │     │     ├── gen = ie.extract_from_webpage(ydl, url, webpage)
+    │     │     ├── 手动迭代生成器（next(gen)）
+    │     │     ├── 捕获 StopExtraction → 独占，立即 return
+    │     │     └── 捕获 StopIteration → 收集当前 IE 的嵌入
+    │     │
+    │     └── if embeds: return embeds  ← 只要有嵌入结果，就不进播放器兜底
+    │
+    └── 第二部分: 播放器模式兜底（第 1020-1223 行）
+          │
+          ├── 兜底触发条件: 第一部分遍历完所有 IE，没有任何嵌入结果
+          │
+          ├── 兜底执行顺序（一旦找到就 return，不继续后面的）:
+          │     1.  JW Player 数据（第 1020-1034 行）
+          │     2.  Video.js 嵌入（第 1036-1097 行）
+          │     3.  KVS Player（第 1099-1108 行）
+          │     4.  JSON-LD VideoObject（第 1110-1122 行）
+          │     5.  SWFObject 内嵌的 JW Player（第 1136-1139 行）
+          │     6.  JW Player 嵌入（第 1142-1151 行）
+          │     7.  通用 file/source 正则（第 1152-1156 行）
+          │     8.  JW Player JS loader（第 1157-1162 行）
+          │     9.  Flow Player（第 1164-1172 行）
+          │     10. Cinerama player（第 1173-1178 行）
+          │     11. Twitter card stream（第 1179-1187 行）
+          │     12. Open Graph video（第 1188-1196 行）
+          │     13. Meta refresh 重定向（第 1197-1214 行）
+          │     14. Twitter player iframe（第 1216-1223 行）
+          │
+          └── 都没找到 → return []（最终会 raise UnsupportedError）
+```
+
+**分层取舍分析**：
+
+> **为什么先遍历所有 IE 的嵌入，再走播放器兜底？**
+>
+> 1. **优先级**：特定站点的提取器（如 YouTubeIE、VimeoIE）对自己的嵌入格式有最准确的解析能力，应该优先尝试。
+> 2. **正确性**：JW Player 等通用播放器模式是"瞎猜"，可能把非视频资源识别为视频，应该作为最后手段。
+> 3. **性能**：遍历 1500+ 个 IE 每个只跑正则扫描，很快；而播放器兜底需要做多次正则搜索、JSON 解析，相对慢。
+>
+> **为什么第一部分找到任何嵌入就立即 return，不继续找更多？**
+>
+> 这是一个保守设计：如果某个专业 IE 已经识别出嵌入，就相信它的结果，不再让通用兜底模式产生多余结果。但如果多个 IE 都返回了结果（没有独占），会全部收集起来作为播放列表。
+
+### 5.3 StopExtraction 独占异常的捕获机制
+
+#### 5.3.1 异常抛出点
+
+`InfoExtractor.StopExtraction` 定义在 `common.py` 第 4113-4114 行：
+```python
+class StopExtraction(Exception):
+    pass
+```
+
+子类在重写 `_extract_from_webpage` 时，检测到网页特征后抛出：
+```python
+@classmethod
+def _extract_from_webpage(cls, url, webpage):
+    if 'invidious-player' in webpage:
+        info_dict = {...}  # 直接从网页提取信息
+        yield info_dict
+        raise cls.StopExtraction  # 告诉 GenericIE 别再找其他 IE 了
+```
+
+#### 5.3.2 完整传播路径
+
+异常从抛出到捕获要经过三层调用：
+
+```
+[子类 _extract_from_webpage] 抛出 StopExtraction
+    ↓ 透传（for 循环不捕获非 StopIteration 异常）
+[InfoExtractor.extract_from_webpage] 第 4086 行
+    │   for info in ie._extract_from_webpage(url, webpage) or []:
+    │       yield info
+    │
+    ↓ 透传（普通 for/yield 只会把 StopIteration 当作迭代结束，其他异常继续向外冒泡）
+[GenericIE._extract_embeds] 第 1008 行
+    │   gen = ie.extract_from_webpage(self._downloader, url, webpage)
+    │   while True:
+    │       current_embeds.append(next(gen))  ← 这里抛异常
+    │
+    ↓ 被捕获
+[GenericIE._extract_embeds] 第 1009 行
+        except self.StopExtraction:
+            return current_embeds  # 立即返回，后续 IE 不再遍历
+```
+
+#### 5.3.3 关键实现细节
+
+**细节 1：手动迭代生成器，而非 for 循环**
+
+`generic.py` 第 1006-1015 行：
+```python
+gen = ie.extract_from_webpage(self._downloader, url, webpage)
+current_embeds = []
+try:
+    while True:
+        current_embeds.append(next(gen))  # 手动 next() 调用
+except self.StopExtraction:
+    return current_embeds  # 独占
+except StopIteration:
+    embeds.extend(current_embeds)  # 正常结束
+```
+
+**为什么不用 `for x in gen`？**
+```python
+# 如果这样写：
+for x in gen:
+    current_embeds.append(x)
+```
+`for` 循环会自动捕获 `StopIteration` 并静默结束循环。但 `StopExtraction` 是另一个异常，会正常冒泡。问题在于：捕获异常时，我们需要**区分三种情况**：
+1. 生成器正常结束（`StopIteration`）→ 收集结果，继续下一个 IE
+2. 生成器请求独占（`StopExtraction`）→ 立即返回，终止整个遍历
+3. 其他异常（`ExtractorError` 等）→ 向上抛出，让上层处理
+
+手动 `next()` 把"正常结束"和"请求独占"都放在同一个局部 `try` 块里处理：正常结束时把 `current_embeds` 合并到总结果，独占时只返回 `current_embeds` 并丢弃之前结果。这样不用额外的循环后状态标记，就能精确控制两个出口。
+
+**细节 2：StopExtraction 继承 Exception，而非 StopIteration**
+
+`common.py` 第 4113 行：
+```python
+class StopExtraction(Exception):  # 不是 StopIteration
+    pass
+```
+
+**为什么不继承 StopIteration？**
+
+- `StopIteration` 在生成器中有特殊语义，表示"生成器结束"。如果 `StopExtraction` 继承它，会被 Python 的生成器机制和 `for` 循环特殊处理，可能导致意外的静默结束。
+- 继承普通 `Exception` 确保它会正常冒泡，只有我们显式的 `except` 块才能捕获它。
+- 这是一个**控制流异常**（control flow exception），用异常实现非局部跳转，类似 `return` 但可以跨多层调用栈。
+
+**细节 3：current_embeds 保留了独占 IE 已经 yield 的结果**
+
+```python
+except self.StopExtraction:
+    # current_embeds 中已经包含了该 IE yield 的所有结果
+    return current_embeds
+```
+
+这意味着：独占 IE 可以先 `yield` 一些结果，再 `raise StopExtraction`。`GenericIE` 会把已经 yield 的结果作为最终结果返回，**同时丢弃**之前其他 IE 已经收集的 `embeds`（因为 `return current_embeds` 而不是 `return embeds + current_embeds`）。
+
+代码第 1010 行明确输出了这个行为：
+```python
+self.report_detected(f'{ie.IE_NAME} exclusive embed', len(current_embeds),
+                     embeds and 'discarding other embeds')
+```
+第三个参数 `embeds and 'discarding other embeds'` 明确告诉用户：之前收集的其他嵌入被丢弃了。
+
+**取舍：为什么独占要丢弃之前的结果？**
+
+- 独占机制的设计目的是"这个网页属于我"，意味着它的解析是最权威的。
+- 如果之前的 IE 已经识别了一些嵌入，那些很可能是误报（比如 invidious 页面里也有 YouTube 嵌入 URL，但实际上应该用 invidious 自己的提取器）。
+- 但这是一个权衡：可能会丢失一些真正的多嵌入场景。所以独占机制应该谨慎使用，只在"这个网页是我的实例"时才触发。
+
+### 5.4 四层架构（回顾与补充）
 
 ```
 用户 URL → GenericIE._real_extract()
     ↓
-    第 1 层: GenericIE 直接尝试解析（直链、HTML5 video 等）
+    第 1 层: GenericIE 直接解析（直链、XML manifest 等）
     ↓ 如果未解析成功
     第 2 层: GenericIE._extract_embeds() 遍历所有 IE
-        ↓
+        ↓ 按 Youtube 优先 → 其他 IE → 播放器兜底的顺序
         第 3 层: 每个 IE.extract_from_webpage() → _extract_from_webpage()
             ↓
             第 4 层: _extract_embed_urls() 基于 _EMBED_REGEX 扫描
-            └── 或者: 子类重写 _extract_from_webpage() 做深度提取
+            └── 或者: 子类重写 _extract_from_webpage() 做深度提取 + 独占
 ```
 
-### 5.2 各层职责与代码位置
-
-**第 1 层：GenericIE 直接解析**（`yt_dlp/extractor/generic.py`）
-- 检测直链媒体文件（mp4/webm/mp3 等）
-- 检测 `<video>` / `<audio>` 标签
-- 检测常见视频播放器配置（JW Player、Video.js 等）
-
-**第 2 层：`_extract_embeds` 遍历调度**（`generic.py` 第 1000–1018 行）
-
-```python
-for ie in self._downloader._ies.values():
-    if ie.ie_key() in smuggled_data.get('block_ies', []):
-        continue
-    gen = ie.extract_from_webpage(self._downloader, url, webpage)
-    current_embeds = []
-    try:
-        while True:
-            current_embeds.append(next(gen))
-    except self.StopExtraction:
-        # 独占：这个 IE 说"这个网页是我的，别给别人了"
-        return current_embeds
-    except StopIteration:
-        embeds.extend(current_embeds)
-```
-
-关键设计：
-- 用 **生成器** 逐个 yield 嵌入结果，而不是一次性返回 list。这样 `StopExtraction` 异常可以**中断迭代**，实现独占机制。
-- `block_ies` 通过 `smuggle_url` 传递，防止递归（如 A 页面嵌入 B，B 页面又引用 A）。
-
-**第 3 层：`extract_from_webpage` 调度**（`common.py` 第 4082–4089 行）
-
-```python
-@classmethod
-def extract_from_webpage(cls, ydl, url, webpage):
-    ie = (cls if isinstance(cls._extract_from_webpage, types.MethodType)
-          else ydl.get_info_extractor(cls.ie_key()))
-    for info in ie._extract_from_webpage(url, webpage) or []:
-        ydl.add_default_extra_info(info, ie, None)
-        yield info
-```
-
-**取舍：`_extract_from_webpage` 同时支持 classmethod 和 instance method**
-
-判断 `isinstance(cls._extract_from_webpage, types.MethodType)`：
-- 如果是 classmethod → 直接用 `cls` 调用（不需要实例化，不触发初始化）
-- 如果是 instance method → 必须 `ydl.get_info_extractor()` 创建实例（需要登录状态、cookies 等）
-
-这个设计平衡了**性能**和**功能**：大多数 IE 的嵌入提取只是正则扫描 HTML，不需要实例化，用 classmethod 更快。少数 IE 需要实例状态才能提取。
-
-**第 4 层：`_extract_embed_urls` 基于正则**（`common.py` 第 4097–4111 行）
-
-默认实现遍历 `_EMBED_REGEX`，每个正则**必须且只能包含一个 `(?P<url>...)` 命名组**。对每个匹配结果：
-1. 用 `unescapeHTML` 反转义
-2. 用 `urljoin` 补全相对路径
-3. 过滤：如果 `_VALID_URL is False`（纯嵌入 IE）直接通过，否则用 `suitable()` 验证
-
-`_EMBED_URL_RE` 同样用 `cls.__dict__` 检查，按类隔离缓存。
-
-### 5.3 独占机制：`StopExtraction`
-
-`common.py` 第 4113–4114 行定义了 `StopExtraction` 异常类。
-
-**使用场景**：某些站点无法通过 URL 区分（如 invidious/peertube 是自托管实例，URL 各不相同），但网页 HTML 有独特特征。此时 `_extract_from_webpage` 检测到特征后抛出 `StopExtraction`，告诉 `GenericIE`："别再找其他 IE 了，这个网页我包了"。
-
-**取舍：为什么用异常而不是返回标记值？**
-
-- 生成器协议天然支持异常中断（`.throw()`）。
-- 不影响正常 yield 的返回类型。
-- `StopExtraction` 继承 `Exception` 而不是 `StopIteration`，避免被 `for` 循环静默吞掉。
-
-### 5.4 边界总结
+### 5.5 边界总结
 
 | 组件 | 位置 | 层级 | 可被覆盖？ |
 |---|---|---|---|
@@ -369,6 +510,7 @@ def extract_from_webpage(cls, ydl, url, webpage):
 | `_extract_from_webpage` | classmethod / instance method | 提取层 | 可覆盖（需要深度解析 / 独占机制） |
 | `extract_from_webpage` | classmethod | 调度层 | 不建议覆盖，处理实例化和默认信息 |
 | `GenericIE._extract_embeds` | instance method | 全局调度层 | 属于 GenericIE 内部逻辑 |
+| `GenericIE._real_extract` | instance method | 主入口层 | 属于 GenericIE 内部逻辑 |
 
 ---
 
