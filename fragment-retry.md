@@ -766,3 +766,81 @@ if self.__do_ytdl_file(ctx):
 ```
 
 当前代码未这样做。这是一个存在但低概率的 bug——只有在恰好写完 PIFF header 后、`_append_fragment` 之前发生中断才会触发。
+
+### 7.5.7 ISM 拼接边界风险摘要
+
+本摘要提炼 ISM 协议在拼接边界上的核心风险点，便于快速排查。
+
+**一、三层状态与更新时序（首分片场景）**
+
+沿时间轴从左到右，三层状态的更新不同步：
+
+```
+时间 →  _download_fragment            write_piff_header    _append_fragment
+        (下载 & 进度hook)             (直接写 dest_stream)   (写+flush+.ytdl)
+         │                              │                      │
+内存     │  ctx['fragment_index']: 0→1  │  ism_track_written   │  不变
+ctx      │                              │  : False → True       │
+         │                              │                      │
+.ytdl    │  不变（仍为 0）              │  不变（仍为 False）  │  追上内存
+磁盘     │                              │                      │  fragment_index=1
+         │                              │                      │  ism_track_written=True
+         │                              │                      │
+.part    │  不变（仍为空）              │  写入 PIFF header    │  追加首分片内容
+文件     │                              │  （~1KB ftyp+moov）  │
+         │                              │                      │
+         ◄────── 窄窗口 ────────────────►
+         状态不一致区域：文件有 header，但 .ytdl 说没写过
+```
+
+**二、窄窗口的精确边界**
+
+窄窗口起点：`write_piff_header()` 调用完成后
+窄窗口终点：`_append_fragment()` 内部 `finally: _write_ytdl_file()` 执行后
+
+窗口内状态快照：
+| 状态层 | 值 | 含义 |
+|-------|----|------|
+| `.part` 文件 | 有 PIFF header 字节 | 文件头已写入 |
+| `.ytdl` fragment_index | `0` | 磁盘认为 0 个分片完成 |
+| `.ytdl` ism_track_written | `false` | 磁盘认为 header 没写过 |
+| 内存 ism_track_written | `True` | 内存知道 header 已写 |
+| 内存 fragment_index | `1` | 内存知道 1 个分片下载完 |
+
+**三、风险触发三要素**
+
+必须同时满足才会导致文件损坏：
+1. **中断时机**：恰好落在窄窗口内（写完 PIFF header 后、`_append_fragment` 完成前）
+2. **恢复判断**：`if not extra_state['ism_track_written']` → 从 `.ytdl` 恢复得到 `False` → 判定"还没写 header"
+3. **写入模式**：`resume_len > 0` → `open_mode = 'ab'` 追加模式 → 新 header 被追加到文件尾部
+
+结果：文件中有两份 PIFF header 前后堆叠，MP4 解析失败。
+
+**四、与 F4m 的关键差异**
+
+| 对比维度 | F4m | ISM |
+|---------|-----|-----|
+| Header 写入时机 | `_prepare` 后、`_start` 前 | 首分片下载后 |
+| 是否需要分片内容 | 否（manifest 中有所有信息） | 是（需从 `tfhd` box 提取 `track_id`） |
+| "是否写过 header" 的判断依据 | `complete_frags_downloaded_bytes == 0`（看文件大小） | `not extra_state['ism_track_written']`（看内存状态） |
+| 判断依据的持久化 | 隐式持久化在 `.part` 文件大小里 | 需显式持久化到 `.ytdl` 的 `extra_state` |
+| 窄窗口风险 | 无 | 有 |
+| 原因 | 文件大小 = header 是否已写，天然一致 | 内存状态需手动刷盘，存在时间差 |
+
+**五、风险等级**
+
+- **发生概率**：低。窄窗口只有几十到几百微秒（`write_piff_header` 写 ~1KB 到内核缓存 + 一次内存赋值），且必须恰好在这个窗口中断。
+- **影响程度**：高。一旦触发，输出文件损坏且静默（不会报错，直到播放时才发现）。
+- **修复成本**：低。在 `write_piff_header` 后加一次 `_write_ytdl_file` 即可消除窗口。
+
+**六、代码定位速查表**
+
+| 关注点 | 文件 | 行号 |
+|-------|------|------|
+| ISM 主循环入口 | [ism.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py) | L236 |
+| PIFF header 写入点 | [ism.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py) | L271 |
+| ism_track_written 内存标记 | [ism.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py) | L272 |
+| _append_fragment 调用 | [ism.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py) | L273 |
+| _append_fragment 内部写 .ytdl | [fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py) | L151-L152 |
+| _write_ytdl_file 写 extra_state | [fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py) | L103-L104 |
+| _read_ytdl_file 恢复 extra_state | [fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py) | L88-L89 |
