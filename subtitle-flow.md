@@ -155,15 +155,30 @@ def determine_ext(url, default_ext='unknown_video'):
 2. **尾部斜杠处理**：某些 URL 形如 `https://x.com/sub.vtt/?download`，去掉末尾 `/` 后若在 `KNOWN_EXTENSIONS` 中（`m3u8, mpd, srt, vtt, ...`）则命中。
 3. **兜底返回**：都不匹配则返回 `default_ext`。字幕场景下的 `default_ext` 为 `'unknown_video'`（由调用点传入），此时字幕格式会是错误的，后续 `process_subtitles` 的格式匹配会失败并退化回取最后一条（"best"策略）。
 
-**各层级的 ext 推断调用点**：
+**各层级的 ext 推断调用点（仅与字幕相关）**：
 
-| 调用位置 | 场景 | default_ext |
+| 调用位置 | 所属解析入口 | 场景 | default_ext |
+|---|---|---|---|
+| [common.py L2302](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2302) | `_parse_m3u8_formats_and_subtitles` | HLS M3U8 中 `#EXT-X-MEDIA:TYPE=SUBTITLES` 标签的 URI | —（无默认值，即 `'unknown_video'`）|
+| [common.py L2738](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2738) | `_parse_smil_subtitles` | SMIL 中 `<textstream>` 标签的 `src` 属性 | —（无默认值），前面已有 `ext`/`mimetype2ext` 两道兜底 |
+| [YoutubeDL.py L2908](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L2908) | 全局最后防线（`process_info`）| 所有尚未设置 `ext` 的字幕条目（如 HTML5 `<track kind="subtitles">` 标签的字幕） | —（无默认值）|
+
+**非字幕解析的 determine_ext 调用点（此前误归入，特此澄清）**：
+
+| 行号 | 所属函数 | 场景 | 类型 |
+|---|---|---|---|
+| [common.py L2113](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2113) | `_extract_f4m_formats` | F4M 清单 URL 解析 | 音视频清单 |
+| [common.py L2635](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2635) | `_parse_smil_formats_and_subtitles` | SMIL `<video>/<audio>/<media>` 标签 `src` | 音视频媒体 |
+| [common.py L3370](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3370) | `_parse_html5_media_entries` | HTML5 `<video>/<audio>` 标签 `src` | 音视频媒体 |
+| [common.py L3691](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3691) | `_parse_jwplayer_formats` | JWPlayer sources 数据解析 | 音视频媒体 |
+
+**其他流格式字幕的 ext 设置方式（不使用 determine_ext）**：
+
+| 格式 | ext 设置方式 | 代码位置 |
 |---|---|---|
-| [_parse_m3u8_formats_and_subtitles L2302](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2302) | HLS M3U8 SUBTITLES 标签的 URI | —（无默认）|
-| [_parse_mpd_formats_and_subtitles L3370](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3370) | DASH Representation 的 full_url | —（无默认）|
-| [_parse_ism_formats_and_subtitles L3691](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3691) | ISM 流 source_url | 先用 `mimetype2ext(source_type)` 兜底 |
-| [_parse_smil_formats_and_subtitles L2635](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2635) | SMIL 媒体 src | 先用流级别的 `ext` 兜底 |
-| [YoutubeDL L2908](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L2908) | **全局最后防线**：所有字幕条目在 process_info 阶段 | —（无默认，即 'unknown_video'）|
+| DASH MPD | `mimetype2ext(mime_type)` 从 MIME 类型映射 | [common.py L2989](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2989) |
+| ISM | 硬编码 `'ismt'` | [common.py L3304](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3304) |
+| HTML5 `<track>` | 未设置 ext，依赖 YoutubeDL L2908 全局推断 | [common.py L3469-L3471](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3469-L3471) |
 
 **特例 1：M3U8 指向 m3u8 时**：在 L2302 推断出 `ext='m3u8'` 后，紧接着 L2304-L2309 会**硬编码覆盖**为 `ext='vtt'` 并标记 `protocol='m3u8_native'`（依据 RFC 8216 §3.1：m3u8 字幕清单只能包含 WebVTT 内容）。这确保后续下载器知道需要按 m3u8 分片方式下载 VTT 片段。
 
@@ -248,7 +263,7 @@ def subtitles_filename(filename, sub_lang, sub_format, expected_real_ext=None):
 
 ### 4.1 触发条件
 
-通过 `--convert-subs FORMAT` 命令行选项触发，在 [\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L644-L649) 中注册为后处理器：
+通过 `--convert-subs FORMAT` 命令行选项触发，在 [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L644-L649) 中注册为后处理器：
 
 ```python
 if opts.convertsubtitles:
@@ -291,52 +306,131 @@ self.run_ffmpeg(old_file, new_file, ['-f', new_format])
 
 #### 4.3.1 转码后字幕文件与 `__files_to_move` 的集成
 
-转换后的新字幕文件必须被**正确注册到移动映射**，才能跟着视频一起从临时目录搬到最终目录。这由两段代码配合完成：
+转换后的新字幕文件必须被**正确注册到移动映射**，才能跟着视频一起从临时目录搬到最终目录。这需要区分子目标格式就是 `srt`（dfxp→srt 为终点），还是还需进一步转换（dfxp→srt→vtt/ass，srt 为中间格式），两种情形处理逻辑差异很大，且代码中存在一处**设计缺陷**。
 
-**第一步：在转换过程中更新 `__files_to_move` 映射**
+首先明确两段关键代码：
 
-FFmpegSubtitlesConvertorPP 中，每生成一个新格式字幕文件，就以**新文件路径为 key** 覆盖掉旧文件路径，对应的 value 也更新为**换了扩展名的最终目标路径**：
+**① 新格式注册逻辑**（仅 ffmpeg 转换后才执行，L1009-L1010）：
 
 ```python
 info['__files_to_move'][new_file] = replace_extension(
     info['__files_to_move'][sub['filepath']], new_ext)
 ```
 
-映射表的含义：`key` 是临时目录中存在的源文件，`value` 是移动后的目标路径（value 为 `''` 或 `None` 表示默认根据 key 的文件名组合 `finaldir`）。
+**重要细节**：`sub` 是循环开始时从 `subs.items()` 取出的引用，而 dfxp2srt 分支中 `subs[lang] = {...}` 是**整体替换对象**（L989），因此 `sub` 仍指向**原始 dfxp 条目**，`sub['filepath']` 仍为 dfxp 原文件路径。这里是**碰巧正确**的实现——我们确实需要基于 dfxp 的最终路径来替换扩展名。
 
-**示例**：
-```
-初始（_write_subtitles 之后）：
-  __files_to_move = {
-    'tmp/video.en.ttml': 'final/video.en.ttml'   # 旧字幕：临时路径 → 最终路径
-  }
+映射表含义：`key` 是临时目录中存在的源文件，`value` 是移动后的目标路径（value 为 `''` 或 `None` 表示默认根据 key 的文件名组合 `finaldir`）。
 
-经过 --convert-subs srt 后，dfxp2srt 先转 srt，再 ffmpeg 转 ass：
-  先由 dfxp2srt 生成 'tmp/video.en.srt'：
-    subs['en']['filepath'] = 'tmp/video.en.srt'
-    __files_to_move['tmp/video.en.srt'] = 'final/video.en.srt'   # 中间格式也注册（若目标非srt稍后被替换）
-  再由 ffmpeg 转 ass 生成 'tmp/video.en.ass'：
-    __files_to_move['tmp/video.en.ass'] = replace_extension('final/video.en.srt', 'ass')
-                                                      = 'final/video.en.ass'
-```
-
-**第二步：旧转码文件的回收机制**
-
-`FFmpegSubtitlesConvertorPP.run()` 返回 `(sub_filenames, info)`，其中 `sub_filenames` 是需要回收的旧文件列表（原始 ttml、中间 srt 等）。`YoutubeDL.run_pp()` 的处理逻辑如下：
+**② 旧文件回收逻辑**（run_pp L3798-L3818 + L3782）：
 
 ```python
-# run_pp L3798-3818
 files_to_delete, infodict = pp.run(infodict)
-if not files_to_delete:
-    return infodict
-if self.params.get('keepvideo', False):   # -k 参数
+for filename in files_to_delete:
+    if filename in info.get('__files_to_move', {}):  # L3782：从移动映射中删除
+        del info['__files_to_move'][filename]
+if self.params.get('keepvideo', False):              # -k 参数
     for f in files_to_delete:
-        infodict['__files_to_move'].setdefault(f, '')   # 保留文件 → 也搬去最终目录
+        infodict['__files_to_move'].setdefault(f, '') # 保留文件 → 也搬去最终目录
 else:
-    self._delete_downloaded_files(*files_to_delete, ...)  # 正常删除
+    self._delete_downloaded_files(*files_to_delete)   # 正常删除
 ```
 
-即：默认情况下旧格式字幕文件会被**直接删除**；若指定 `-k`（`keepvideo=True`）则**也移动到最终目录**。
+---
+
+下面分两种情形详述：
+
+##### 情形 A：dfxp→srt（目标格式就是 srt，设计缺陷）
+
+```
+初始 __files_to_move：
+  {'tmp/video.en.dfxp': 'final/video.en.dfxp'}
+
+L970: old_file = 'tmp/video.en.dfxp'
+L971: sub_filenames = ['tmp/video.en.dfxp']   ← dfxp 加入待删除
+L972: new_file = 'tmp/video.en.srt'
+
+L979-L987: dfxp2srt 转换，生成 srt_file = 'tmp/video.en.srt'
+           old_file = 'tmp/video.en.srt'
+
+L989-993: subs['en'] = {                       ← 整体替换对象，sub 仍指向旧对象
+    'ext': 'srt',
+    'data': srt_data,
+    'filepath': 'tmp/video.en.srt'
+}
+
+L995: new_ext == 'srt' → TRUE
+L996: continue  → 直接跳过 L1000-1010！
+       ↓
+       × 不会运行 ffmpeg
+       × 不会执行 L1009-1010 的 __files_to_move 更新
+       × srt 文件未注册到移动映射！
+```
+
+**后续处理**：
+- `sub_filenames = ['tmp/video.en.dfxp']` → run_pp 中**删除 dfxp 文件**，同时**从 __files_to_move 删除 key `tmp/video.en.dfxp`**
+- **srt 文件 `tmp/video.en.srt`**：既不在 `files_to_delete` 中，也不在 `__files_to_move` 中，**最终留在临时目录，不会被移动到最终目录**！
+
+> **代码缺陷**：dfxp→srt 且目标就是 srt 时，srt 文件永远不会被移动到最终目录。如需修复，需在 `continue` 前补充注册 srt 文件到 `__files_to_move`。
+
+---
+
+##### 情形 B：dfxp→srt→vtt（目标格式非 srt，srt 为中间格式）
+
+```
+初始 __files_to_move：
+  {'tmp/video.en.dfxp': 'final/video.en.dfxp'}
+
+L970: old_file = 'tmp/video.en.dfxp'
+L971: sub_filenames = ['tmp/video.en.dfxp']   ← dfxp 加入待删除
+L972: new_file = 'tmp/video.en.vtt'
+
+L979-L987: dfxp2srt 转换，生成 srt_file = 'tmp/video.en.srt'
+           old_file = 'tmp/video.en.srt'
+
+L989-993: subs['en'] = {'ext': 'srt', ..., 'filepath': 'tmp/video.en.srt'}
+
+L995: new_ext != 'srt' → FALSE
+L998: sub_filenames.append('tmp/video.en.srt')
+      → sub_filenames = ['tmp/video.en.dfxp', 'tmp/video.en.srt']
+
+L1000: run_ffmpeg('tmp/video.en.srt', 'tmp/video.en.vtt', ['-f', 'webvtt'])
+
+L1002-1007: subs['en'] = {'ext': 'vtt', ..., 'filepath': 'tmp/video.en.vtt'}
+
+L1009-1010: 注册 vtt 到移动映射
+  info['__files_to_move']['tmp/video.en.vtt']
+    = replace_extension(
+        info['__files_to_move']['tmp/video.en.dfxp'], 'vtt')
+                             ↑ sub['filepath'] 仍是 dfxp 路径（碰巧正确）
+    = 'final/video.en.vtt'
+```
+
+**此时状态**：
+```
+__files_to_move = {
+  'tmp/video.en.dfxp': 'final/video.en.dfxp',
+  'tmp/video.en.vtt':  'final/video.en.vtt'
+}
+sub_filenames = ['tmp/video.en.dfxp', 'tmp/video.en.srt']
+```
+
+**后续处理**：
+1. run_pp 处理 `files_to_delete = ['tmp/video.en.dfxp', 'tmp/video.en.srt']`
+2. 从 `__files_to_move` 删除 `tmp/video.en.dfxp`（srt 不在其中，跳过）
+3. 默认模式：**删除 dfxp 和 srt 文件**
+4. 最终 `__files_to_move = {'tmp/video.en.vtt': 'final/video.en.vtt'}`
+5. MoveFilesAfterDownloadPP 正常移动 vtt 到最终目录 ✓
+
+---
+
+##### 情形 C：普通格式转换（非 dfxp/ttml，如 vtt→srt）
+
+无需中间格式，流程更简单：
+- old_file 加入 `sub_filenames` 待删除
+- ffmpeg 转换生成 new_file
+- L1009-L1010 注册 new_file 到移动映射
+- run_pp 删除 old_file 并从映射移除
+- new_file 正常移动
 
 ---
 
@@ -420,12 +514,13 @@ def run(self, info):
     return [], info
 ```
 
-### 5.3 字幕文件在移动链中的三种结局
+### 5.3 字幕文件在移动链中的四种结局
 
 | 场景 | 处理方式 | 代码位置 |
 |---|---|---|
 | 只 `--write-subs` | 字幕文件正常 `files_to_move`，被 MoveFilesAfterDownloadPP 搬到 finaldir | [YoutubeDL L3386-3389](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3386-L3389) |
-| `--write-subs --convert-subs FORMAT` | 转码后新格式字幕替换旧文件映射注册，旧格式被 run_pp 删除（带 `-k` 则保留并一起搬） | [ffmpeg.py L1009-1010](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) + [YoutubeDL L3811-3818](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3811-L3818) |
+| `--write-subs --convert-subs FORMAT`（普通格式/dfxp 转非 srt） | 转码后新格式字幕替换旧文件映射注册，旧格式被 run_pp 删除（带 `-k` 则保留并一起搬） | [ffmpeg.py L1009-1010](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) + [YoutubeDL L3798-L3818](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3818) |
+| `--write-subs --convert-subs srt`（dfxp→srt 终点）⚠️ **设计缺陷** | dfxp 原文件被删除，srt 文件未注册到 `__files_to_move`，**不会被移动到最终目录，留在临时目录** | [ffmpeg.py L995-L996](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L995-L996) `continue` 跳过注册 |
 | `--embed-subs` 且未保留 | 字幕嵌入后被 FFmpegEmbedSubtitlePP 列为 files_to_delete，由 run_pp 删除，因此不会出现在最终目录 | [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
 | `--embed-subs --write-subs` | 嵌入时 `already_have_subtitle=True`，因此不在 files_to_delete 中，继续留在 files_to_move 随视频一起搬移 | [__init__.py L674-679](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L679) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
 
@@ -435,7 +530,7 @@ def run(self, info):
 
 ### 6.1 触发条件
 
-通过 `--embed-subs` 选项触发，在 [\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L679) 中注册：
+通过 `--embed-subs` 选项触发，在 [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L679) 中注册：
 
 ```python
 if opts.embedsubtitles:
@@ -550,21 +645,28 @@ ffmpeg -i video.mp4 -i sub1.vtt -i sub2.srt \
 | 字幕数据结构定义 | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L331-L339) | L331-339 |
 | extract_subtitles 入口 | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3885-L3892) | L3885-3892 |
 | _merge_subtitles | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3938-L3946) | L3938-3946 |
-| M3U8 字幕解析 | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2284-L2311) | L2284-2311 |
-| DASH MPD 字幕解析 | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3208-L3209) | L3208-3209 |
+| M3U8 字幕解析（含 determine_ext 调用） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2284-L2311) | L2284-2311 |
+| SMIL textstream 字幕解析（含 determine_ext 调用） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2730-L2742) | L2730-L2742 |
+| DASH MPD 字幕解析 | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3202-L3209) | L3202-L3209 |
+| DASH 字幕 ext 设置（mimetype2ext，不用 determine_ext） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2989) | L2989 |
+| ISM 字幕 ext 硬编码（不用 determine_ext） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3304) | L3304 |
+| HTML5 track 字幕解析（未设置 ext，依赖全局推断） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3461-L3471) | L3461-L3471 |
 | determine_ext 推断扩展名 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/utils/_utils.py#L1310-L1320) | L1310-1320 |
 | process_subtitles | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3154-L3212) | L3154-3212 |
-| URL清理+全局ext推断 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L2901-L2909) | L2901-2909 |
+| URL清理+全局ext推断（最后防线） | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L2901-L2909) | L2901-L2909 |
 | _write_subtitles | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L4440-L4494) | L4440-4494 |
 | subtitles_filename | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/utils/_utils.py#L1323-L1324) | L1323-1324 |
 | dfxp2srt 转换 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/utils/_utils.py#L3414) | L3414 |
-| FFmpegSubtitlesConvertorPP | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L939-L1012) | L939-1012 |
+| FFmpegSubtitlesConvertorPP 主流程 | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L939-L1012) | L939-1012 |
+| subs[lang] 整体替换（导致 sub 引用旧对象） | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L989-L993) | L989-L993 |
+| dfxp→srt 终点跳过注册（设计缺陷） | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L995-L996) | L995-L996 |
 | 转码字幕注册到__files_to_move | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) | L1009-1010 |
-| FFmpegEmbedSubtitlePP | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L581-L659) | L581-659 |
-| run_pp: files_to_delete处理 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3818) | L3798-3818 |
+| FFmpegEmbedSubtitlePP | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L581-L659) | L581-L659 |
+| run_pp: 从__files_to_move删除待删除文件键 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3782-L3785) | L3782-L3785 |
+| run_pp: files_to_delete 删除/保留逻辑 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3818) | L3798-L3818 |
 | pre_process / post_process 生命周期 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3828-L3846) | L3828-3846 |
 | MoveFilesAfterDownloadPP | [movefilesafterdownload.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py#L11-L53) | L11-53 |
-| 后处理器注册 | [\_\_init\_\_.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L644-L679) | L644-679 |
+| 后处理器注册 | [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L644-L679) | L644-679 |
 | YouTube _SUBTITLE_FORMATS | [youtube/_video.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/youtube/_video.py#L142) | L142 |
 | YouTube process_language | [youtube/_video.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/youtube/_video.py#L4199-L4211) | L4199-4211 |
 | MEDIA_EXTENSIONS.subtitles | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/utils/_utils.py#L5097) | L5097 |
