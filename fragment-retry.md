@@ -577,7 +577,7 @@ IsmFD.real_download (ism.py:236)
 - **F4m 路**：拆开 `_prepare_and_start_frag_download`，在中间插入 header 写入（要求 header 内容在下载前已知）
 - **Ism 路**：保持组合调用不变，在首分片回调中提取信息后写入（header 内容依赖首分片数据，如 ISM 的 track_id）
 
-无论走哪条路，只要 header 写入完成时 `fragment_index` 还没增加（即还没完成 `_append_fragment`），.ytdl 的断点续传语义就不会出错——下次重下时会从 fragment_index=0 重新走一遍，header 会被重写，但因为是以 `wb` 模式重新打开的，覆盖写入也不会有问题。
+**⚠️ 这两种路径的断点恢复安全性截然不同**：F4m 是安全的，ISM 存在窄窗口风险。详见 7.5 节深度分析。
 
 ### 7.4 重试路径的三种模式总结
 
@@ -595,182 +595,174 @@ IsmFD.real_download (ism.py:236)
 
 ## 7.5 协议头写入、进度更新与断点恢复的边界深度分析
 
-这一节聚焦一个最容易忽略的设计细节：协议头是"裸写" dest_stream 的，不走 `_append_fragment`，也不走 `_write_ytdl_file`。这与 `.part` 文件大小、`complete_frags_downloaded_bytes`、`fragment_index` 三者之间存在微妙的不一致边界。
+这一节从代码时序层面精确梳理：协议头是"裸写" `dest_stream` 的，不走 `_append_fragment`，也不走 `_write_ytdl_file`——这与 `.part` 文件大小、`fragment_index` 内存值、`.ytdl` 磁盘值三者之间存在微妙的时间差，是断点恢复 bug 的温床。
 
-### 7.5.1 三个核心变量的关系链
+### 7.5.1 前置知识：两套 fragment_index 更新机制
 
-先看 `_prepare_frag_download` 中的初始化逻辑 [fragment.py:157-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py#L157-L223)：
+在深入分析之前，必须先区分三个容易混淆的"进度"概念：
+
+| 概念 | 存储位置 | 更新时机 | 更新者 | 作用 |
+|------|---------|---------|-------|------|
+| `ctx['fragment_index']` | 内存 | 每次分片下载完成（进度 hook `status='finished'` 时） | `frag_progress_hook` [fragment.py:270-L273](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py#L270-L273) | 构造分片临时文件名、估算总大小 |
+| `.ytdl` 中 `current_fragment.index` | 磁盘文件 | 每次 `_append_fragment` 成功后（finally 块中） | `_write_ytdl_file` [fragment.py:151-L152](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py#L151-L152) | 断点恢复时跳过已完成分片 |
+| `complete_frags_downloaded_bytes` | 内存 | 每次分片下载完成（进度 hook 中） | `frag_progress_hook` [fragment.py:275](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py#L275) | 进度估算 |
+
+> **注意**：`complete_frags_downloaded_bytes` 字面上是"已完成分片的字节数"，但它的初始值是 `resume_len = .part 文件的原始大小`，**包含协议头字节**——即使协议头不属于任何分片。这是后续边界问题的根源之一。
+
+关键时间差：
+- **`ctx['fragment_index']`（内存）先更新**：下载完成的瞬间，进度 hook 就加 1
+- **`.ytdl`（磁盘）后更新**：要等 `_append_fragment` 完成后，在 finally 中才写入
+
+两者之间存在一个窗口：分片已下载完成，但还没写入目标文件。
+
+### 7.5.2 open_mode 的选择逻辑
+
+`_prepare_frag_download` 中决定文件打开模式 [fragment.py:173-L178](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py#L173-L178)：
 
 ```python
-# 1. 读取 .part 文件大小
-resume_len = self.filesize_or_none(tmpfilename)  # 可能包含协议头字节!
+resume_len = self.filesize_or_none(tmpfilename)
 if resume_len > 0:
-    open_mode = 'ab'   # 追加模式
+    open_mode = 'ab'   # 追加：文件已有内容，从尾部继续写
 else:
-    open_mode = 'wb'   # 覆盖模式
-
-# 2. 恢复 .ytdl 中的 fragment_index
-if self.__do_ytdl_file(ctx):
-    if continuedl and ytdl_file_exists:
-        self._read_ytdl_file(ctx)  # 恢复 fragment_index 和 extra_state
-    is_inconsistent = ctx['fragment_index'] > 0 and resume_len == 0
-    if is_inconsistent:
-        # 有分片进度但文件为空 → 从零开始
-        ctx['fragment_index'] = resume_len = 0
-
-# 3. 打开 dest_stream
-dest_stream, tmpfilename = self.sanitize_open(tmpfilename, open_mode)
-
-# 4. 关键：complete_frags_downloaded_bytes 被设为 resume_len
-ctx['complete_frags_downloaded_bytes'] = resume_len
+    open_mode = 'wb'   # 覆盖：文件为空，从头写
 ```
 
-**名不副实的变量**：`complete_frags_downloaded_bytes` 字面上是"已完成的分片字节数"，但实际上它就是 `.part` 文件的原始大小，**包含了协议头字节**——即使协议头不是任何一个分片的一部分。
+判断依据只有一个：`.part` 文件是否有字节。只要有字节（哪怕只是协议头），就是 `'ab'` 追加模式。
 
-这是后续所有边界问题的根源。
-
-### 7.5.2 F4m 的边界分析（前序写入模式）
+### 7.5.3 F4m 的边界分析（前序写入模式）—— 安全
 
 F4m 的写入时序 [f4m.py:361-L372](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/f4m.py#L361-L372)：
 
 ```python
-self._prepare_frag_download(ctx)
+self._prepare_frag_download(ctx)      # 打开 .part，open_mode 根据 resume_len 决定
 dest_stream = ctx['dest_stream']
 
-if ctx['complete_frags_downloaded_bytes'] == 0:  # ← 用 resume_len 判断
-    write_flv_header(dest_stream)       # 直接写 dest_stream, 不走 _append_fragment
-    write_metadata_tag(dest_stream, metadata)  # 直接写, 不走 _append_fragment
+# 用 complete_frags_downloaded_bytes == 0 作为 header 写入判断
+if ctx['complete_frags_downloaded_bytes'] == 0:
+    write_flv_header(dest_stream)     # 直接写 dest_stream，不走 _append_fragment
+    write_metadata_tag(dest_stream, metadata)
 
-self._start_frag_download(ctx, info_dict)
-# 之后进入循环，逐个 _append_fragment
+self._start_frag_download(ctx, info_dict)  # 启动进度 hook
 ```
 
-**断点恢复的几种场景：**
+**断点恢复场景分析：**
 
-| 中断时机 | .part 内容 | fragment_index（.ytdl） | resume_len | 恢复时行为 | 结果 |
-|---------|-----------|-------------------------|------------|-----------|------|
-| **写 header 前** | 空 | 0 | 0 | open_mode='wb'，重写 header，从 frag 1 开始 | ✅ 正确 |
-| **header 写完，frag 1 未 `_append_fragment`** | FLV header + metadata | 0（_append_fragment 才会更新） | header_size（>0） | `complete_frags_downloaded_bytes > 0` → 不重写 header；open_mode='ab' 指针在尾部；从 frag 1 开始 | ✅ 正确（header 已存在，直接追加分片） |
-| **frag 1 已 `_append_fragment`，frag 2 未完成** | header + meta + frag1_mdat | 1 | header + meta + frag1 | open_mode='ab'；`frag_index <= 1` 跳过；从 frag 2 开始 | ✅ 正确 |
+| 中断时机 | .part 内容 | `.ytdl` fragment_index | resume_len | open_mode | `complete_frags_downloaded_bytes == 0`? | 恢复时行为 | 结果 |
+|---------|-----------|----------------------|------------|-----------|----------------------------------------|-----------|------|
+| **写 header 前** | 空 | 0 | 0 | `'wb'` | ✅ 是 | 重写 header，从 frag 1 开始 | ✅ 正确 |
+| **header 写完，frag 1 未 append** | FLV header + metadata | **0**（还没调过 `_append_fragment`） | header_size | `'ab'` | ❌ 否 | **不重写 header**，从 frag 1 开始 | ✅ 正确 |
+| **frag 1 已 append** | header + meta + frag1 | 1 | header + meta + frag1 | `'ab'` | ❌ 否 | 跳过 frag 1，从 frag 2 开始 | ✅ 正确 |
 
-**F4m 的保护机制**：用 `complete_frags_downloaded_bytes == 0` 作为是否写 header 的判断。只要 `.part` 有任何字节（哪怕只有 header），就不会重写 header。这个保护是可靠的。
+**F4m 为什么安全？** 关键在于它用 `complete_frags_downloaded_bytes == 0`（即 `.part` 文件大小）作为 header 写入的判断条件，而不是用 `fragment_index`。只要 `.part` 有任何字节（哪怕只有 header），就不会重写 header。`'ab'` 追加模式也保证了不会覆盖已有内容。
 
-**但有一个语义瑕疵**：`complete_frags_downloaded_bytes = resume_len = header_size`，此时进度估算会把 header 字节算作"已完成的分片"，导致初始进度估算偏大。但这只是显示问题，不影响数据正确性。
+### 7.5.4 ISM 的边界分析（懒写入模式）—— 存在窄窗口风险
 
-### 7.5.3 ISM 的边界分析（懒写入模式）—— 存在窄窗口风险
+ISM 必须从第一个分片的 `tfhd` box 中提取 `track_id` 才能构建 PIFF header，因此不得不推迟到第一个分片下载后再写。这引入了一个未持久化窗口。
 
-ISM 的写入时序 [ism.py:245-L273](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py#L245-L273)：
+让我们逐行跟踪 ISM 第一个分片的完整时序 [ism.py:262-L273](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py#L262-L273)：
 
 ```python
-self._prepare_and_start_frag_download(ctx, info_dict)
+# 初始状态：
+#   ctx['fragment_index'] = 0  (内存)
+#   .ytdl fragment_index = 0   (磁盘)
+#   extra_state.ism_track_written = False  (内存 & 磁盘)
+#   .part 文件: 空
 
-extra_state = ctx.setdefault('extra_state', {
-    'ism_track_written': False,
-})
+try:
+    success = self._download_fragment(ctx, segment['url'], info_dict)
+    # ┌──────────────────────────────────────────────┐
+    # │  _download_fragment 内部:                     │
+    # │  1. 文件名 = tmpfilename + "-Frag0"          │
+    # │     (用 ctx['fragment_index'] = 0 构造)      │
+    # │  2. ctx['dl'].download() → HttpFD 下载        │
+    # │  3. 下载完成，进度 hook 触发 status='finished'│
+    # │     → ctx['fragment_index'] += 1 → 变成 1   │
+    # │     【注意：内存更新了，磁盘还没动】           │
+    # │  4. ctx['fragment_filename_sanitized'] = ... │
+    # └──────────────────────────────────────────────┘
+    # 此时：ctx['fragment_index'] = 1 (内存)
+    #       .ytdl fragment_index 仍为 0 (磁盘)
 
-for segment in segments:
-    ...
-    for retry in retry_manager:
-        try:
-            success = self._download_fragment(ctx, segment['url'], info_dict)
-            frag_content = self._read_fragment(ctx)
+    frag_content = self._read_fragment(ctx)
 
-            if not extra_state['ism_track_written']:
-                # ┌─────────────────────────────────────────────────┐
-                # │  窄窗口 A：PIFF header 写入 dest_stream        │
-                # │  此时 .part 文件已有数据，但还没更新 .ytdl      │
-                # │  内存中 ism_track_written 已设为 True         │
-                # └─────────────────────────────────────────────────┘
-                tfhd_data = extract_box_data(frag_content, [b'moof', b'traf', b'tfhd'])
-                info_dict['_download_params']['track_id'] = u32.unpack(tfhd_data[4:8])[0]
-                write_piff_header(ctx['dest_stream'], info_dict['_download_params'])
-                extra_state['ism_track_written'] = True  # 内存标记
+    if not extra_state['ism_track_written']:   # True (内存中为 False)
+        tfhd_data = extract_box_data(frag_content, [b'moof', b'traf', b'tfhd'])
+        info_dict['_download_params']['track_id'] = u32.unpack(tfhd_data[4:8])[0]
+        write_piff_header(ctx['dest_stream'], info_dict['_download_params'])
+        # 直接写 dest_stream → .part 现在有 PIFF header (~1KB)
+        extra_state['ism_track_written'] = True
+        # 【注意：仅内存，.ytdl 中仍是 False】
 
-            # ┌─────────────────────────────────────────────────┐
-            # │  窄窗口 B：在 _append_fragment 调用前中断       │
-            # │  此时 ism_track_written=True 仅在内存中，       │
-            # │  .ytdl 文件中仍是 False（未持久化）             │
-            # └─────────────────────────────────────────────────┘
-            self._append_fragment(ctx, frag_content)
-            # _append_fragment 内部 finally 块会调用 _write_ytdl_file，
-            # 将 extra_state['ism_track_written']=True 写入 .ytdl
+    # ▲─────── 窄窗口位置 ───────▲
+    # 此时状态快照：
+    #   .part 文件: PIFF header
+    #   ctx['fragment_index'] = 1      (内存)
+    #   .ytdl fragment_index = 0       (磁盘)
+    #   extra_state.ism_track_written = True   (内存)
+    #   extra_state.ism_track_written = False  (磁盘 .ytdl 中)
+    #
+    # 如果在此处中断 → 恢复时会重写 PIFF header → 文件损坏
+
+    self._append_fragment(ctx, frag_content)
+    # ┌──────────────────────────────────────────────┐
+    # │  _append_fragment 内部:                       │
+    # │  1. dest_stream.write(frag_content)          │
+    # │  2. dest_stream.flush()                      │
+    # │  3. finally:                                  │
+    # │     _write_ytdl_file(ctx)                     │
+    # │       → 写入 ctx['fragment_index'] = 1       │
+    # │       → 写入 extra_state.ism_track_written=True │
+    # │     【磁盘状态终于追上内存】                   │
+    # └──────────────────────────────────────────────┘
 ```
 
-**关键时序图**：
+**断点恢复场景分析（窄窗口中断）：**
 
-```
-时间轴 →
-│
-├─ frag[0] 下载完成，读取到内存
-│
-├─ if not ism_track_written:
-│    ├─ write_piff_header(dest_stream)   ← 文件中已有 PIFF header
-│    └─ extra_state['ism_track_written'] = True  ← 仅内存
-│
-│  ▲ 窄窗口 A：此处中断 → 文件有 header，.ytdl 中 ism_track_written 仍为 False
-│
-├─ _append_fragment(ctx, frag_content)
-│    ├─ dest_stream.write(frag_content)
-│    ├─ dest_stream.flush()
-│    └─ finally:
-│         └─ _write_ytdl_file(ctx)  ← ism_track_written=True 持久化到 .ytdl
-│
-│  ▲ 窄窗口 B：在 append 前中断 → 同上
-│
-└─ frag[0] 处理完成，进入 frag[1]
-```
+| 中断时机 | .part 内容 | `.ytdl` fragment_index | `.ytdl` ism_track_written | resume_len | open_mode | 恢复时行为 | 结果 |
+|---------|-----------|----------------------|--------------------------|------------|-----------|-----------|------|
+| **写 PIFF header 前** | 空 | 0 | False | 0 | `'wb'` | 写 header，append frag[0] | ✅ 正确 |
+| **PIFF header 写完，frag[0] 未 append**（窄窗口） | PIFF header | **0** | **False** | ~1KB | `'ab'` | `ism_track_written=False` → **再写一遍 PIFF header**；然后 append frag[0] | ❌ **文件损坏**：两份 header 堆叠 |
+| **frag[0] 已 append** | PIFF header + frag[0] | 1 | True | header + frag0 | `'ab'` | 跳过 frag[0]，从 frag[1] 开始 | ✅ 正确 |
 
-**ISM 的断点恢复场景分析：**
+**为什么会损坏？** 三重巧合叠加：
+1. **`'ab'` 追加模式**：因为 `.part` 已有 PIFF header 字节，`resume_len > 0` → 用追加模式打开
+2. **`ism_track_written` 未持久化**：状态只在内存中，`.ytdl` 里还是 `False`
+3. **判断条件是内存状态**：`if not extra_state['ism_track_written']` 使用的是从 `.ytdl` 恢复的值
 
-| 中断时机 | .part 内容 | fragment_index | ism_track_written（.ytdl） | resume_len | 恢复时行为 | 结果 |
-|---------|-----------|----------------|----------------------------|------------|-----------|------|
-| **写 PIFF header 前** | 空 | 0 | False | 0 | open_mode='wb'；写 PIFF header；append frag[0] | ✅ 正确 |
-| **PIFF header 写完，frag[0] 未 `_append_fragment`**（窄窗口 A/B） | PIFF header 约 1KB | 0 | **False**（未持久化！） | ~1000 | open_mode='ab'（因为 resume_len>0）；`ism_track_written=False` → **再写一遍 PIFF header**；然后 append frag[0] | ❌ **文件损坏！** 两份 PIFF header 前后堆叠 |
-| **frag[0] 已 `_append_fragment`** | PIFF header + frag[0] 全文 | 1 | True | header + frag[0] | open_mode='ab'；`ism_track_written=True` → 不重写 header；跳过 frag[0]；从 frag[1] 开始 | ✅ 正确 |
-| **frag[5] 完成后中断** | header + frag[0-5] | 6 | True | header + sum(frag0-5) | 从 frag[6] 开始 | ✅ 正确 |
+三者共同作用，导致恢复时用 `'ab'` 模式又追加了一份 PIFF header，MP4 文件结构损坏。
 
-**ISM 的设计缺陷**：`extra_state['ism_track_written'] = True` 是内存状态，只有在 `_append_fragment` 的 finally 块中才会被 `_write_ytdl_file` 持久化。在 `write_piff_header` 和 `_append_fragment` 之间存在一个**未持久化的窄窗口**，如果在此窗口中断，恢复时会重复写入 PIFF header，导致 MP4 文件结构损坏。
+### 7.5.5 一致性检查的盲区
 
-对比 F4m：F4m 不需要从分片内容中提取信息才能写 header，所以它把 header 写入放在了 `_prepare` 和 `_start` 之间，且用 `complete_frags_downloaded_bytes == 0` 做保护——而 ISM 因为需要从第一个分片的 `tfhd` box 中提取 `track_id` 才能构建 PIFF header，不得不推迟到第一个分片下载后再写，这就引入了窄窗口风险。
-
-### 7.5.4 一致性检查的盲区
-
-`_prepare_frag_download` 中有一个一致性检查：
+`_prepare_frag_download` 中有一个一致性检查 [fragment.py:204-L211](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/fragment.py#L204-L211)：
 
 ```python
 is_inconsistent = ctx['fragment_index'] > 0 and resume_len == 0
+# 即：【有分片进度，但文件为空】→ 清零重下
+if is_inconsistent:
+    ctx['fragment_index'] = resume_len = 0
+    self._write_ytdl_file(ctx)
 ```
 
-这个检查只覆盖了"有分片进度但文件为空"这一种不一致。但反过来的情况：
+这个检查只覆盖了一种不一致。反过来的情况：
 
 > **`fragment_index == 0` 但 `resume_len > 0`**
 
 是**故意不检查**的——因为协议头写入就是在 fragment_index=0 时进行的，这种情况是合法的。
 
-但这意味着：
-- F4m：写完 header 后中断，`fragment_index=0, resume_len=header_size` → 合法，保护机制正确
-- ISM 窄窗口中断：`fragment_index=0, resume_len=header_size, ism_track_written=False` → 合法但有语义不一致，会导致重写 header
+但这也意味着：
+- F4m 的 header 写完后中断 → 合法且安全（有 `complete_frags_downloaded_bytes == 0` 保护）
+- ISM 窄窗口中断 → 合法但**有语义不一致**（`ism_track_written` 状态没同步）→ 会导致重写 header
 
-### 7.5.5 dest_stream 打开模式的关键作用
+### 7.5.6 理论修复方向
 
-`open_mode` 由 `resume_len` 决定：
-- `resume_len == 0` → `'wb'` 覆盖模式 → 会清空已有内容
-- `resume_len > 0` → `'ab'` 追加模式 → 文件指针移到尾部，写操作追加
-
-对于 ISM 窄窗口中断场景，`resume_len > 0` 所以用 `'ab'` 模式——问题不是覆盖了已有内容，而是**又追加了一份 header**。这是一个结构性错误。
-
-如果 ISM 此时用的是 `'wb'` 模式，反而会因为从头覆盖而隐式修复（header 和 frag[0] 都重写一遍），但这会丢失已下载的 header 字节。所以 `'ab'` 本身是正确的选择，问题出在 `ism_track_written` 的持久化时机。
-
-### 7.5.6 理论上的修复方向
-
-如果要修复 ISM 的窄窗口问题，可以在 `write_piff_header` 之后立即持久化一次 `.ytdl`：
+如果要修复 ISM 的窄窗口问题，只需在 `write_piff_header` 之后立即持久化一次 `.ytdl`：
 
 ```python
 write_piff_header(ctx['dest_stream'], info_dict['_download_params'])
 extra_state['ism_track_written'] = True
-# 立即持久化，消除窄窗口
+# 立即持久化 ism_track_written 状态，消除窄窗口
 if self.__do_ytdl_file(ctx):
     self._write_ytdl_file(ctx)
 ```
 
-但当前代码没有这样做。这是一个存在但低概率的 bug——只有在恰好写完 PIFF header 后、_append_fragment 之前发生中断才会触发。
+当前代码未这样做。这是一个存在但低概率的 bug——只有在恰好写完 PIFF header 后、`_append_fragment` 之前发生中断才会触发。
