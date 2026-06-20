@@ -16,7 +16,7 @@ SponsorBlock 功能在 yt-dlp 中通过 **三个核心后处理器（PostProcess
 
 ### 2.1 阶段定义：POSTPROCESS_WHEN
 
-后处理链的执行时机由 8 个阶段组成，定义在 [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/utils/_utils.py#L2858-L2858)：
+后处理链的执行时机由 8 个阶段组成，定义在 [yt_dlp/utils/_utils.py](yt_dlp/utils/_utils.py#L2858-L2858)：
 
 ```python
 POSTPROCESS_WHEN = (
@@ -33,7 +33,7 @@ POSTPROCESS_WHEN = (
 
 ### 2.2 链的构建：get_postprocessors()
 
-所有后处理器在 [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/__init__.py#L627-L736) 的 `get_postprocessors()` 函数中按 yield 顺序构建：
+所有后处理器在 [yt_dlp/__init__.py](yt_dlp/__init__.py#L627-L736) 的 `get_postprocessors()` 函数中按 yield 顺序构建：
 
 | 后处理器 | when 阶段 | 说明 |
 |---------|----------|------|
@@ -90,7 +90,7 @@ if opts.addmetadata or opts.addchapters or opts.embed_infojson:
 
 ### 2.3 链的执行：run_all_pps() / run_pp()
 
-链的执行逻辑在 [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3846)：
+链的执行逻辑在 [yt_dlp/YoutubeDL.py](yt_dlp/YoutubeDL.py#L3798-L3846)：
 
 ```python
 def run_pp(self, pp, infodict):
@@ -112,7 +112,7 @@ def post_process(self, filename, info, files_to_move=None):
     return self.run_all_pps('after_move', info)
 ```
 
-`_pps` 在 [YoutubeDL.__init__](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/YoutubeDL.py#L640-L640) 中按阶段初始化：
+`_pps` 在 [YoutubeDL.__init__](yt_dlp/YoutubeDL.py#L640-L640) 中按阶段初始化：
 
 ```python
 self._pps = {k: [] for k in POSTPROCESS_WHEN}
@@ -120,11 +120,208 @@ self._pps = {k: [] for k in POSTPROCESS_WHEN}
 
 ---
 
-## 3. SponsorBlockPP：片段标记机制
+## 3. 选项触发链路：从 CLI 到后处理器
 
-文件：[sponsorblock.py](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/postprocessor/sponsorblock.py)
+SponsorBlock 选项不是直接启用单个后处理器，而是通过 **选项依赖 → 后处理器构建** 的两级触发机制。
 
-### 3.1 分类体系
+### 3.1 选项依赖关系
+
+在 [yt_dlp/__init__.py](yt_dlp/__init__.py#L590-L592) 的 `validate_options()` 中：
+
+```python
+if (opts.addmetadata or opts.sponsorblock_mark) and opts.addchapters is None:
+    # Add chapters when adding metadata or marking sponsors
+    opts.addchapters = True
+```
+
+**关键逻辑：`addchapters` 的默认值是 `None`（不是 False）**，这是一个三态设计：
+- `None` — 未设置，由其他选项自动决定
+- `True` — 显式启用（`--embed-chapters`）
+- `False` — 显式禁用（`--no-embed-chapters`）
+
+自动开启的条件是：`addmetadata 或 sponsorblock_mark 为真` **且** `addchapters 为 None`。
+
+此外，在 [yt_dlp/options.py](yt_dlp/options.py) 中，`addchapters` 选项的定义：
+
+```python
+# --embed-chapters / --add-chapters
+'--embed-chapters', '--add-chapters', action='store_true', dest='addchapters', default=None
+
+# --no-embed-chapters / --no-add-chapters
+'--no-embed-chapters', '--no-add-chapters', action='store_false', dest='addchapters'
+```
+
+### 3.2 后处理器启用条件汇总
+
+| 后处理器 | 启用条件 | 配置来源 |
+|---------|---------|---------|
+| **SponsorBlockPP** | `sponsorblock_query` 非空 | `opts.sponsorblock_mark \| opts.sponsorblock_remove` |
+| **ModifyChaptersPP** | `remove_chapters` 非空 **或** `sponsorblock_query` 非空 | 章节删除 + SponsorBlock 标记/删除 |
+| **FFmpegMetadataPP** | `addmetadata` **或** `addchapters` **或** `embed_infojson` | 元数据嵌入 + 章节嵌入 + info.json |
+
+### 3.3 三个参数在 FFmpegMetadataPP 中的作用
+
+`FFmpegMetadataPP` 构造时接收三个独立开关（[yt_dlp/postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py#L664-L668)）：
+
+```python
+def __init__(self, downloader, add_metadata=True, add_chapters=True, add_infojson='if_exists'):
+    self._add_metadata = add_metadata
+    self._add_chapters = add_chapters
+    self._add_infojson = add_infojson
+```
+
+在 `run()` 中三者独立判断：
+- `self._add_chapters and info.get('chapters')` → 生成章节元数据文件
+- `self._add_metadata` → 生成通用 metadata 选项
+- `self._add_infojson` → MKV 附加 info.json
+
+因此可能出现 **FFmpegMetadataPP 已启用但 `add_chapters=False`** 的情况（如只嵌入通用元数据，不嵌入章节）。
+
+---
+
+## 4. 四种场景详细对比
+
+### 场景 A：仅标记片段 — `--sponsorblock-mark sponsor,intro`
+
+**选项状态：**
+- `sponsorblock_mark = {'sponsor', 'intro'}`
+- `sponsorblock_remove = set()`
+- `sponsorblock_query = {'sponsor', 'intro'}`
+- `addchapters` 初始为 `None` → 因 `sponsorblock_mark` 为真 → `addchapters = True`
+- `addmetadata = False`
+
+**启用的后处理器：**
+
+| 后处理器 | when | 是否启用 | 作用 |
+|---------|------|---------|------|
+| SponsorBlockPP | after_filter | ✅ | 获取片段，写入 `info['sponsorblock_chapters']` |
+| ModifyChaptersPP | post_process | ✅ | 合并 sponsor 章节到普通章节，生成标题，**不剪切视频** |
+| FFmpegMetadataPP | post_process | ✅ (`add_chapters=True`) | 将合并后的章节嵌入视频文件 |
+
+**ModifyChaptersPP 在无删除时的行为：**
+
+即使没有任何片段需要删除（`cuts` 为空），ModifyChaptersPP 仍然会：
+1. 将 `sponsorblock_chapters` 与 `chapters` 合并
+2. 通过最小堆算法按时间排序、处理重叠
+3. 执行 `_remove_tiny_rename_sponsors()`：
+   - 生成 SponsorBlock 章节标题（`[SponsorBlock]: ...`）
+   - 合并同类别的相邻章节
+4. 将结果写回 `info['chapters']`
+
+然后因为 `cuts` 为空，直接 `return [], info` —— **不调用 ffmpeg 剪切视频**。
+
+**最终效果：** 视频文件中包含 SponsorBlock 章节标记，但视频内容完整未剪切。
+
+---
+
+### 场景 B：仅删除片段 — `--sponsorblock-remove sponsor`
+
+**选项状态：**
+- `sponsorblock_mark = set()`
+- `sponsorblock_remove = {'sponsor'}`
+- `sponsorblock_query = {'sponsor'}`
+- `addchapters` 初始为 `None` → 因 `sponsorblock_mark` 为空 → **保持 `None`**
+- `addmetadata = False`
+
+**启用的后处理器：**
+
+| 后处理器 | when | 是否启用 | 作用 |
+|---------|------|---------|------|
+| SponsorBlockPP | after_filter | ✅ | 获取片段，写入 `info['sponsorblock_chapters']` |
+| ModifyChaptersPP | post_process | ✅ | 标记要删除的 sponsor 片段，**实际剪切视频** |
+| FFmpegMetadataPP | post_process | ❌ | `addchapters=None` 为 falsy，不启用 |
+
+**关键细节：为什么 FFmpegMetadataPP 不启用？**
+
+因为 `sponsorblock_remove` 为真不会触发 `addchapters = True`，只有 `sponsorblock_mark` 和 `addmetadata` 会触发。
+
+`FFmpegMetadataPP` 的启用条件：
+```python
+if opts.addmetadata or opts.addchapters or opts.embed_infojson:
+```
+`None` 在布尔上下文中为假，所以条件不成立。
+
+**最终效果：** 视频被剪切，广告片段被移除，但**章节信息不会被写入文件元数据**（视频文件本身没有章节标记）。
+
+---
+
+### 场景 C：标记 + 删除 — `--sponsorblock-mark all --sponsorblock-remove sponsor,intro`
+
+**选项状态：**
+- `sponsorblock_mark = {all 类别}`
+- `sponsorblock_remove = {'sponsor', 'intro'}`
+- `sponsorblock_query = {all 类别}`（并集）
+- `addchapters` 初始为 `None` → 因 `sponsorblock_mark` 为真 → `addchapters = True`
+
+**启用的后处理器：**
+
+| 后处理器 | when | 是否启用 | 作用 |
+|---------|------|---------|------|
+| SponsorBlockPP | after_filter | ✅ | 获取所有类别的片段 |
+| ModifyChaptersPP | post_process | ✅ | 删除 sponsor/intro 片段，保留其余作为章节 |
+| FFmpegMetadataPP | post_process | ✅ | 将保留的章节嵌入视频文件 |
+
+**数据流转：**
+1. SponsorBlockPP 获取所有类别片段
+2. ModifyChaptersPP 中，`sponsor` 和 `intro` 类别的章节被标记 `remove=True`
+3. `poi_highlight`、`chapter` 等不可删除类别仅作为章节标记
+4. 剪切视频后，剩余章节重新编号
+5. FFmpegMetadataPP 将最终章节嵌入文件
+
+**最终效果：** 广告片段被剪切，其余 SponsorBlock 标记（如 highlight、chapter）作为章节嵌入文件。
+
+---
+
+### 场景 D：标记但禁用章节嵌入 — `--sponsorblock-mark all --no-embed-chapters`
+
+**选项状态：**
+- `sponsorblock_mark = {all 类别}`
+- `addchapters = False`（显式设置，**不是 None**）
+- 自动开启条件：`sponsorblock_mark 为真 and addchapters is None` → **False**（不满足）
+
+**启用的后处理器：**
+
+| 后处理器 | when | 是否启用 | 作用 |
+|---------|------|---------|------|
+| SponsorBlockPP | after_filter | ✅ | 获取片段，写入 `info['sponsorblock_chapters']` |
+| ModifyChaptersPP | post_process | ✅ | 合并章节到 `info['chapters']`（内存中） |
+| FFmpegMetadataPP | post_process | ❌ | `addchapters=False`，不启用 |
+
+**关键细节：ModifyChaptersPP 仍会运行**
+
+ModifyChaptersPP 的启用条件是 `remove_chapters or sponsorblock_query`，与 `addchapters` 无关。只要有 `sponsorblock_query`（即使只有 mark 没有 remove），ModifyChaptersPP 都会被加入链中。
+
+它会将 SponsorBlock 章节合并到 `info['chapters']`，但因为没有后续的 FFmpegMetadataPP，这些章节**只存在于内存的 info 字典中，不会被写入视频文件**。
+
+**最终效果：**
+- 内存中 `info['chapters']` 包含 SponsorBlock 章节（可被后续后处理器或 `--print` 使用）
+- 视频文件中**没有**章节元数据
+- 视频内容完整未剪切
+
+---
+
+## 5. 选项-后处理器矩阵
+
+| 命令选项 | SponsorBlockPP | ModifyChaptersPP | FFmpegMetadataPP<br/>(add_chapters) | FFmpegMetadataPP<br/>(add_metadata) |
+|---------|:---:|:---:|:---:|:---:|
+| （无选项） | ❌ | ❌ | ❌ | ❌ |
+| `--sponsorblock-mark all` | ✅ | ✅ | ✅ | ❌ |
+| `--sponsorblock-remove sponsor` | ✅ | ✅ | ❌ | ❌ |
+| `--sponsorblock-mark all --sponsorblock-remove sponsor` | ✅ | ✅ | ✅ | ❌ |
+| `--embed-metadata` | ❌ | ❌ | ✅ | ✅ |
+| `--embed-metadata --sponsorblock-mark all` | ✅ | ✅ | ✅ | ✅ |
+| `--embed-chapters` | ❌ | ❌ | ✅ | ❌ |
+| `--no-embed-chapters --sponsorblock-mark all` | ✅ | ✅ | ❌ | ❌ |
+| `--embed-metadata --no-embed-chapters` | ❌ | ❌ | ❌ | ✅ |
+| `--remove-chapters "Intro"` | ❌ | ✅ | ❌ | ❌ |
+
+---
+
+## 6. SponsorBlockPP：片段标记机制
+
+文件：[yt_dlp/postprocessor/sponsorblock.py](yt_dlp/postprocessor/sponsorblock.py)
+
+### 6.1 分类体系
 
 ```python
 CATEGORIES = {
@@ -143,7 +340,7 @@ CATEGORIES = {
 }
 ```
 
-### 3.2 run() 流程（第 39-47 行）
+### 6.2 run() 流程（第 39-47 行）
 
 ```python
 def run(self, info):
@@ -157,7 +354,7 @@ def run(self, info):
     return [], info   # <-- 不删除任何文件，仅修改 info 字典
 ```
 
-### 3.3 API 调用：_get_sponsor_segments()（第 94-105 行）
+### 6.3 API 调用：_get_sponsor_segments()（第 94-105 行）
 
 使用 **SHA-256 哈希前缀查询**（隐私保护）：
 
@@ -176,7 +373,7 @@ def _get_sponsor_segments(self, video_id, service):
     return []
 ```
 
-### 3.4 片段过滤与转换：_get_sponsor_chapters()（第 49-92 行）
+### 6.4 片段过滤与转换：_get_sponsor_chapters()（第 49-92 行）
 
 **过滤逻辑 duration_filter**：
 - 跳过 (0,0) 整段视频标记
@@ -205,11 +402,11 @@ def to_chapter(s):
 
 ---
 
-## 4. ModifyChaptersPP：元数据改写与视频裁剪
+## 7. ModifyChaptersPP：元数据改写与视频裁剪
 
-文件：[modify_chapters.py](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/postprocessor/modify_chapters.py)
+文件：[yt_dlp/postprocessor/modify_chapters.py](yt_dlp/postprocessor/modify_chapters.py)
 
-### 4.1 run() 主流程（第 25-75 行）
+### 7.1 run() 主流程（第 25-75 行）
 
 ```python
 def run(self, info):
@@ -246,7 +443,7 @@ def run(self, info):
     return files_to_remove, info
 ```
 
-### 4.2 标记阶段：_mark_chapters_to_remove()（第 77-110 行）
+### 7.2 标记阶段：_mark_chapters_to_remove()（第 77-110 行）
 
 对两种章节来源分别打 `remove=True` 标记：
 
@@ -279,7 +476,7 @@ self._remove_sponsor_segments = set(remove_sponsor_segments or []) - set(Sponsor
 
 `poi_highlight` 和 `chapter` 类别无法被删除，只能标记。
 
-### 4.3 核心算法：_remove_marked_arrange_sponsors()（第 125-264 行）
+### 7.3 核心算法：_remove_marked_arrange_sponsors()（第 125-264 行）
 
 使用 **最小堆（priority queue）** 按 `start_time` 处理所有章节，处理 8 种重叠情况：
 
@@ -297,7 +494,7 @@ self._remove_sponsor_segments = set(remove_sponsor_segments or []) - set(Sponsor
 - `'_categories' in c` → 表示这是一个 SponsorBlock 章节（可能包含多个合并后的类别）
 - `c['cut_idx']` → 指向第一个落在该章节内的 cut，用于后续计算时长扣减
 
-### 4.4 后处理：_remove_tiny_rename_sponsors()（第 266-311 行）
+### 7.4 后处理：_remove_tiny_rename_sponsors()（第 266-311 行）
 
 - **微小章节合并**：时长 < 1s 且由切割产生的（`'_was_cut' in c` 或 `'_categories' in c`）章节被合并到相邻章节
 - **类别字段展开**：将内部的 `_categories` 列表展开为：
@@ -315,11 +512,11 @@ self._remove_sponsor_segments = set(remove_sponsor_segments or []) - set(Sponsor
 
 ---
 
-## 5. MetadataParserPP：通用元数据改写
+## 8. MetadataParserPP：通用元数据改写
 
-文件：[metadataparser.py](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/postprocessor/metadataparser.py)
+文件：[yt_dlp/postprocessor/metadataparser.py](yt_dlp/postprocessor/metadataparser.py)
 
-### 5.1 两种动作
+### 8.1 两种动作
 
 **INTERPRET** — 从模板解析字段（第 67-81 行）：
 
@@ -346,7 +543,7 @@ def replacer(self, field, search, replace):
     return f
 ```
 
-### 5.2 执行
+### 8.2 执行
 
 `run()` 方法依次执行所有 action，仅修改 `info` 字典，不触碰文件：
 
@@ -359,11 +556,11 @@ def run(self, info):
 
 ---
 
-## 6. FFmpegMetadataPP：元数据写入文件
+## 9. FFmpegMetadataPP：元数据写入文件
 
-文件：[ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/100-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L662-L820)
+文件：[yt_dlp/postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py#L662-L820)
 
-### 6.1 run() 流程（第 678-709 行）
+### 9.1 run() 流程（第 678-709 行）
 
 ```python
 def run(self, info):
@@ -393,7 +590,7 @@ def run(self, info):
     return [], info
 ```
 
-### 6.2 章节写入：_get_chapter_opts()（第 711-726 行）
+### 9.2 章节写入：_get_chapter_opts()（第 711-726 行）
 
 将 `info['chapters']`（其中包含 SponsorBlock 标记的章节）写入 FFMETADATA1 格式：
 
@@ -414,7 +611,7 @@ title=[SponsorBlock]: Sponsor
 
 然后通过 `-map_metadata 1` 将元数据文件映射到输出文件。
 
-### 6.3 通用元数据：_get_metadata_opts()（第 728-795 行）
+### 9.3 通用元数据：_get_metadata_opts()（第 728-795 行）
 
 字段映射表（部分）：
 
@@ -427,20 +624,25 @@ title=[SponsorBlock]: Sponsor
 | artist / uploader | artist |
 | genre / categories / tags | genre |
 | album / series | album |
-| meta_<key> / meta<i>_<key> | 自定义流元数据 |
+| meta_\<key\> / meta\<i\>_\<key\> | 自定义流元数据 |
 
 ---
 
-## 7. 数据流总结
+## 10. 数据流总结
 
 ```
 用户选项: --sponsorblock-mark all --sponsorblock-remove sponsor,intro
           |
           v
+validate_options() [yt_dlp/__init__.py]
+  ├─ sponsorblock_query = mark | remove
+  └─ addchapters = True (因 sponsorblock_mark 为真且 addchapters is None)
+          |
+          v
 get_postprocessors()
-  ├─ SponsorBlockPP (when=after_filter)
-  └─ ModifyChaptersPP (when=post_process, 必须在 FFmpegMetadataPP 之前)
-  └─ FFmpegMetadataPP (when=post_process)
+  ├─ SponsorBlockPP (when=after_filter, categories=all)
+  ├─ ModifyChaptersPP (when=post_process, remove_sponsor_segments={sponsor,intro})
+  └─ FFmpegMetadataPP (when=post_process, add_chapters=True, add_metadata=False)
           |
           v
 YouTube 提取器 → info dict
@@ -459,7 +661,7 @@ after_filter 阶段: SponsorBlockPP.run(info)
 post_process 阶段: ModifyChaptersPP.run(info)
   ├─ _mark_chapters_to_remove()
   │     ├─ chapters: 按正则打 remove=True
-  │     └─ sponsor_chapters: 按类别打 remove=True
+  │     └─ sponsor_chapters: 按类别打 remove=True (sponsor, intro)
   ├─ _remove_marked_arrange_sponsors()
   │     ├─ 最小堆处理 8 种重叠
   │     ├─ 计算 cuts[] 和 new_chapters[]
@@ -470,7 +672,7 @@ post_process 阶段: ModifyChaptersPP.run(info)
           v
 post_process 阶段: FFmpegMetadataPP.run(info)
   ├─ _get_chapter_opts(info['chapters']) → *.meta
-  ├─ _get_metadata_opts(info) → -metadata 选项
+  ├─ _get_metadata_opts(info) → -metadata 选项 (若 add_metadata=True)
   └─ ffmpeg 重混，章节和元数据嵌入文件
           |
           v
@@ -479,7 +681,7 @@ post_process 阶段: FFmpegMetadataPP.run(info)
 
 ---
 
-## 8. 关键设计要点
+## 11. 关键设计要点
 
 1. **阶段分离**：SponsorBlockPP 在 `after_filter`（下载前）获取数据，ModifyChaptersPP 在 `post_process`（下载后）执行剪切，避免不必要的下载。
 
@@ -487,9 +689,15 @@ post_process 阶段: FFmpegMetadataPP.run(info)
 
 3. **顺序保障**：ModifyChaptersPP 必须在 FFmpegMetadataPP **之前**运行（注释明确标注），因为剪切后的章节才是最终要嵌入的章节。
 
-4. **不可删除类别**：`NON_SKIPPABLE_CATEGORIES`（`poi_highlight`、`chapter`）只能用于生成章节标记，不能被视频剪切。
+4. **三态选项**：`addchapters` 使用 `None/True/False` 三态设计，`None` 表示未设置，可被 `sponsorblock_mark` 或 `addmetadata` 自动开启；`False` 表示显式禁用，优先级高于自动开启。
 
-5. **内部字段约定**：
+5. **不可删除类别**：`NON_SKIPPABLE_CATEGORIES`（`poi_highlight`、`chapter`）只能用于生成章节标记，不能被视频剪切。
+
+6. **ModifyChaptersPP 的双重作用**：即使没有任何删除操作，只要有 `sponsorblock_query` 就会启用 ModifyChaptersPP，负责将 SponsorBlock 章节合并到普通章节中并生成标题。
+
+7. **仅删除不嵌入**：只使用 `--sponsorblock-remove` 时，视频会被剪切但章节不会嵌入文件；只有 `--sponsorblock-mark` 才会自动触发 `addchapters = True`。
+
+8. **内部字段约定**：
    - `c['_categories']` — SponsorBlock 章节的原始类别列表（用于合并后追踪）
    - `c['remove']` — 标记该时间段需要被剪切
    - `c['cut_idx']` — 指向第一个落在该章节内的 cut 的索引
