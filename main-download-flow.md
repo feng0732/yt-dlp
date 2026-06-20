@@ -696,37 +696,181 @@ if success and full_filename != '-':
 
 因此，**即使所有子格式都下载成功（分文件完整存在于磁盘），只要 FFmpegMergerPP 合并失败**，就会 `return`，`__write_download_archive` 保持 `False`。
 
-### 10.6 重试影响分析：子格式部分成功但归档未写入
+### 10.6 重试影响分析：子格式文件存在性与续传机制
 
-#### 重试前的文件状态
+#### 10.6.1 重试前的文件状态分类
 
-假设外层格式组 `bestvideo+bestaudio`（format_id=`137+140`）：
-- 子格式 137（纯视频）：下载成功，文件为 `video.f137.mp4`（分文件）
-- 子格式 140（纯音频）：下载失败
-- 合并后的最终文件 `video.mp4`：不存在（合并从未开始或失败）
+假设外层格式组 `bestvideo+bestaudio`（format_id=`137+140`），重试前子格式文件有三种状态：
 
-#### 下次重试时发生了什么
+| 子格式文件状态 | 磁盘上存在的文件 | 说明 |
+|--------------|----------------|------|
+| **完全下载成功** | `video.f137.mp4`（无 `.part`） | 下载器 `try_rename` 已将 `.part` 重命名为最终文件名 |
+| **部分下载中断** | `video.f137.mp4.part` | 下载中途失败/中断，`.part` 文件仍保留 |
+| **从未下载** | 无 | 第一次失败在下载开始前（如 `_ensure_dir_exists`、网络错误等） |
 
-1. **归档检查（粒度 1）**：`in_download_archive` 检查 `extractor_key+video_id` → 归档未写入 → **不跳过**，重新进入下载流程
-2. **existing_video_file 检查（粒度 1）**：检查合并后的最终文件 `video.mp4` 和临时文件 `video.mp4.part`（[L3508](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3508)）→ 两者都不存在 → **继续下载**
-3. **子文件是否被复用？**
-   - `existing_video_file` **只检查合并后的最终文件名**，不检查分文件 `video.f137.mp4`
-   - 分文件 `video.f137.mp4` 如果在磁盘上，只有下载器自己的 `continuedl`（HTTP 续传）逻辑可能复用
-   - 但子文件使用的是 `temp_filename` 变体（如 `video.f137.mp4.f137.mp4`？不，`prepend_extension` 生成的文件名不含 `.part` 后缀）
-   - **实际行为**：分文件通常会被重新下载（如果有 `.part` 文件，HTTP 续传可能生效）
+关键区别：`existing_video_file`（粒度 1）只检查**合并后**的最终文件 `video.mkv` / `video.mp4`，不检查任何子格式文件。因此无论子格式文件处于哪种状态，只要合并文件不存在，就会进入下载流程。
 
-#### 重试场景完整表
+#### 10.6.2 下载器级别的续传检测：`FileDownloader.download()`
 
-| 失败位置 | 成功的子格式是否在磁盘 | 合并后文件 | 归档是否写入 | 重试行为 |
-|---------|---------------------|-----------|------------|---------|
-| `_ensure_dir_exists` 失败 | 否 | 否 | 否 | 重新下载全部子格式 |
-| 第 1 个子格式下载失败 | 否（第 1 个失败，第 2 个会继续尝试） | 否 | 否 | 重新下载全部子格式 |
-| 第 2 个子格式下载失败 | 是（第 1 个完整） | 否 | 否 | **重新下载全部子格式**（第 1 个虽在磁盘但不被检测，可能被覆盖或续传） |
-| 全部子格式下载成功，FFmpegMergerPP 合并失败 | 是（全部完整） | 否 | 否 | **重新下载全部子格式**（分文件存在但不被检测，可能被覆盖） |
-| FFmpegMergerPP 成功，post_hooks 失败 | 是（全部完整） | **是**（已合并） | 否 | `existing_video_file` 会检测到合并文件 → 跳过下载，只尝试后处理 |
-| 全部成功 | 是 | 是 | 是 | 归档命中 → 整个视频跳过 |
+位置：[common.py#L430-L455](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/common.py#L430-L455)
 
-#### `existing_file` 对于已存在分文件的行为
+```python
+def download(self, filename, info_dict, subtitle=False):
+    nooverwrites_and_exists = (
+        not self.params.get('overwrites', True)        # --no-overwrites
+        and os.path.exists(filename)                   # filename = 最终文件名（非 .part）
+    )
+    if not hasattr(filename, 'write'):
+        continuedl_and_exists = (
+            self.params.get('continuedl', True)        # 默认开启续传
+            and os.path.isfile(filename)               # ⚠️ 检查的是最终文件名
+            and not self.params.get('nopart', False)   # 未禁用 .part
+        )
+    if filename != '-' and (nooverwrites_and_exists or continuedl_and_exists):
+        self.report_file_already_downloaded(filename)
+        return True, False   # success=True, real_download=False
+```
+
+**核心发现**：`continuedl_and_exists` 检查的是 `os.path.isfile(filename)`——即**最终文件名**（如 `video.f137.mp4`），而不是 `.part` 临时文件。这意味着：
+
+- **子格式文件完全下载成功**（从 `.part` 已 rename）→ `os.path.isfile('video.f137.mp4')` 为 True → `continuedl` 命中 → **跳过，返回 `(True, False)`** → 零重试成本
+- **子格式文件部分下载**（仅 `.part` 存在）→ `os.path.isfile('video.f137.mp4')` 为 False → 不命中 → 进入 `real_download` → **由具体下载器的续传逻辑处理**
+- **子格式文件从未下载** → 同上，从头下载
+
+#### 10.6.3 HttpFD 的续传实现
+
+位置：[http.py#L24-L376](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/http.py#L24-L376)
+
+HttpFD 内部维护双层文件名：
+
+| 变量 | 值 | 用途 |
+|-----|---|------|
+| `ctx.filename` | `video.f137.mp4` | 最终目标文件名 |
+| `ctx.tmpfilename` | `video.f137.mp4.part` | 临时下载文件（由 `self.temp_name(filename)` 生成） |
+
+续传流程：
+
+```
+real_download(filename='video.f137.mp4', info_dict)
+│
+├─ ctx.tmpfilename = self.temp_name(filename) = 'video.f137.mp4.part'
+│
+├─ [continuedl=True] 且 os.path.isfile(ctx.tmpfilename):
+│   ├─ ctx.resume_len = os.path.getsize(ctx.tmpfilename)  ← 读取 .part 文件大小
+│   └─ ctx.is_resume = True
+│
+├─ establish_connection():
+│   ├─ [ctx.resume_len > 0] → 发送 Range: bytes=resume_len- 请求
+│   │   ├─ 服务器返回 Content-Range 且起始匹配 → ctx.open_mode = 'ab'（追加写入）
+│   │   ├─ 服务器返回 416 (Range Not Satisfiable):
+│   │   │   ├─ 无 Range 重试后 Content-Length ≈ resume_len (±100字节) → 视为已下载完
+│   │   │   │   → try_rename(.part → 最终名) → raise SucceedDownload → return True
+│   │   │   └─ Content-Length 不匹配 → report_unable_to_resume → 从头下载 (open_mode='wb')
+│   │   └─ 服务器不返回 Content-Range → 无法续传 → 从头下载 (open_mode='wb')
+│   └─ [ctx.resume_len == 0] → 正常下载 (open_mode='wb')
+│
+├─ download(): 循环读取数据写入 ctx.tmpfilename
+│
+└─ 成功后: self.try_rename(ctx.tmpfilename, ctx.filename)
+    → .part 文件重命名为最终文件名
+```
+
+**关键行为**：
+- `.part` 文件存在时，HttpFD 用 HTTP Range 头续传，**只下载剩余部分**
+- 服务器不支持 Range 时，放弃续传从头下载（覆盖 `.part`）
+- 416 + Content-Length ≈ 已有大小 → 视为已下载完成，直接 rename
+
+#### 10.6.4 FragmentFD（DASH/HLS native）的分片续传
+
+位置：[fragment.py#L26-L319](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/fragment.py#L26-L319)
+
+FragmentFD 使用 **`.ytdl` 簿记文件** 记录下载进度，实现分片级续传：
+
+```
+video.f137.mp4           ← 合并后的最终文件（成功后才 rename）
+video.f137.mp4.part      ← 临时合并文件（分片逐步追加写入）
+video.f137.mp4.part.ytdl ← 簿记文件（JSON，记录 fragment_index）
+video.f137.mp4.part-Frag0  ← 单个分片临时文件（下载完即合并后删除）
+video.f137.mp4.part-Frag1
+...
+```
+
+续传流程（`_prepare_frag_download`，[L157-L223](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/fragment.py#L157-L223)）：
+
+```
+_prepare_frag_download(ctx)
+│
+├─ tmpfilename = self.temp_name(ctx['filename']) = 'video.f137.mp4.part'
+├─ resume_len = self.filesize_or_none(tmpfilename)  ← .part 文件大小
+│
+├─ [__do_ytdl_file(ctx)]:
+│   ├─ ytdl_file_exists = os.path.isfile('video.f137.mp4.part.ytdl')
+│   │
+│   ├─ [continuedl=True 且 ytdl_file_exists]:
+│   │   ├─ _read_ytdl_file(ctx) → 读取 fragment_index
+│   │   ├─ 一致性检查: fragment_index > 0 但 resume_len == 0 → 不一致，从头开始
+│   │   └─ ytdl_corrupt → 从头开始
+│   │
+│   └─ [continuedl=False]:
+│       └─ fragment_index = resume_len = 0 → 从头开始
+│
+├─ [resume_len > 0] → open_mode = 'ab'（追加写入 .part）
+│
+└─ dest_stream = sanitize_open(tmpfilename, open_mode)
+    → 从 fragment_index 处继续下载分片，追加到 .part 文件
+```
+
+**分片级续传**：
+- 单个分片也支持续传：`_download_fragment` 中检查 `frag_resume_len = self.filesize_or_none(self.temp_name(fragment_filename))`（[L120-L122](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/fragment.py#L120-L122)）
+- 成功完成后删除 `.ytdl` 簿记文件，`try_rename(.part → 最终名)`
+
+#### 10.6.5 外部下载器的续传行为
+
+位置：[external.py#L42-L70](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/downloader/external.py#L42-L70)
+
+外部下载器的 `real_download` 接收 `filename`（最终文件名），内部用 `self.temp_name(filename)` 得到 `.part` 文件名，将 `.part` 传给 `_call_downloader`。成功后 `try_rename(.part → 最终名)`。
+
+| 下载器 | 续传标志 | 行为 |
+|--------|---------|------|
+| **curl** | `--continue-at -`（`continuedl=True` 时） | 自动续传 `.part` 文件 |
+| **aria2c** | `-c`（硬编码始终开启） | 始终尝试续传 `.part` 文件 |
+| **wget** | 无显式续传标志 | wget 默认对已有文件尝试续传 |
+| **FFmpegFD** | 无续传 | 不支持续传，每次从头下载 |
+
+**注意**：外部下载器的续传发生在 `.part` 文件级别。如果子格式已完全下载（`.part` 已 rename 为最终名），则 `FileDownloader.download()` 的 `continuedl_and_exists` 检查会先命中，直接返回 `(True, False)`，根本不会调用 `real_download`。
+
+#### 10.6.6 完整重试场景表（含续传与复用细节）
+
+以下表格基于 `continuedl=True`（默认开启续传）和 `overwrites=True`（默认允许覆盖）：
+
+| 失败位置 | 子格式 137 磁盘状态 | 子格式 140 磁盘状态 | 合并文件 | 归档 | 重试时子格式 137 的处理 | 重试时子格式 140 的处理 | 重试成本 |
+|---------|-------------------|-------------------|---------|------|----------------------|----------------------|---------|
+| `_ensure_dir_exists` | 无 | 无 | 无 | 否 | 从头下载 | 从头下载 | **全量** |
+| 第 1 个子格式下载失败（.part 不存在） | 无 | 未尝试 | 无 | 否 | 从头下载 | 从头下载 | **全量** |
+| 第 1 个子格式下载中断（.part 存在） | `video.f137.mp4.part` | 未尝试 | 无 | 否 | HttpFD/FragmentFD 续传 `.part` | 从头下载 | **部分** |
+| 第 2 个子格式下载失败 | `video.f137.mp4`（完整） | 无 | 无 | 否 | **`continuedl` 跳过**，返回 `(True, False)` | 从头下载 | **低**（仅音频） |
+| 第 2 个子格式下载中断 | `video.f137.mp4`（完整） | `video.f140.m4a.part` | 无 | 否 | **`continuedl` 跳过** | HttpFD/FragmentFD 续传 `.part` | **最低**（续传音频） |
+| 全部下载成功，FFmpegMergerPP 合并失败 | `video.f137.mp4`（完整） | `video.f140.m4a`（完整） | 无 | 否 | **`continuedl` 跳过** | **`continuedl` 跳过** | **最低**（仅重试合并） |
+| FFmpegMergerPP 成功，post_hooks 失败 | — | — | `video.mkv`（完整） | 否 | **`existing_video_file` 检测到** → 跳过整个下载 | 同左 | **仅后处理** |
+| 全部成功 | — | — | `video.mkv` | 是 | **归档命中** → 整个视频跳过 | 同左 | **零** |
+
+#### 10.6.7 复用/覆盖条件对重试成本的影响
+
+`overwrites` 和 `continuedl` 两个参数共同决定重试行为：
+
+| 参数组合 | 子格式完整文件存在时 | 子格式 .part 文件存在时 | 合并文件存在时 |
+|---------|-------------------|----------------------|-------------|
+| `overwrites=True, continuedl=True`（默认） | `continuedl` 跳过，零成本 | 续传 `.part`，部分成本 | `existing_video_file` 跳过，零成本 |
+| `overwrites=True, continuedl=False` | **不跳过**，从头覆盖 | **不续传**，从头覆盖 | `existing_video_file` 跳过，零成本 |
+| `overwrites=False, continuedl=True` | `nooverwrites` 跳过，零成本 | 续传 `.part`，部分成本 | `existing_video_file` 跳过（`nooverwrites` 更优先），零成本 |
+| `overwrites=False, continuedl=False` | `nooverwrites` 跳过，零成本 | **不续传**，从头覆盖 | `existing_video_file` 跳过，零成本 |
+
+**关键差异**：
+- `continuedl=True`（默认）是子格式级别复用的关键开关——只有开启时，已完整下载的子格式文件才会被跳过，部分下载的 `.part` 文件才会被续传
+- `continuedl=False` 时，子格式文件即使已完整存在也会被重新下载（但合并文件仍被 `existing_video_file` 保护）
+- `overwrites=False`（`--no-overwrites`）比 `continuedl` 更严格：只要文件存在就跳过，不区分完整/部分
+
+#### 10.6.8 `existing_file` 对已存在分文件的删除行为
 
 `existing_file` 方法（[L3320-L3328](file:///d:/fz/0601-2/solo-dogfeeding/code/83-yt-dlp/yt_dlp/YoutubeDL.py#L3320-L3328)）：
 
@@ -735,21 +879,22 @@ def existing_file(self, filepaths, *, default_overwrite=True):
     existing_files = list(filter(os.path.exists, orderedSet(filepaths)))
     if existing_files and not self.params.get('overwrites', default_overwrite):
         return existing_files[0]
-    for file in existing_files:        # ⚠️ 若允许覆盖，则删除已存在文件
+    for file in existing_files:
         self.report_file_delete(file)
         os.remove(file)
     return None
 ```
 
 `existing_video_file` 只传了 `full_filename` 和 `temp_filename`（合并后的文件），**没有传分文件路径**。因此：
-- 如果用户设置了 `--no-overwrites`：分文件不会被检测到，也不会被删除，但也不会被主动复用
-- 如果用户未设置 `--no-overwrites`（默认允许覆盖）：分文件同样不会被检测，因此不会被主动删除，但下载器写入同名文件时会覆盖原分文件
-- 只有分文件恰好带 `.part` 后缀且下载器支持续传时，才有可能断点续传
+- `overwrites=True`（默认）时：分文件不在检测列表中，不会被主动删除，但下载器写入同名 `.part` 文件时可能覆盖
+- `overwrites=False` 时：分文件同样不在检测列表中，不会被主动删除也不会被主动复用
 
-**总结**：子格式级别的部分成功在重试时几乎不会被利用，因为：
-1. 归档粒度是视频级（粒度 1），不是子格式级（粒度 3）
-2. `existing_video_file` 只检查合并后的最终文件（粒度 1）
-3. 分文件（粒度 3）没有独立的"已完成"标记机制
+**总结**：子格式级别的部分成功在重试时**可以被利用**，具体机制取决于文件状态和参数：
+
+1. **已完整下载的子格式文件**（无 `.part`）：由 `FileDownloader.download()` 的 `continuedl_and_exists` 检查自动跳过 → 零重试成本
+2. **部分下载的 `.part` 文件**：由具体下载器（HttpFD/FragmentFD/外部下载器）的续传逻辑处理 → 部分重试成本
+3. **从未下载的子格式**：从头下载 → 全量成本
+4. 归档粒度是视频级（粒度 1），不是子格式级（粒度 3），但 `continuedl` 在下载器层面提供了子格式级（粒度 3）的隐式复用能力
 
 ### 10.7 `record_download_archive` 实现
 
