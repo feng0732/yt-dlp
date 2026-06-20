@@ -1,8 +1,7 @@
 # yt-dlp 格式选择器代码实现分析
 
-核心代码位于 [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2337-L2681)，
-由 `build_format_selector(format_spec)` 方法驱动。该方法将格式选择表达式字符串解析为一棵选择器树，
-再编译为嵌套函数，最终以生成器模式产出候选格式。
+核心代码位于 `yt_dlp/YoutubeDL.py` 的 `build_format_selector(format_spec)` 方法。
+该方法将格式选择表达式字符串解析为一棵选择器树，再编译为嵌套函数，最终以生成器模式产出候选格式。
 
 ---
 
@@ -30,13 +29,11 @@ ctx = {
 }
 ```
 
-构建于 [_select_formats](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2305-L2311)。
+构建于 `YoutubeDL.py` 的 `_select_formats` 方法。
 
 ---
 
 ## 二、Token 清洗：`_remove_unused_ops`
-
-位于 [YoutubeDL.py#L2361-L2390](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2361-L2390)。
 
 将 token 流中的无用运算符（如 `-`）与相邻字符串拼接，保留的结构运算符仅有：
 
@@ -54,8 +51,6 @@ ctx = {
 
 ## 三、解析：`_parse_format_selection` 递归下降
 
-位于 [YoutubeDL.py#L2392-L2448](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2392-L2448)。
-
 ### 3.1 选择器类型 `FormatSelector`
 
 ```python
@@ -64,7 +59,7 @@ FormatSelector = namedtuple('FormatSelector', ['type', 'selector', 'filters'])
 
 | type | selector | 含义 |
 |------|----------|------|
-| `SINGLE` | 格式名如 `'best'`, `'mp4'`, `'137'` | 原子选择器 |
+| `SINGLE` | 格式名如 `'best'`, `'mp4'`, `'137'`, `'all'` | 原子选择器 |
 | `PICKFIRST` | `(first, second)` 元组 | `/` 回退 |
 | `MERGE` | `(selector_1, selector_2)` 元组 | `+` 合并 |
 | `GROUP` | 子选择器列表 | `()` 分组 |
@@ -108,8 +103,6 @@ FormatSelector = namedtuple('FormatSelector', ['type', 'selector', 'filters'])
 
 ## 四、候选回退机制：`/` (PICKFIRST)
 
-位于 [YoutubeDL.py#L2551-L2559](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2551-L2559)。
-
 ```python
 def selector_function(ctx):
     for f in fs:
@@ -142,8 +135,6 @@ def selector_function(ctx):
 
 ## 五、合并机制：`+` (MERGE)
 
-位于 [YoutubeDL.py#L2561-L2566](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2561-L2566)。
-
 ```python
 def selector_function(ctx):
     for pair in itertools.product(selector_1(ctx), selector_2(ctx)):
@@ -154,8 +145,6 @@ def selector_function(ctx):
 通常左右各只产出一个格式（如 `bv+ba`），此时只有一对合并结果。
 
 ### `_merge` 合并细节
-
-位于 [YoutubeDL.py#L2450-L2522](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2450-L2522)。
 
 1. 展开两边的 `requested_formats`（支持已合并格式的再合并）
 2. 根据多流策略过滤：
@@ -170,8 +159,6 @@ def selector_function(ctx):
 
 ## 六、多选机制：`,` (列表)
 
-位于 [YoutubeDL.py#L2540-L2546](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2540-L2546)。
-
 ```python
 def selector_function(ctx):
     for f in fs:
@@ -183,55 +170,143 @@ def selector_function(ctx):
 
 ### 示例
 
-`bv,ba` → 分别选出最佳视频和最佳音频，产出两个格式（不合并），用于独立下载。
+`bv,ba` → 分别选出最佳纯视频和最佳纯音频，产出两个格式（不合并），用于独立下载。
 
 ---
 
 ## 七、原子选择器：SINGLE
 
-位于 [YoutubeDL.py#L2568-L2636](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2568-L2636)。
-
 ### 7.1 格式名分类
 
 | 输入 | 匹配方式 | 示例 |
 |------|----------|------|
-| `best`/`worst`/`b`/`w` + 可选修饰 | 正则 `r'(?P<bw>best|worst|b|w)(?P<type>video|audio|v|a)?(?P<mod>\*)?(?:\.(?P<n>[1-9]\d*))?$'` | `bv`, `ba*`, `worst.2` |
+| `all` | 直接关键字匹配，输出全部格式 | `all` |
+| `mergeall` | 直接关键字匹配，合并全部有效格式 | `mergeall` |
+| `best`/`worst`/`b`/`w` + 可选修饰 | 正则 `r'(?P<bw>best\|worst\|b\|w)(?P<type>video\|audio\|v\|a)?(?P<mod>\*)?(?:\.(?P<n>[1-9]\d*))?$'` | `bv`, `ba*`, `worst.2`, `bv.2` |
 | 音频扩展名 | `_format_selection_exts['audio']` | `mp3`, `m4a`, `flac` 等 |
 | 视频扩展名 | `_format_selection_exts['video']` | `mp4`, `webm`, `mkv` 等 |
 | Storyboard 扩展名 | `_format_selection_exts['storyboards']` | `mhtml` 等 |
 | 其他 | 按 `format_id` 精确匹配 | `137`, `251` |
 
-### 7.2 best/worst 系列的过滤逻辑
+### 7.2 特殊原子：`all`
+
+```python
+if format_spec == 'all':
+    def selector_function(ctx):
+        yield from _check_formats(ctx['formats'][::-1])
+```
+
+**行为**：
+1. 直接对 `ctx['formats']` 进行倒序（`[::-1]`）——因为 extractor 原本按"最差→最优"排列，倒序后变为"最优→最差"
+2. 逐个通过 `_check_formats` 做可用性检查
+3. **产出所有可用格式**，数量为全部可用格式的总数
+
+**与过滤器的组合**：`all[ext=mp4]` 先由过滤器筛选出 ext=mp4 的格式，再全部倒序产出。
+
+### 7.3 特殊原子：`mergeall`
+
+```python
+elif format_spec == 'mergeall':
+    def selector_function(ctx):
+        formats = list(_check_formats(
+            f for f in ctx['formats']
+            if f.get('vcodec') != 'none' or f.get('acodec') != 'none'))
+        if not formats:
+            return
+        merged_format = formats[-1]               # 取最优格式作为起点
+        for f in formats[-2::-1]:                 # 剩余格式从次优到最差依次合并
+            merged_format = _merge((merged_format, f))
+        yield merged_format                       # 最终只产出一个超级合并格式
+```
+
+**行为**：
+1. 先过滤掉 `acodec==none 且 vcodec==none` 的 storyboard 等无效格式
+2. `ctx['formats']` 是按"最差→最优"排序，所以 `formats[-1]` 是最优格式
+3. 以最优格式为起点，从次优到最差依次调用 `_merge` 层层合并
+4. 最终只产出**一个合并结果**，包含所有视频/音频流的信息
+5. 受多流策略约束：若未启用 `--video-multistreams` / `--audio-multistreams`，`_merge` 内部会丢弃多余的同类型流，实际只保留一个视频流和一个音频流
+
+**典型用法**：`bv*+mergeall[vcodec=none]` + `--audio-multistreams` = 最佳含视频格式 + 合并所有纯音频格式（多音轨）。
+
+### 7.4 best/worst 系列的过滤逻辑
 
 ```
 格式:    {bw}{type?}{mod?}{.n?}
+           ↑    ↑     ↑    ↑
+         best/worst  v/a  *    .1 .2 .3...
 ```
 
 | 写法 | format_type | format_modified | 过滤条件 | 含义 |
 |------|-------------|-----------------|----------|------|
-| `b` | None | False | vcodec≠none AND acodec≠none | 最佳预合并 |
-| `w` | None | False | vcodec≠none AND acodec≠none | 最差预合并 |
-| `bv` | 'v' | False | acodec==none | 最佳纯视频 |
-| `ba` | 'a' | False | vcodec==none | 最佳纯音频 |
-| `b*` | None | True | True (不过滤) | 最佳任意格式 |
-| `bv*` | 'v' | True | vcodec≠none | 最佳含视频格式 |
-| `ba*` | 'a' | True | acodec≠none | 最佳含音频格式 |
+| `b` | None | False | vcodec≠none **AND** acodec≠none | 最佳预合并格式（音视频俱全） |
+| `w` | None | False | vcodec≠none **AND** acodec≠none | 最差预合并格式（音视频俱全） |
+| `bv` | `'v'` | False | **acodec==none** | 最佳**纯视频**（不含音频流） |
+| `ba` | `'a'` | False | **vcodec==none** | 最佳**纯音频**（不含视频流） |
+| `wv` | `'v'` | False | **acodec==none** | 最差纯视频 |
+| `wa` | `'a'` | False | **vcodec==none** | 最差纯音频 |
+| `b*` | None | True | True（不过滤） | 最佳任意格式 |
+| `w*` | None | True | True（不过滤） | 最差任意格式 |
+| `bv*` | `'v'` | True | **vcodec≠none** | 最佳含视频格式（可含音频） |
+| `ba*` | `'a'` | True | **acodec≠none** | 最佳含音频格式（可含视频） |
+| `wv*` | `'v'` | True | **vcodec≠none** | 最差含视频格式 |
+| `wa*` | `'a'` | True | **acodec≠none** | 最差含音频格式 |
+
+**`bv` vs `bv*` 的本质区别**：
+- `bv`（无星号，type=v，modified=False）→ 反向条件：**必须没有音频流**（`acodec == 'none'`），即视频流独立封装的纯视频轨道
+- `bv*`（有星号，type=v，modified=True）→ 正向条件：**只要有视频流就行**（`vcodec != 'none'`），包含预合并格式和纯视频轨道
+
+代码中这一分支通过三元选择链实现：
+```python
+_filter_f = (
+    (lambda f: f.get(f'{format_type}codec') != 'none')
+    if format_type and format_modified      # bv*, ba* → 正向：有该类编解码器
+    else (lambda f: f.get(f'{not_format_type}codec') == 'none')
+    if format_type                         # bv, ba → 反向：没有对立类编解码器
+    else (lambda f: ...)                    # b, w, b*, w* 的其余分支
+)
+```
 
 所有过滤器都附加一个**基础条件**：`vcodec≠none OR acodec≠none`，排除 storyboard 等无效格式。
 
-### 7.3 排序与选取
+### 7.5 序号修饰符 `.n`：`bv.2`、`ba.3` 等
+
+正则中的 `(?:\.(?P<n>[1-9]\d*))?` 捕获点号后的整数：
 
 ```python
-format_reverse = True  # best → 降序
-format_reverse = False # worst → 升序
-format_idx = 1         # 默认取第1个
-# best.2 → format_idx = 2, 取排序后第2个
+format_idx = int_or_none(mobj.group('n'), default=1)
+# ...
+yield matches[format_idx - 1]     # 取排序后第 format_idx 个（1-based → 0-based）
+```
+
+**`bv.2` 的完整流程**：
+1. 解析：`bv` → format_type=`'v'`, modified=False；`.2` → format_idx=2
+2. 过滤条件：`acodec==none`（纯视频）
+3. 候选倒序排列（`format_reverse=True`，best 从优到差）
+4. `matches[1]`（0-based 索引 1 = 1-based 第 2 个）→ 产出**第二佳纯视频格式**
+
+**组合示例**：
+| 写法 | 含义 |
+|------|------|
+| `bv` | 第 1 佳纯视频 |
+| `bv.2` | 第 2 佳纯视频 |
+| `bv.3` | 第 3 佳纯视频 |
+| `ba.2` | 第 2 佳纯音频 |
+| `worst.2` | 第 2 差预合并格式 |
+| `bv*.5` | 第 5 佳含视频格式 |
+
+### 7.6 排序与选取
+
+```python
+format_reverse = True   # best → 倒序（最优在前）
+format_reverse = False  # worst → 正序（最差在前）
+format_idx = 1          # 默认取第1个
+# bv.2 → format_idx = 2, 取排序后第2个
 ```
 
 排序依赖 `ctx['formats']` 的原始顺序（由 extractor 和 `--format-sort` / `-S` 参数预先排好），
 `best` 取倒序后第一个（即质量最高），`worst` 取正序第一个（即质量最低）。
 
-### 7.4 回退策略
+### 7.7 回退策略
 
 当主过滤无匹配时，有两条回退路径：
 
@@ -240,17 +315,16 @@ format_idx = 1         # 默认取第1个
 | `format_fallback=True` 且 `incomplete_formats=True` | `b`/`w` 在纯音频/纯视频站点 | 放宽为 `vcodec≠none OR acodec≠none` |
 | `seperate_fallback` 存在且 `has_merged_format=False` | 扩展名选择器（如 `mp4`）无匹配 | 对视频扩展名，回退为只要求 vcodec≠none |
 
-### 7.5 格式检查 `_check_formats`
+`format_fallback` 仅在**没有指定 type 也没有指定 `*` 修饰**时成立（即只对 `b`/`w`）。
+`bv`、`bv*`、`ba` 等带 type 或带 `*` 的写法**不会触发此回退**。
 
-位于 [YoutubeDL.py#L2524-L2537](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2524-L2537)。
+### 7.8 格式检查 `_check_formats`
 
 在最终选取前，过滤不可用格式（DRM 保护或需测试的格式会实际探测可用性）。
 
 ---
 
 ## 八、过滤器：`[...]`
-
-位于 [_build_format_filter](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2199-L2264) 和 [final_selector](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2640-L2645)。
 
 ### 8.1 两种过滤器语法
 
@@ -312,8 +386,6 @@ def final_selector(ctx):
 
 ### 默认格式规格
 
-位于 [_default_format_spec](file:///d:/fz/0601-2/solo-dogfeeding/code/84-yt-dlp/yt_dlp/YoutubeDL.py#L2313-L2335)。
-
 | 条件 | 默认规格 |
 |------|----------|
 | 输出到 stdout 或 ffmpeg 不可用 | `best/bestvideo+bestaudio` |
@@ -352,7 +424,51 @@ PICKFIRST
 解析树: [SINGLE("bv"), SINGLE("bv.2"), SINGLE("ba")]
 ```
 
-执行流程：依次选出最佳含视频、第2佳含视频、最佳纯音频，产出 3 个格式。
+执行流程：
+1. `bv` → 过滤条件 `acodec==none`（纯视频），倒序取第 1 个 → 产出最佳纯视频
+2. `bv.2` → 过滤条件 `acodec==none`（纯视频），倒序取第 2 个 → 产出第二佳纯视频
+3. `ba` → 过滤条件 `vcodec==none`（纯音频），倒序取第 1 个 → 产出最佳纯音频
+
+共产出 3 个格式，用于独立下载。
+
+### `bv*+ba+ba.2`（配合 `--audio-multistreams`）
+
+```
+解析树: MERGE(
+    SINGLE("bv*"),
+    MERGE(SINGLE("ba"), SINGLE("ba.2"))
+)
+```
+
+执行流程：
+1. `bv*` → 最佳含视频格式
+2. `ba` → 最佳纯音频
+3. `ba.2` → 第二佳纯音频
+4. 两次 MERGE 将三者合并为一个格式
+5. 若开启多音频流，合并结果保留两个音频轨道
+
+### `all[height<=480]`
+
+```
+解析树: SINGLE("all") with filter height<=480
+```
+
+执行流程：
+1. 过滤器先在上下文中过滤，只保留 height≤480 的格式
+2. `all` 将过滤后剩余的格式全部倒序（从优到差）产出
+3. 若需探测可用性，逐个通过 `_check_formats`
+
+### `mergeall`（默认不启用多流）
+
+```
+解析树: SINGLE("mergeall")
+```
+
+执行流程：
+1. 过滤掉 vcodec 和 acodec 均为 none 的无效格式
+2. 以最优格式（formats[-1]）为基底
+3. 从次优到最差依次与当前结果 `_merge`，由于默认不允许多流，每次合并实际只保留第一个视频和第一个音频
+4. 最终产出一个合并格式，其本质等同于选择了最优的视频格式和最优的音频格式
 
 ### `bestvideo[height<=?480]+bestaudio/worst`
 
@@ -366,5 +482,5 @@ PICKFIRST
 ```
 
 执行流程：
-1. 在高度 ≤480（或高度未知）的最佳纯视频中选最佳，与最佳纯音频合并
+1. 在高度 ≤480（或高度未知）的纯视频中选最佳，与最佳纯音频合并
 2. 失败 → 取最差预合并格式
