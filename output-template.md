@@ -438,20 +438,25 @@ def in_download_archive(self, info_dict):
 - 第二次检查命中：`__write_download_archive = 'ignore'`，`process_info` 直接 return
 - **两种情况都不会写入归档**
 
-#### 3.4.4 `__write_download_archive` 标记的五种取值时机
+#### 3.4.4 `__write_download_archive` 标记的取值时机
 
-此标记是归档写入决策的唯一依据。完整取值时机表：
+此标记是归档写入决策的核心依据。完整设置点表（按执行顺序排列）：
 
-| 场景 | 值 | 设置位置 | 说明 |
-|------|-----|----------|------|
-| 被 `_match_entry` 过滤 | `'ignore'` | `yt_dlp/YoutubeDL.py#L3341` | 视频 ID 已在归档中或被过滤条件排除 |
-| `simulate` 模式 | `force_write_download_archive` | `yt_dlp/YoutubeDL.py#L3371` | 模拟下载，由参数决定是否归档 |
-| `skip_download` 模式 | `force_write_download_archive` | `yt_dlp/YoutubeDL.py#L3457` | 跳过下载，由参数决定是否归档 |
-| `process_info` 正常走完 | `True` | `yt_dlp/YoutubeDL.py#L3667` | post_process 和 post_hooks 均未异常 return |
-| `force_write_download_archive=True` | `True`（强制覆盖） | `yt_dlp/YoutubeDL.py#L3670-L3671` | 无论前面设置为何值，强制改为 `True` |
-| （默认值，未设置） | `False` | `yt_dlp/YoutubeDL.py#L3140` | 通过 `f.get('__write_download_archive', False)` 获取 |
+| # | 场景 | 值 | 设置位置 | 执行条件 |
+|---|------|-----|----------|----------|
+| 1 | 被 `_match_entry` 过滤 | `'ignore'` | `yt_dlp/YoutubeDL.py#L3341` | `_match_entry()` 返回非 None（如视频已在归档） |
+| 2 | `simulate` 模式 | `force_write_download_archive` | `yt_dlp/YoutubeDL.py#L3371` | `simulate=True`，设置后立即 return |
+| 3 | `skip_download` 模式 | `force_write_download_archive` | `yt_dlp/YoutubeDL.py#L3457` | `skip_download=True`，设置后流程继续 |
+| 4 | 下载 + 后处理全部成功 | `True` | `yt_dlp/YoutubeDL.py#L3667` | `success=True` 且 post_process / post_hooks 无异常 |
+| 5 | force_write 兜底 | `True`（强制覆盖） | `yt_dlp/YoutubeDL.py#L3670-L3671` | `force_write_download_archive=True` 且流程未因异常 return |
+| 0 | （默认值，未设置） | `False` | `yt_dlp/YoutubeDL.py#L3140` | 通过 `f.get('__write_download_archive', False)` 获取 |
 
-**没有任何地方显式设置为 `False`**——`False` 仅作为 `dict.get()` 的默认值出现。
+**关键要点**：
+- 没有任何地方显式设置为 `False`——`False` 仅作为 `dict.get()` 的默认值
+- 设置点 1 和 2 之后会 `return`，后面的设置点走不到
+- 设置点 3 之后流程继续，设置点 5 可能再次覆盖（但值相同）
+- 设置点 4 和 5 都在下载分支内/外，需结合具体路径判断可达性
+- 详细可达性分析见 3.11 节
 
 ### 3.5 第三层：existing_file + overwrites — 文件系统检测
 
@@ -686,13 +691,15 @@ if True in write_archive and False not in write_archive:
 
 ### 3.9 各冲突层与归档写入的关系总结
 
-| 层次 | 是否阻止归档写入 | 机制 |
-|------|-----------------|------|
-| 第一层 SameFileError | **是** | 异常终止，整个流程中断 |
-| 第二层 download_archive（两次） | **是** | 设置 `__write_download_archive='ignore'` 后 return 或 break |
-| 第三层 existing_file（不覆盖） | **否** | 只跳过下载，不设置 False，流程继续 |
-| 第四层 MoveFilesAfterDownloadPP（不覆盖） | **否** | 只跳过移动，不抛异常，L3667 仍设为 True |
-| `force_write_download_archive=True` | **强制写入** | L3670-L3671 无条件覆盖为 True |
+| 层次 | 是否阻止归档写入 | 机制 | force_write 能覆盖吗？ |
+|------|-----------------|------|:---:|
+| 第一层 SameFileError | **是** | 异常终止，整个流程中断 | ✗（走不到） |
+| 第二层 download_archive（两次） | **是** | 设置 `'ignore'` 后 return 或 break | ✗（走不到） |
+| 第三层 existing_file（不覆盖） | **否** | 只跳过下载，流程继续到 post_process | ✓（L3670 兜底） |
+| 第四层 MoveFilesAfterDownloadPP（不覆盖） | **否** | 只跳过移动，不抛异常 | ✓（L3667 已设为 True） |
+| simulate / skip_download | 取决于 force_write | 不下载，由 force_write 决定标记值 | ✓（本身就是设置点） |
+
+**关键结论**：只有前两层（SameFileError、download_archive）能完全阻止归档写入，且 `force_write_download_archive` 对它们无效——因为 return/break 发生在 force_write 代码之前。
 
 ### 3.10 典型场景的最终状态
 
@@ -704,9 +711,223 @@ if True in write_archive and False not in write_archive:
 | 新视频，有同名文件 | - | None | 是（视频 default=False） | 是（移动 continue 不抛异常） | `True` | ✓ | ✗ 保留旧视频，辅助文件可能覆盖 |
 | 视频已在 archive | 包含 | 任意 | 是（第二层跳过） | 否（第二层 return） | `'ignore'` | ✗ | ✗ 跳过下载 |
 | 固定文件名 + 多 URL | - | 任意 | - | - | - | ✗ | ✗ 异常终止 |
-| 任何场景 + force_write | - | - | - | - | `True`（强制） | ✓ | 取决于上述场景 |
+| force_write=True（流程能走到时） | - | - | - | - | `True`（强制） | ✓ | 取决于上述场景 |
 
-**注意**：第三、四层不覆盖场景下，归档仍然会被写入。这意味着后续相同视频 ID 的下载会被第二层直接跳过，即使目标文件从未真正被替换。
+**注意**：
+1. 第三、四层不覆盖场景下，归档仍然会被写入。这意味着后续相同视频 ID 的下载会被第二层直接跳过，即使目标文件从未真正被替换。
+2. 表中最后一行"force_write=True"的前提是**流程能走到 force_write 代码**。archive 命中早退（前两层）时 force_write 完全走不到，见 3.11 节详细分析。
+
+### 3.11 force_write_download_archive 适用边界详解
+
+#### 3.11.1 force_write_download_archive 的五处代码位置
+
+`force_write_download_archive` 不是在一个地方统一处理，而是散落在代码的五个不同位置，各有各的作用场景和边界。
+
+| # | 位置 | 作用方式 | 所属路径 |
+|---|------|----------|----------|
+| 1 | `yt_dlp/YoutubeDL.py#L1935-L1936` | 直接调用 `record_download_archive()` | 扁平化提取（特殊路径） |
+| 2 | `yt_dlp/YoutubeDL.py#L3371` | 设置 `__write_download_archive` 标记 | simulate 模式 |
+| 3 | `yt_dlp/YoutubeDL.py#L3457` | 设置 `__write_download_archive` 标记 | skip_download 模式 |
+| 4 | `yt_dlp/YoutubeDL.py#L3667` | 设置 `__write_download_archive = True` | 正常下载后处理成功 |
+| 5 | `yt_dlp/YoutubeDL.py#L3670-L3671` | 强制覆盖为 `True` | 所有走到 process_info 末尾的路径 |
+
+**关键区别**：第 1 处直接写入归档（绕过 `__write_download_archive` 标记），第 2-5 处通过设置 `__write_download_archive` 标记间接影响归档写入决策。
+
+#### 3.11.2 四类路径下 force_write 的可达性分析
+
+以下按执行顺序排列，箭头表示"能否走到下一个设置点"。
+
+**路径一：archive 命中早退（完全走不到 force_write）**
+
+```
+process_info() 入口
+  ↓
+_match_entry() 命中 in_download_archive  [L3340]
+  ↓
+__write_download_archive = 'ignore'      [L3341]
+  ↓
+return  ←★ 直接退出函数 ★
+  ↓
+（以下全部走不到）
+  ├─ simulate 检查 [L3370]
+  ├─ skip_download 检查 [L3452]
+  ├─ L3667 下载完成设 True
+  └─ L3670 force_write 兜底
+```
+
+**早退点 1**：extract_info 中 `in_download_archive(temp_id)`（`yt_dlp/YoutubeDL.py#L1708-L1713`）
+- 行为：`break` 跳过该 URL，连 process_info 都不会调用
+- `force_write_download_archive`：**完全走不到**
+- 归档：不写入
+
+**早退点 2**：_match_entry 中 `in_download_archive`（`yt_dlp/YoutubeDL.py#L3340-L3342`）
+- 行为：设置 `'ignore'` 后 `return`，直接退出 process_info
+- `force_write_download_archive`：**完全走不到**（L3371、L3457、L3667、L3670 全在 return 之后）
+- 归档：不写入
+
+**结论**：archive 命中早退时，`force_write_download_archive=True` 也救不了——它连被执行的机会都没有。
+
+---
+
+**路径二：模拟下载（simulate=True）**
+
+```
+_match_entry() 通过（不在归档）
+  ↓
+if simulate:  [L3370]
+  ├─ __write_download_archive = force_write_download_archive  [L3371]
+  ├─ check_max_downloads()
+  └─ return  ←★ 退出函数 ★
+  ↓
+（以下走不到）
+  ├─ skip_download 检查 [L3452]
+  ├─ L3667 下载完成设 True
+  └─ L3670 force_write 兜底
+```
+
+- **L3371** 是此路径下唯一的 force_write 设置点
+- 之后立即 `return`，L3670 的兜底**走不到**
+- 归档写入完全取决于 `force_write_download_archive` 参数值：
+  - `True` → 写入
+  - `False/None` → 不写入
+
+**注意**：simulate 优先于 skip_download。如果两者同时为 True，走 simulate 路径，skip_download 的代码根本不会执行。
+
+---
+
+**路径三：跳过下载（skip_download=True）**
+
+```
+_match_entry() 通过
+  ↓
+simulate=False → 跳过
+  ↓
+if skip_download:  [L3452]
+  ├─ MoveFilesAfterDownloadPP（不移动）
+  ├─ __write_download_archive = force_write_download_archive  [L3457]
+  └─ ↓（继续向下，不 return）
+  ↓
+L3667（下载成功设 True）→ 走不到（在 else 块内）
+  ↓
+if force_write_download_archive:  [L3670]  ←★ 能走到 ★
+  └─ __write_download_archive = True
+  ↓
+check_max_downloads()
+  ↓
+process_info 返回
+```
+
+- **L3457** 是此路径的第一个 force_write 设置点
+- **L3670** 是此路径的第二个设置点（最终兜底）
+- L3667 走不到，因为它在 `else: # Download` 块内部
+- 两个设置点结果一致，都是取 `force_write_download_archive` 的值
+- 归档写入完全取决于 `force_write_download_archive` 参数值
+
+---
+
+**路径四：正常下载 + 后处理**
+
+```
+_match_entry() 通过
+  ↓
+simulate=False → 跳过
+  ↓
+skip_download=False → 进入 else 分支
+  ↓
+下载逻辑（可能成功可能失败）
+  ↓
+if success and full_filename != '-':
+  ├─ fixup()
+  ├─ post_process()
+  │    └─ 成功 → 继续
+  │    └─ 失败（PostProcessingError）→ return ←★ 退出，L3667 和 L3670 都走不到 ★
+  ├─ post_hooks
+  │    └─ 成功 → 继续
+  │    └─ 失败（Exception）→ return ←★ 退出，L3667 和 L3670 都走不到 ★
+  └─ __write_download_archive = True  [L3667]  ←★ 全部成功才执行 ★
+  ↓
+if force_write_download_archive:  [L3670]  ←★ 兜底，只要没 return 就会执行 ★
+  └─ __write_download_archive = True
+  ↓
+check_max_downloads()
+```
+
+**子路径 4a：下载 + 后处理全部成功**
+- L3667 设为 `True`
+- L3670 再次确认（force_write=True 时也是 True，结果不变）
+- 归档：写入
+
+**子路径 4b：post_process 失败（PostProcessingError）**
+- L3667 走不到
+- L3670 走不到（return 了）
+- `__write_download_archive`：保持默认 `False`
+- 归档：不写入
+
+**子路径 4c：post_hooks 失败（Exception）**
+- 同上，不写入
+
+**子路径 4d：同名文件且不覆盖（跳过下载，后处理继续）**
+- `existing_video_file` 返回已存在文件 → 跳过下载
+- `success` 仍为 `True`（下载没失败，只是没执行）
+- post_process 被调用（因为 success=True）
+- MoveFilesAfterDownloadPP：目标已存在且不覆盖 → warning + continue，不抛异常
+- post_hooks 正常执行
+- L3667 设为 `True`
+- L3670 兜底
+- 归档：写入（只要 post_process 和 post_hooks 不抛异常）
+
+**子路径 4e：download 本身失败（success=False）**
+- `success = False`
+- `_raise_pending_errors()` 只报告错误不抛异常 → 流程继续
+- `if success and full_filename != '-':` 条件不满足 → L3667 走不到
+- L3670 能走到（在 if 块外面）
+  - `force_write=True` → 设为 True → 归档写入
+  - `force_write=False/None` → 保持默认 False → 不写入
+- 归档：取决于 force_write
+
+#### 3.11.3 特殊路径：扁平化提取（extract_flat）
+
+位置：`yt_dlp/YoutubeDL.py#L1935-L1936`，在 `process_ie_result` 函数内。
+
+```python
+if result_type in ('url', 'url_transparent'):
+    ...
+    if extract_flat:
+        ...
+        if self.params.get('force_write_download_archive', False):
+            self.record_download_archive(info_copy)
+        return ie_result
+```
+
+**特点**：
+- 不经过 `process_info`，所以 _match_entry 检查也不会执行
+- 直接调用 `record_download_archive()`，绕过 `__write_download_archive` 标记
+- 扁平化提取模式下，视频信息不完整，只有 URL 和 ID
+- `force_write=True` 时直接写入归档，`False` 时不写入
+
+#### 3.11.4 可达性总表
+
+| 路径 | L3371 (simulate) | L3457 (skip) | L3667 (下载成功) | L3670 (兜底) | 归档写入 |
+|------|:---:|:---:|:---:|:---:|:---:|
+| archive 早退（extract_info） | ✗ | ✗ | ✗ | ✗ | ✗ |
+| archive 早退（_match_entry） | ✗ | ✗ | ✗ | ✗ | ✗ |
+| simulate=True | ✓ | ✗ | ✗ | ✗ | 取决于 force |
+| skip_download=True | ✗ | ✓ | ✗ | ✓ | 取决于 force |
+| 正常下载全部成功 | ✗ | ✗ | ✓ | ✓ | ✓（无论 force） |
+| 同名文件不覆盖 | ✗ | ✗ | ✓ | ✓ | ✓（无论 force） |
+| post_process 失败 | ✗ | ✗ | ✗ | ✗ | ✗ |
+| post_hooks 失败 | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 下载失败 + force=True | ✗ | ✗ | ✗ | ✓ | ✓ |
+| 下载失败 + force=False | ✗ | ✗ | ✗ | ✗ | ✗ |
+| 扁平化提取 + force=True | 不适用（不经过 process_info） | - | - | - | ✓（直接调用） |
+
+#### 3.11.5 关键结论
+
+1. **archive 命中早退时，force_write 完全无效**——连被执行的代码路径都走不到
+2. **simulate 和 skip_download 路径下，force_write 是归档写入的唯一决定因素**——没有其他地方会把标记设为 True
+3. **正常下载成功时，force_write 是多余的**——L3667 已经设为 True 了
+4. **L3670 的兜底只对部分异常路径有意义**——比如下载失败但 force_write=True 时
+5. **force_write 的核心用途**：在 simulate、skip_download 等"不真正下载"的场景下，强制写入归档，让后续下载能被去重
 
 ---
 
