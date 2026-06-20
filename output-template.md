@@ -1,137 +1,505 @@
-# yt-dlp 输出模板到文件命名处理路径详解
+# yt-dlp 输出模板到文件命名：代码路径追踪
 
-## 整体处理流程概览
-
-从输出模板字符串到最终文件名的完整处理路径如下：
-
-```
-输出模板字符串 (outtmpl)
-    ↓
-1. _parse_outtmpl()  —— 模板解析与默认值填充
-    ↓
-2. _outtmpl_expandpath()  —— 环境变量与波浪号展开
-    ↓
-3. prepare_outtmpl()  —— 模板变量解析、对象遍历、格式转换
-    ↓
-4. evaluate_outtmpl()  —— 模板最终求值
-    ↓
-5. _prepare_filename()  —— 文件名特殊处理（扩展名、长度裁剪）
-    ↓
-6. get_output_path()  —— 路径拼接与路径清理
-    ↓
-7. existing_file() / download_archive  —— 冲突检测与处理
-    ↓
-最终文件名
-```
+> **文档定位**：按代码执行路径，逐环节追踪「输出模板 → 变量展开 → 文件名清理 → 冲突处理 → 最终文件」的完整流程。每个环节附代码位置、分支条件、对最终结果的影响。
 
 ---
 
-## 一、输出模板解析与默认值
+## 第一部分：整体处理流程
 
-### 1.1 模板类型与默认值
+### 1.1 七步代码路径
 
-定义在 [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L2861-L2877)：
-
-```python
-DEFAULT_OUTTMPL = {
-    'default': '%(title)s [%(id)s].%(ext)s',
-    'chapter': '%(title)s - %(section_number)03d %(section_title)s [%(id)s].%(ext)s',
-}
-OUTTMPL_TYPES = {
-    'chapter': None,
-    'subtitle': None,
-    'thumbnail': None,
-    'description': 'description',
-    'annotation': 'annotations.xml',
-    'infojson': 'info.json',
-    'link': None,
-    'pl_video': None,
-    'pl_thumbnail': None,
-    'pl_description': 'description',
-    'pl_infojson': 'info.json',
-}
+```
+输出模板 (outtmpl)
+    ↓
+[1] _parse_outtmpl()         → 模板规范化、填充默认值
+    ↓                        [YoutubeDL.py#L1201-L1209]
+[2] _outtmpl_expandpath()    → 环境变量展开（含 %% 保护机制）
+    ↓                        [YoutubeDL.py#L1221-L1233]
+[3] prepare_outtmpl()        → 变量解析、对象遍历、格式转换
+    ↓                        [YoutubeDL.py#L1263-L1514]
+[4] evaluate_outtmpl()       → Python % 格式化最终求值
+    ↓                        [YoutubeDL.py#L1516-L1518]
+[5] _prepare_filename()      → 扩展名替换、长度裁剪
+    ↓                        [YoutubeDL.py#L1521-L1546]
+[6] get_output_path()        → 路径拼接、sanitize_path
+    ↓                        [YoutubeDL.py#L1211-L1218]
+[7] 冲突处理四层机制         → 见第二部分详细说明
+    ↓
+最终文件
 ```
 
-### 1.2 解析函数 `_parse_outtmpl`
+### 1.2 关键代码位置速查
 
-位置：[YoutubeDL.py#L1201-L1209](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1201-L1209)
-
-处理逻辑：
-1. 如果 `outtmpl` 不是字典，包装为 `{'default': outtmpl}`
-2. 对 `DEFAULT_OUTTMPL` 中的每个键，如果用户未指定则使用默认值
-3. 如果启用了 `restrictfilenames`，对默认模板进行简单的空格替换：
-   - `' - '` → `' '`
-   - `' '` → `'-'`
-
----
-
-## 二、环境变量与路径展开
-
-### 2.1 `_outtmpl_expandpath` 方法
-
-位置：[YoutubeDL.py#L1221-L1233](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1221-L1233)
-
-**关键设计：使用随机分隔符保护模板变量不被展开**
-
-处理步骤：
-1. 生成 32 位随机字母字符串作为分隔符 `sep`
-2. 将模板中的 `%%` 替换为 `%{sep}%`，`$$` 替换为 `${sep}$`
-3. 调用 `expand_path()` 展开环境变量和 `~`
-4. 移除分隔符，恢复 `%%` 和 `$$`
-
-这样做的原因：
-- `expand_path` 会展开 `%VAR%` 和 `$VAR` 形式的环境变量
-- 但模板变量 `%(title)s` 中的 `%` 和元数据中的 `$` 字符不应被展开
-- 通过临时占位符保护，确保只有模板字符串本身的路径变量被展开
-
-### 2.2 `expand_path` 函数
-
-位置：[_utils.py#L768-L770](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L768-L770)
-
-```python
-def expand_path(s):
-    """Expand shell variables and ~"""
-    return os.path.expandvars(compat_expanduser(s))
-```
-
----
-
-## 三、模板变量展开（核心）
-
-### 3.1 入口函数链
-
-| 函数 | 位置 | 作用 |
+| 环节 | 文件 | 行号 |
 |------|------|------|
-| `evaluate_outtmpl` | [YoutubeDL.py#L1516-L1518](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1516-L1518) | 对外接口，调用 prepare_outtmpl 后执行格式化 |
-| `prepare_outtmpl` | [YoutubeDL.py#L1263-L1514](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1263-L1514) | 核心：解析模板语法、遍历 info_dict、应用格式转换 |
+| 模板解析 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | [L1201-L1209](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1201-L1209) |
+| 路径展开 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | [L1221-L1233](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1221-L1233) |
+| 模板准备核心 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | [L1263-L1514](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1263-L1514) |
+| 文件名清理 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py) | [L631-L683](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L631-L683) |
+| 路径清理 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py) | [L706-L733](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L706-L733) |
+| 冲突检测 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | [L3320-L3328](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3320-L3328) |
+| 下载归档 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | [L3868-L3887](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3868-L3887) |
+| 文件移动 | [movefilesafterdownload.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py) | [L21-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py#L21-L52) |
+| 默认模板定义 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py) | [L2861-L2877](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L2861-L2877) |
 
-### 3.2 `prepare_outtmpl` 详细处理流程
+---
 
-#### 3.2.1 自动生成字段
+## 第二部分：文件名清理 — 三条独立分支
 
-在模板展开前，会向 `info_dict` 中注入以下自动生成的字段：
+`sanitize_filename` 函数有 **两个独立参数**，组合产生 **四种场景**。每条路径的代码分支完全独立。
 
-| 字段 | 说明 |
-|------|------|
-| `epoch` | Unix 时间戳，整个过程中保持一致 |
-| `duration_string` | 格式化的时长字符串（文件名中用 `-` 替代 `:`） |
-| `autonumber` | 自动编号，从 `autonumber_start` 开始 |
-| `video_autonumber` | 视频自动编号 |
-| `resolution` | 分辨率字符串（如 `1080p`） |
+### 2.1 函数签名与核心分支点
 
-#### 3.2.2 字段大小兼容性映射
+位置：[_utils.py#L631-L683](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L631-L683)
 
-对于以下字段，`%(field)s` 会自动转换为 `%(field)0Nd` 格式：
-- `playlist_index`: 位数由 `__last_playlist_index` 决定
-- `playlist_autonumber`: 位数由 `n_entries` 决定
-- `autonumber`: 位数由 `autonumber_size` 决定（默认 5 位）
+```python
+def sanitize_filename(s, restricted=False, is_id=NO_DEFAULT):
+```
 
-#### 3.2.3 模板语法解析
+**两个参数的独立影响：**
 
-使用正则表达式 `EXTERNAL_FORMAT_RE` 匹配 `%(key)format` 形式的模板变量。
+| 参数 | 控制维度 | 影响范围 |
+|------|----------|----------|
+| `restricted` | 字符集严格度 | 全角/半角、Unicode/ASCII、允许的特殊字符 |
+| `is_id` | 是否为标识符 | 首尾清理、重复字符合并、下划线处理 |
 
-内部格式正则 `INTERNAL_FORMAT_RE` 支持丰富的语法：
+### 2.2 分支一：默认模式（restricted=False, is_id=NO_DEFAULT）
 
+**触发条件**：既非受限模式，也不明确指定 `is_id=True/False`。这是 yt-dlp 的新规则。
+
+**代码路径：**
+
+```
+s = '输入字符串'
+    ↓
+[L661-L662] 跳过 NFKC 规范化（因为 restricted=False）
+    ↓
+[L663] 时间戳处理：0:12:34 → 0_12_34
+    ↓
+[L664] 逐字符调用 replace_insane(char):
+    ├─ [L641-L642] 跳过 ACCENT_CHARS（restricted=False）
+    ├─ [L643-L644] '\n' → '\0 '
+    ├─ [L645-L647] 特殊字符转全角：
+    │     '"'  → '＂' (U+FF02)
+    │     '*'  → '＊' (U+FF0A)
+    │     ':'  → '：' (U+FF1A)
+    │     '<'  → '＜' (U+FF1C)
+    │     '>'  → '＞' (U+FF1E)
+    │     '?'  → '？' (U+FF1F)
+    │     '|'  → '｜' (U+FF5C)
+    │     '/'  → '⧸' (U+29F8)
+    │     '\\' → '⧹' (U+29F9)
+    ├─ [L648-L649] '?'、控制字符(<32)、DEL(127) → 删除
+    ├─ [L650-L651] '"' → "'"
+    ├─ [L652-L653] ':' → '\0 \0-'（后续变为 ' -'）
+    ├─ [L654-L655] '\\/|*<>' → '\0_'（后续变为 '_'）
+    └─ [L656-L657] 跳过受限模式字符过滤
+    ↓
+[L665-L668] is_id=NO_DEFAULT 时的后处理：
+    ├─ [L666] 重复替换字符去重：\0_\0_ → \0_
+    └─ [L667-L668] 首尾清理：去掉首尾的替换字符、空格、_、-
+    ↓
+[L669] 移除 \0 标记，空则返回 '_'
+    ↓
+[L671-L682] 跳过 is_id 分支的清理（因为 is_id=NO_DEFAULT）
+    ↓
+返回结果
+```
+
+**对最终文件名的影响**：
+- 保留 Unicode 字符（中文、重音符号等）
+- 特殊字符转全角，视觉上保留原意
+- 路径分隔符替换为特殊 Unicode 字符，避免目录穿越
+- 不做 ID 字段的特殊保护
+
+### 2.3 分支二：受限模式（restricted=True）
+
+**触发条件**：`--restrict-filenames` 参数，或 `params['restrictfilenames']=True`。
+
+**代码路径：**
+
+```
+s = '输入字符串'
+    ↓
+[L661-L662] NFKC 规范化（Unicode 兼容等价）
+    ↓
+[L663] 时间戳处理：同上
+    ↓
+[L664] 逐字符调用 replace_insane(char):
+    ├─ [L641-L642] ACCENT_CHARS 重音映射表（[_utils.py#L99-L101]）
+    │     例：Ä→A, é→e, 中→_（非重音的 Unicode）
+    ├─ [L643-L644] 跳过换行处理（restricted=True）
+    ├─ [L645-L647] 跳过全角转换（restricted=True）
+    ├─ [L648-L649] '?'、控制字符、DEL → 删除
+    ├─ [L650-L651] '"' → 删除
+    ├─ [L652-L653] ':' → '\0_\0-'（后续变为 '_-_'）
+    ├─ [L654-L655] '\\/|*<>' → '\0_'（后续变为 '_'）
+    └─ [L656-L657] 更多字符过滤：
+          !&'()[]{}$;`^,#、空格、所有 Unicode → 删除或 '_'
+          组合字符(Unicode category C/M) → 删除
+    ↓
+[L665-L668] 重复替换字符去重 + 首尾清理（is_id=NO_DEFAULT 时）
+    ↓
+[L669] 移除 \0 标记
+    ↓
+[L671-L682] 非 ID 的额外清理：
+    ├─ [L672-L673] '__' → '_'
+    ├─ [L674] 首尾 '_' 去除
+    ├─ [L676-L677] 开头 '-_' 移除（处理 "外文 - 英文" 场景）
+    ├─ [L678-L679] 开头 '-' → '_'
+    ├─ [L680] 开头 '.' 移除
+    └─ [L681-L682] 空则 '_'
+    ↓
+返回结果
+```
+
+**对最终文件名的影响**：
+- 纯 ASCII，无任何 Unicode 字符
+- 文件名最短，空格和特殊字符都被替换或删除
+- 适用于需要兼容旧文件系统的场景
+
+### 2.4 分支三：ID 模式（is_id=True）
+
+**触发条件**：字段名匹配正则 `(^|[_.])id(\.|$)`，例如 `id`、`video_id`、`formats.0.id`。
+
+**判断位置**：[YoutubeDL.py#L1385-L1388](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1385-L1388)
+
+```python
+is_id = bool(re.search(r'(^|[_.])id(\.|$)', key))
+```
+
+**代码路径（与默认模式的差异）：**
+
+```
+... 前面的字符替换同上（受 restricted 影响）...
+    ↓
+[L665] 条件 is_id is NO_DEFAULT → False（因为 is_id=True）
+    ↓
+跳过 [L666-L668] 的重复替换字符去重和首尾清理
+    ↓
+[L669] 移除 \0 标记
+    ↓
+[L671] 条件 not is_id → False（因为 is_id=True）
+    ↓
+跳过 [L672-L682] 的所有清理
+    ↓
+直接返回结果
+```
+
+**对最终文件名的影响**：
+- 不合并重复下划线（如 `ab__cd` 保持不变）
+- 不清理首尾的 `-`、`.`、`_`
+- 最大限度保持 ID 的原始格式
+- 举例：`_n_cd26wFpw` → `_n_cd26wFpw`（不变）
+
+### 2.5 分支四：非 ID 模式（is_id=False）
+
+**触发条件**：`compat_opts` 包含 `filename-sanitization` 且字段不是 ID。
+
+**代码路径（与默认模式的差异）：**
+
+```
+... 字符替换同上 ...
+    ↓
+[L665] 条件 is_id is NO_DEFAULT → False（因为 is_id=False）
+    ↓
+跳过 [L666-L668]
+    ↓
+[L669] 移除 \0 标记
+    ↓
+[L671] 条件 not is_id → True
+    ↓
+执行 [L672-L682] 的所有清理：
+    - 合并连续下划线
+    - 去除首尾下划线
+    - 开头 `-` 转 `_`
+    - 去除开头 `.`
+    - 空值兜底
+    ↓
+返回结果
+```
+
+### 2.6 prepare_outtmpl 中 sanitize 的决策树
+
+位置：[YoutubeDL.py#L1390-L1400](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1390-L1400)
+
+```
+调用 prepare_outtmpl(..., sanitize=?)
+    ↓
+[L1390] sanitize 是 callable? → 弃用警告，继续使用
+    ↓
+[L1392] sanitize 是 False? → 不做任何清理
+    ↓
+[L1394] 三个条件同时满足？
+    ├─ 非 Windows 平台
+    ├─ restrictfilenames=False
+    └─ windowsfilenames=False
+    ├─ 是 → 极简清理：仅替换 '/'→'⧸' 和 '\0'→''
+    └─ 否 → 完整清理：调用 filename_sanitizer(key, value, restricted=?)
+        ↓
+        根据 key 正则判断 is_id，调用 sanitize_filename
+```
+
+### 2.7 文件名清理的调用时机
+
+位置：[YoutubeDL.py#L1500-L1508](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1500-L1508)
+
+仅对以下格式类型执行清理：
+- `c`（首字符）
+- `s`（字符串，默认）
+- `r`（repr 表示）
+- `a`（ASCII 表示）
+
+对 `d/i/f/e/g/l/j/h/q/B/U/D/S` 等格式不执行文件名清理。
+
+### 2.8 路径清理 sanitize_path
+
+位置：[_utils.py#L706-L733](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L706-L733)
+
+**Windows 特有处理：**
+- 解析 UNC 路径 `\\SERVER\SHARE`
+- 解析绝对路径 `C:\path`
+- 对每个路径段调用 `_sanitize_path_parts`：
+  - `.` → 跳过
+  - `..` → 上一级（弹出路径栈）
+  - 无效字符 `/<>:"\|\\?*` 或结尾空格/点 → 替换为 `#`
+
+**非 Windows：**
+- 默认返回原路径
+- `force=True` 时才执行清理
+
+---
+
+## 第三部分：冲突处理 — 四层机制协作
+
+### 3.1 四层机制总览
+
+四层机制在下载流程的 **不同阶段** 依次触发，共同决定最终文件是否产生。
+
+```
+下载启动
+    ↓
+[第一层] SameFileError 检测
+    时机：download() 开始时
+    作用：防止多个 URL 写入同一固定文件名
+    ↓
+[第二层] download_archive 检测（两次）
+    时机 1：extract_info() URL 解析时
+    时机 2：_match_entry() 过滤时
+    作用：基于视频 ID 的去重
+    ↓
+[第三层] existing_file + overwrites 检测
+    时机：process_info() 下载前
+    作用：文件系统级别的存在检测
+    ↓
+[第四层] MoveFilesAfterDownloadPP 检测
+    时机：post_process() 后处理时
+    作用：临时文件移动到最终位置时的检测
+    ↓
+最终文件
+```
+
+### 3.2 第一层：SameFileError — 固定文件名冲突
+
+**触发位置**：[YoutubeDL.py#L3697-L3702](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3697-L3702)
+
+**触发条件（同时满足）：**
+1. `len(url_list) > 1` — 有多个 URL
+2. `outtmpl != '-'` — 不是输出到 stdout
+3. `'%' not in outtmpl` — 模板中没有变量（固定文件名）
+4. `max_downloads != 1` — 不止下载一个
+
+**对最终文件的影响**：
+- 直接抛出 `SameFileError` 异常
+- 下载流程终止，**不产生任何文件**
+
+### 3.3 第二层：download_archive — 视频 ID 去重
+
+#### 3.3.1 第一次检查：URL 解析时
+
+位置：[YoutubeDL.py#L1708-L1713](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1708-L1713)
+
+```python
+temp_id = ie.get_temp_id(url)
+if temp_id is not None and self.in_download_archive({'id': temp_id, 'ie_key': key}):
+    # 报告已在归档中
+    if self.params.get('break_on_existing', False):
+        raise ExistingVideoReached  # 终止整个下载
+    break  # 跳过此视频
+```
+
+#### 3.3.2 第二次检查：_match_entry 过滤时
+
+位置：[YoutubeDL.py#L1645-L1650](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1645-L1650)
+
+```python
+if self.in_download_archive(info_dict):
+    reason = '... has already been recorded in the archive'
+    break_opt, break_err = 'break_on_existing', ExistingVideoReached
+    # 根据 break_on_existing 决定是否终止
+```
+
+#### 3.3.3 in_download_archive 实现
+
+位置：[YoutubeDL.py#L3868-L3874](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3868-L3874)
+
+```python
+def in_download_archive(self, info_dict):
+    if not self.archive:
+        return False
+    vid_ids = [self._make_archive_id(info_dict)]
+    vid_ids.extend(info_dict.get('_old_archive_ids') or [])
+    return any(id_ in self.archive for id_ in vid_ids)
+```
+
+**归档 ID 格式**：`make_archive_id(extractor_key, video_id)` → 如 `youtube dQw4w9WgXcQ`
+
+**对最终文件的影响**：
+- 视频被跳过，**不产生下载文件**
+- 可以产生辅助文件（描述、字幕等，取决于后续逻辑）
+- 如果 `force_write_download_archive=True`，即使跳过也写入归档
+
+#### 3.3.4 归档写入时机
+
+位置：[YoutubeDL.py#L3140-L3143](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3140-L3143)
+
+```python
+write_archive = {f.get('__write_download_archive', False) for f in downloaded_formats}
+# 值为 True 且无 False 时才写入
+if True in write_archive and False not in write_archive:
+    self.record_download_archive(info_dict)
+```
+
+`__write_download_archive` 的设置：
+- 被 `_match_entry` 过滤 → `'ignore'`（不写入）
+- `simulate` 模式 → `force_write_download_archive` 的值
+- `skip_download` 模式 → `force_write_download_archive` 的值
+- 正常下载完成 → `True`
+- `force_write_download_archive=True` → 强制 `True`
+
+### 3.4 第三层：existing_file + overwrites — 文件系统检测
+
+#### 3.4.1 overwrites 参数三态
+
+位置：[YoutubeDL.py#L291-L293](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L291-L293)
+
+| 值 | 视频文件 | 辅助文件 | default_overwrite |
+|----|----------|----------|-------------------|
+| `True` | 覆盖 | 覆盖 | - |
+| `None` | 不覆盖（默认） | 覆盖 | - |
+| `False` | 不覆盖 | 不覆盖 | - |
+
+#### 3.4.2 existing_file 核心逻辑
+
+位置：[YoutubeDL.py#L3320-L3328](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3320-L3328)
+
+```python
+def existing_file(self, filepaths, *, default_overwrite=True):
+    existing_files = list(filter(os.path.exists, orderedSet(filepaths)))
+    if existing_files and not self.params.get('overwrites', default_overwrite):
+        return existing_files[0]  # 不覆盖，返回已存在文件
+    
+    for file in existing_files:
+        self.report_file_delete(file)
+        os.remove(file)  # 覆盖，删除现有文件
+    return None
+```
+
+#### 3.4.3 视频文件检测：existing_video_file
+
+位置：[YoutubeDL.py#L3463-L3470](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3463-L3470)
+
+```python
+def existing_video_file(*filepaths):
+    ext = info_dict.get('ext')
+    converted = lambda file: replace_extension(file, final_ext or ext, ext)
+    # 同时检查原始扩展名和转换后的扩展名
+    file = self.existing_file(
+        itertools.chain(*zip(map(converted, filepaths), filepaths)),
+        default_overwrite=False  # 视频文件默认不覆盖
+    )
+```
+
+**调用时机**：
+- 多格式合并：[YoutubeDL.py#L3508](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3508)
+- 单文件下载：[YoutubeDL.py#L3575](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3575)
+
+**对最终文件的影响**：
+- 文件已存在且不覆盖 → 跳过下载，直接使用现有文件
+- 文件已存在且覆盖 → 删除现有文件，重新下载
+- 返回 `temp_filename`（`--no-part` 场景）→ 继续下载（断点续传）
+
+#### 3.4.4 辅助文件检测
+
+| 文件类型 | 检测位置 | default_overwrite |
+|----------|----------|-------------------|
+| 信息 JSON | [YoutubeDL.py#L4396](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L4396) | `True` |
+| 描述文件 | [YoutubeDL.py#L4425](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L4425) | `True` |
+| 网络快捷方式 | [YoutubeDL.py#L3418](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3418) | `True` |
+
+### 3.5 第四层：MoveFilesAfterDownloadPP — 文件移动检测
+
+位置：[movefilesafterdownload.py#L21-L52](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py#L21-L52)
+
+```python
+for oldfile, newfile in info['__files_to_move'].items():
+    if os.path.abspath(oldfile) == os.path.abspath(newfile):
+        continue  # 同一文件，跳过
+    if not os.path.exists(oldfile):
+        continue  # 源文件不存在，跳过
+    if os.path.exists(newfile):
+        if self.get_param('overwrites', True):
+            os.remove(newfile)  # 覆盖，删除目标
+        else:
+            continue  # 不覆盖，跳过移动
+    shutil.move(oldfile, newfile)
+```
+
+**对最终文件的影响**：
+- 不覆盖时：临时文件保留在临时目录，**不产生最终文件**
+- 覆盖时：删除目标文件，移动成功，**产生最终文件**
+
+### 3.6 四层机制协作时序图
+
+```
+YoutubeDL.download(url_list)
+├─ 第一层: SameFileError 检测 → 失败则终止
+└─ 对每个 URL:
+    YoutubeDL.extract_info(url)
+    ├─ 第二层(1): in_download_archive(temp_id) → 命中则跳过
+    └─ YoutubeDL.process_ie_result()
+        └─ YoutubeDL.process_info(info_dict)
+            ├─ 第二层(2): _match_entry() 中的 in_download_archive → 命中则跳过
+            ├─ 生成 full_filename, temp_filename
+            ├─ 写入辅助文件（描述、字幕等，各自检测 overwrites）
+            ├─ 第三层: existing_video_file() → 存在且不覆盖则跳过下载
+            ├─ 下载到 temp_filename
+            └─ YoutubeDL.post_process()
+                ├─ 格式转换等后处理
+                └─ 第四层: MoveFilesAfterDownloadPP → 移动文件到最终位置
+                    └─ 再次检测 overwrites
+```
+
+### 3.7 典型场景的最终文件状态
+
+| 场景 | archive | overwrites | 最终文件状态 |
+|------|---------|------------|-------------|
+| 新视频，无同名文件 | - | 任意 | ✓ 产生新文件，写入 archive |
+| 新视频，有同名文件 | - | True | ✓ 覆盖旧文件，写入 archive |
+| 新视频，有同名文件 | - | False | ✗ 保留旧文件，不下载，不写 archive |
+| 新视频，有同名文件 | - | None | ✗ 保留旧视频文件，辅助文件可能被覆盖 |
+| 视频已在 archive | 包含 | 任意 | ✗ 跳过下载，不写 archive |
+| 固定文件名 + 多 URL | - | 任意 | ✗ SameFileError，无文件 |
+
+---
+
+## 第四部分：变量展开核心逻辑
+
+### 4.1 模板语法解析
+
+位置：[YoutubeDL.py#L1304-L1313](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1304-L1313)
+
+内部格式正则：
 ```
 (?P<negate>-)?
 (?P<fields>{FIELD_RE})
@@ -144,295 +512,128 @@ def expand_path(s):
 )$
 ```
 
-支持的语法元素：
-- **对象遍历**：`%(formats.0.id)s` —— 使用点号遍历嵌套对象
-- **取反**：`-%(field)s` —— 数值取反
-- **数学运算**：`%(field+10)d` —— 支持 `+`、`-`、`*`
-- **日期格式化**：`%(upload_date>%Y-%m-%d)s` —— 使用 `>` 指定 strftime 格式
-- **替代字段**：`%(field1,field2)s` —— 使用 `,` 分隔，第一个为空则尝试下一个
-- **替换格式**：`%(field&replacement)s` —— 使用 `&`，值非空时使用 `replacement` 格式化
-- **默认值**：`%(field|default)s` —— 使用 `|`，值为空时使用默认值
+### 4.2 支持的语法元素
 
-#### 3.2.4 对象遍历 `_traverse_infodict`
-
-位置：[YoutubeDL.py#L1327-L1341](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1327-L1341)
-
-调用 `traverse_obj(info_dict, fields, traverse_string=True)` 进行深度遍历。
-
-`traverse_obj` 函数（定义在 [traversal.py#L38-L100](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/traversal.py#L38-L100)）支持：
-- 字典键访问
-- 列表/元组索引访问
-- 切片访问
-- 集合类型过滤
-- 字典转换（`{key1:path1,key2:path2}`）
-- 分支路径
-
-#### 3.2.5 格式转换类型
-
-| 格式字符 | 含义 |
-|----------|------|
-| `s` | 字符串（默认） |
-| `d`, `i` | 整数 |
-| `f`, `F`, `e`, `E`, `g`, `G` | 浮点数 |
-| `r` | repr 表示 |
-| `a` | ASCII 表示 |
-| `c` | 首字符 |
-| `l` | 列表格式（用 `, ` 或 `\n` 连接） |
-| `j` | JSON 格式 |
-| `h` | HTML 转义 |
-| `q` | Shell 引号转义 |
-| `B` | 字节格式化 |
-| `U` | Unicode 规范化（NFC/NFKC/NFD/NFKD） |
-| `D` | 十进制后缀（如 KB、MB） |
-| `S` | 文件名清理 |
-
-### 3.3 转义与最终求值
-
-#### 3.3.1 `escape_outtmpl`
-
-位置：[YoutubeDL.py#L1236-L1241](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1236-L1241)
-
-转义模板中剩余的 `%` 字符，避免 Python 字符串格式化时出错。
-
-#### 3.3.2 最终求值
-
-```python
-self.escape_outtmpl(outtmpl) % info_dict
-```
-
-使用 Python 原生的 `%` 字符串格式化操作完成最终替换。
-
----
-
-## 四、文件名清理规则
-
-### 4.1 `sanitize_filename` 函数
-
-位置：[_utils.py#L631-L683](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L631-L683)
-
-函数签名：
-```python
-def sanitize_filename(s, restricted=False, is_id=NO_DEFAULT):
-```
-
-#### 4.1.1 三种模式
-
-| 参数组合 | 模式 | 特点 |
-|----------|------|------|
-| `restricted=False, is_id=NO_DEFAULT` | 默认模式（新规则） | 保留 Unicode，特殊字符转全角 |
-| `restricted=True` | 受限模式 | 仅 ASCII，去除重音 |
-| `is_id=True` | ID 模式 | 尽量保持 ID 不变 |
-| `is_id=False` | 非 ID 模式 | 常规文件名清理 |
-
-#### 4.1.2 默认模式（新规则）清理规则
-
-1. **时间戳处理**：`0:12:34` → `0_12_34`（用正则匹配时间格式）
-2. **全角字符替换**：以下字符替换为对应的 Unicode 全角版本：
-   - `"` → `＂` (U+FF02)
-   - `*` → `＊` (U+FF0A)
-   - `:` → `：` (U+FF1A)
-   - `<` → `＜` (U+FF1C)
-   - `>` → `＞` (U+FF1E)
-   - `?` → `？` (U+FF1F)
-   - `|` → `｜` (U+FF5C)
-   - `/` → `⧸` (U+29F8)
-   - `\` → `⧹` (U+29F9)
-3. **控制字符删除**：`?`、ASCII 控制字符（< 32）、DEL（127）直接删除
-4. **冒号特殊处理**：非 restricted 模式下替换为 ` -`（空格+连字符）
-5. **路径分隔符处理**：`\ / | * < >` 替换为 `_`
-6. **重复替换字符去重**：连续的相同替换字符合并为一个
-7. **首尾清理**：移除开头和结尾的替换字符、空格、下划线、连字符
-8. **空值兜底**：如果结果为空，返回 `_`
-
-#### 4.1.3 受限模式（restricted）清理规则
-
-1. **Unicode 规范化**：使用 NFKC 规范化
-2. **重音字符转换**：使用 `ACCENT_CHARS` 映射表将带重音字符转换为 ASCII 对应字符
-   - 例如：`Ä` → `A`，`é` → `e`
-3. **更多字符删除或替换**：
-   - `! & ' ( ) [ ] { } $ ; ` ^ , #` 以及空格 → 删除或替换为 `_`
-   - 所有非 ASCII 字符 → 删除（如果是组合字符）或替换为 `_`
-4. **特殊处理**：
-   - 开头的 `-_` 前缀移除（处理 "外文歌名 - 英文歌名" 的常见情况）
-   - 开头的 `-` 替换为 `_`
-   - 开头的 `.` 移除
-   - 连续 `__` 合并为 `_`
-   - 首尾 `_` 去除
-
-#### 4.1.4 ID 模式特殊规则
-
-当 `is_id=True` 时：
-- 不执行重复替换字符去重
-- 不执行首尾清理
-- 不合并连续下划线
-- 尽量保持原始 ID 的格式
-
-默认情况下（`is_id=NO_DEFAULT`），根据字段名判断是否为 ID：
-- 字段名匹配 `(^|[_.])id(\.|$)` 时视为 ID
-
-位置：[YoutubeDL.py#L1384-L1388](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1384-L1388)
-
-### 4.2 文件名清理的调用时机
-
-在 `prepare_outtmpl` 中，当 `sanitize=True` 时：
-
-```python
-if sanitize:
-    if fmt[-1] == 'r':
-        value, fmt = repr(value), str_fmt
-    elif fmt[-1] == 'a':
-        value, fmt = ascii(value), str_fmt
-    if fmt[-1] in 'csra':
-        value = sanitize(last_field, value)
-```
-
-即对于 `c`、`s`、`r`、`a` 格式类型，会对值进行文件名清理。
-
-### 4.3 路径清理 `sanitize_path`
-
-位置：[_utils.py#L706-L733](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L706-L733)
-
-Windows 平台特有处理：
-- 解析 UNC 路径、绝对路径、相对路径
-- 对每个路径段调用 `_sanitize_path_parts`
-- 替换无效字符和结尾的点/空格为 `#`
-- 处理 `.` 和 `..` 路径段
-
----
-
-## 五、文件名生成与后处理
-
-### 5.1 `_prepare_filename`
-
-位置：[YoutubeDL.py#L1521-L1546](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1521-L1546)
-
-处理步骤：
-1. 根据 `tmpl_type` 或 `outtmpl` 参数选择模板
-2. 调用 `_outtmpl_expandpath` 展开路径
-3. 调用 `evaluate_outtmpl` 求值（`sanitize=True`）
-4. 处理扩展名：
-   - 对于 `''` 和 `'temp'` 类型：处理 `final_ext` 替换
-   - 对于其他类型：使用 `OUTTMPL_TYPES` 中定义的扩展名进行强制替换
-5. 文件名长度裁剪：如果设置了 `trim_file_name`，裁剪文件名（不含扩展名）到指定长度
-
-### 5.2 `prepare_filename`
-
-位置：[YoutubeDL.py#L1551-L1570](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1551-L1570)
-
-对外接口，在 `_prepare_filename` 基础上：
-1. 处理空文件名情况
-2. 处理 stdout 输出（`-`）
-3. 调用 `get_output_path` 拼接最终路径
-
-### 5.3 `get_output_path`
-
-位置：[YoutubeDL.py#L1211-L1218](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1211-L1218)
-
-```python
-def get_output_path(self, dir_type='', filename=None):
-    paths = self.params.get('paths', {})
-    path = os.path.join(
-        expand_path(paths.get('home', '').strip()),
-        expand_path(paths.get(dir_type, '').strip()) if dir_type else '',
-        filename or '')
-    return sanitize_path(path, force=self.params.get('windowsfilenames'))
-```
-
-路径结构：`{home}/{dir_type}/{filename}`
-
----
-
-## 六、文件命名冲突处理
-
-### 6.1 `overwrites` 参数
-
-位置：[YoutubeDL.py#L291-L293](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L291-L293)
-
-| 值 | 含义 |
-|----|------|
-| `True` | 覆盖所有视频和元数据文件 |
-| `None` | 只覆盖非视频文件（默认行为） |
-| `False` | 不覆盖任何文件 |
-
-兼容性：`nooverwrites` 参数与 `overwrites` 互为反义，两者保持同步。
-
-### 6.2 `existing_file` 方法
-
-位置：[YoutubeDL.py#L3320-L3328](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3320-L3328)
-
-```python
-def existing_file(self, filepaths, *, default_overwrite=True):
-    existing_files = list(filter(os.path.exists, orderedSet(filepaths)))
-    if existing_files and not self.params.get('overwrites', default_overwrite):
-        return existing_files[0]
-    
-    for file in existing_files:
-        self.report_file_delete(file)
-        os.remove(file)
-    return None
-```
-
-逻辑：
-1. 过滤出存在的文件路径
-2. 如果不允许覆盖且有文件存在，返回第一个存在的文件路径
-3. 如果允许覆盖，删除所有已存在的文件并返回 `None`
-
-### 6.3 下载归档 `download_archive`
-
-#### 6.3.1 加载归档
-
-位置：[YoutubeDL.py#L839-L857](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L839-L857)
-
-程序启动时从文件加载已下载视频的 ID 集合。
-
-#### 6.3.2 检查归档 `in_download_archive`
-
-位置：[YoutubeDL.py#L3868-L3874](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3868-L3874)
-
-检查视频 ID（包括 `_old_archive_ids`）是否在归档中。
-
-#### 6.3.3 记录归档 `record_download_archive`
-
-位置：[YoutubeDL.py#L3876-L3887](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3876-L3887)
-
-下载完成后将视频 ID 写入归档文件和内存集合。
-
-### 6.4 `SameFileError` 异常
-
-位置：[_utils.py#L1080-L1091](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py#L1080-L1091)
-
-触发条件（位置：[YoutubeDL.py#L3697-L3702](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3697-L3702)）：
-- 有多个 URL 需要下载
-- 输出模板不是 `-`（stdout）
-- 输出模板中不含 `%`（即固定文件名）
-- `max_downloads` 不是 1
-
-这种情况下多个文件会写入同一文件名，直接抛出异常。
-
-### 6.5 下载过程中的冲突处理
-
-在 `process_info` 函数（[YoutubeDL.py#L3331](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L3331)）中：
-
-1. 生成最终文件名 `full_filename` 和临时文件名 `temp_filename`
-2. 写入字幕、缩略图、信息 JSON 等辅助文件时检查覆盖
-3. 视频下载前调用 `existing_video_file` 检查是否已存在
-4. 下载完成后通过后处理将临时文件移动到最终位置
-
----
-
-## 七、关键代码速查表
-
-| 功能 | 文件 | 行号 |
+| 语法 | 示例 | 说明 |
 |------|------|------|
-| 模板解析 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L1201-L1209 |
-| 路径展开 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L1221-L1233 |
-| 模板准备（核心） | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L1263-L1514 |
-| 模板求值 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L1516-L1518 |
-| 文件名准备 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L1521-L1570 |
-| 输出路径生成 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L1211-L1218 |
-| 文件名清理 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py) | L631-L683 |
-| 路径清理 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py) | L706-L733 |
-| 冲突检测 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L3320-L3328 |
-| 下载归档 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py) | L3868-L3887 |
-| 对象遍历 | [traversal.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/traversal.py) | L38-L100 |
-| 默认模板定义 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/utils/_utils.py) | L2861-L2877 |
+| 对象遍历 | `%(formats.0.id)s` | 点号遍历嵌套对象 |
+| 取反 | `-%(view_count)s` | 数值取负 |
+| 数学运算 | `%(duration+10)d` | `+` `-` `*` 三种运算 |
+| 日期格式化 | `%(upload_date>%Y-%m-%d)s` | `>` 后接 strftime 格式 |
+| 替代字段 | `%(artist,uploader)s` | `,` 分隔，按序尝试 |
+| 替换格式 | `%(id&https://youtu.be/{})s` | `&` 后接替换模板 |
+| 默认值 | `%(uploader|Unknown)s` | `|` 后接默认值 |
+
+### 4.3 格式转换类型
+
+| 字符 | 含义 | 调用清理 |
+|------|------|----------|
+| `s` | 字符串（默认） | ✓ |
+| `d`, `i` | 整数 | ✗ |
+| `f`, `e`, `g` | 浮点数 | ✗ |
+| `r` | repr 表示 | ✓ |
+| `a` | ASCII 表示 | ✓ |
+| `c` | 首字符 | ✓ |
+| `l` | 列表格式 | ✗ |
+| `j` | JSON 格式 | ✗ |
+| `h` | HTML 转义 | ✗ |
+| `q` | Shell 引号转义 | ✗ |
+| `B` | 字节格式化 | ✗ |
+| `U` | Unicode 规范化 | ✗ |
+| `D` | 十进制后缀 | ✗ |
+| `S` | 文件名清理 | ✗（内部调用） |
+
+---
+
+## 第五部分：关键设计要点
+
+### 5.1 _outtmpl_expandpath 的 %% 保护机制
+
+位置：[YoutubeDL.py#L1221-L1233](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1221-L1233)
+
+**问题**：`expand_path` 会展开 `%VAR%`（Windows）和 `$VAR`（Unix）形式的环境变量，但模板变量 `%(title)s` 中的 `%` 和元数据中的 `$` 不应被展开。
+
+**解决方案**：
+1. 生成 32 位随机分隔符 `sep`
+2. `%%` → `%{sep}%`，`$$` → `${sep}$`
+3. 调用 `expand_path` 展开真正的环境变量
+4. 移除分隔符，恢复 `%%` 和 `$$`
+
+### 5.2 文件名中的 \0 标记机制
+
+在 `sanitize_filename` 的 `replace_insane` 中，许多替换结果包含 `\0` 字符：
+- `:` → `\0 \0-`（非 restricted）
+- `:` → `\0_\0-`（restricted）
+- `\ / | * < >` → `\0_`
+
+**作用**：
+1. 后续可以用 `\0.` 正则匹配这些替换
+2. `[L666]` 去重重复的替换字符
+3. `[L667-L668]` 从首尾清理
+4. `[L669]` 一次性移除所有 `\0`，得到最终的空格/下划线
+
+### 5.3 自动生成字段
+
+位置：[YoutubeDL.py#L1268-L1278](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1268-L1278)
+
+| 字段 | 说明 |
+|------|------|
+| `epoch` | Unix 时间戳，整个过程保持一致 |
+| `duration_string` | 时长字符串，文件名中用 `-` 替代 `:` |
+| `autonumber` | 自动编号，从 `autonumber_start` 开始 |
+| `video_autonumber` | 视频自动编号 |
+| `resolution` | 分辨率字符串 |
+
+### 5.4 字段大小兼容性映射
+
+位置：[YoutubeDL.py#L1282-L1286](file:///d:/fz/0601-2/solo-dogfeeding/code/95-yt-dlp/yt_dlp/YoutubeDL.py#L1282-L1286)
+
+以下字段的 `%(field)s` 自动转换为 `%(field)0Nd`：
+- `playlist_index`：位数由 `__last_playlist_index` 决定
+- `playlist_autonumber`：位数由 `n_entries` 决定
+- `autonumber`：位数由 `autonumber_size` 决定（默认 5）
+
+---
+
+## 第六部分：输入输出示例
+
+### 示例 1：默认模式文件名清理
+
+**输入**：`"Hello: World/Test?"`（标题字段）
+**代码路径**：`restricted=False, is_id=NO_DEFAULT`
+**输出**：`Hello - World⧸Test？`
+
+转换过程：
+- `:` → ` -`
+- `/` → `⧸` (U+29F8)
+- `?` → `？` (U+FF1F)
+
+### 示例 2：受限模式文件名清理
+
+**输入**：`"Hello: World/Test?"`
+**代码路径**：`restricted=True, is_id=NO_DEFAULT`
+**输出**：`Hello_-_World_Test`
+
+转换过程：
+- `:` → `_-_`
+- `/` → `_`
+- `?` → 删除
+- 首尾清理
+
+### 示例 3：ID 字段保持
+
+**输入**：`"_n_cd26wFpw"`
+**代码路径**：`is_id=True`
+**输出**：`_n_cd26wFpw`（完全不变）
+
+### 示例 4：冲突处理 — 不覆盖
+
+**配置**：`overwrites=False`
+**现有文件**：`./Video Title [dQw4w9WgXcQ].mp4`
+**结果**：报告已存在，跳过下载，保留原文件
+
+### 示例 5：冲突处理 — 覆盖
+
+**配置**：`overwrites=True`
+**现有文件**：`./Video Title [dQw4w9WgXcQ].mp4`
+**结果**：删除旧文件，下载新文件，写入归档
