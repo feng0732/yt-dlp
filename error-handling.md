@@ -238,9 +238,25 @@ def raise_no_formats(self, msg, expected=False, video_id=None):
 **注意：** 只有当 `expected=True` 时才会检查降级条件。
 如果 `expected=False`（非预期的无格式错误），直接抛出错误，不会降级。
 
-### 5.3 `UserNotLive` 的特殊处理
+### 5.3 等待直播异常的完整传播链
 
-位置：`yt_dlp/YoutubeDL.py#L1862-L1867`
+#### 5.3.1 `UserNotLive` 的性质
+
+位置：`yt_dlp/utils/_utils.py#L1049-L1054`
+
+`UserNotLive` 继承自 `ExtractorError`，其构造函数**强制设置** `expected=True`，
+所以它永远是预期错误，不会触发 bug 报告提示。
+
+```python
+class UserNotLive(ExtractorError):
+    def __init__(self, msg=None, **kwargs):
+        kwargs['expected'] = True
+        super().__init__(msg or 'The channel is not currently live', **kwargs)
+```
+
+#### 5.3.2 入口①：提取时抛出 `UserNotLive` 的传播顺序
+
+位置：`yt_dlp/YoutubeDL.py#L1860-L1867`
 
 ```python
 try:
@@ -248,17 +264,68 @@ try:
 except UserNotLive as e:
     if process:
         if self.params.get('wait_for_video'):
-            self.report_warning(e)  # 先报告警告
-        self._wait_for_video()     # 进入等待逻辑
-    raise  # 重新抛出，由外层装饰器处理
+            self.report_warning(e)
+        self._wait_for_video()     # ← 在 raise 之前执行
+    raise                           # ← 如果上面抛了异常，这行不会执行
 ```
 
-**流程：**
-1. 提取器抛出 `UserNotLive`
-2. 如果设置了 `wait_for_video`，先报告 Warning
-3. 调用 `_wait_for_video()` 进入等待
-4. 等待结束后抛出 `ReExtractInfo(expected=True)` 触发重新提取
-5. 重新提取成功则继续，失败则由 `_handle_extraction_exceptions` 处理
+**关键细节：`_wait_for_video()` 在 `raise` 之前被调用。**
+这决定了两种完全不同的传播路径：
+
+##### 路径 A：有 `wait_for_video` 参数
+
+| 步骤 | 发生了什么 | 异常状态 |
+|------|-----------|---------|
+| 1 | `ie.extract(url)` 抛出 `UserNotLive(expected=True)` | UserNotLive 在 except 块内被捕获 |
+| 2 | 有 `wait_for_video` → `self.report_warning(e)` 输出黄色警告 | 异常仍在 except 块内 |
+| 3 | 调用 `self._wait_for_video()`（**不传 ie_result 参数，使用默认值 `{}`**） | — |
+| 4 | `_wait_for_video({})` 内部检查通过（空 dict 无 formats/url）→ 进入等待循环 | — |
+| 5 | 等待结束（或 Ctrl+C）→ 抛出 `ReExtractInfo(expected=True)` | **ReExtractInfo 替代了 UserNotLive** |
+| 6 | 后面的 `raise`（重新抛出 UserNotLive）**永远不会被执行** | — |
+| 7 | ReExtractInfo 从 except 块向上传播到装饰器 `_handle_extraction_exceptions` | 当前异常：ReExtractInfo |
+| 8 | 装饰器匹配 `except ReExtractInfo` → 打印提示 → `continue` → **重新开始 while True 循环** | 重新调用 `__extract_info` |
+
+**结果：原始 UserNotLive 被 ReExtractInfo "吃掉"，进入重提取循环。**
+
+##### 路径 B：没有 `wait_for_video` 参数
+
+| 步骤 | 发生了什么 | 异常状态 |
+|------|-----------|---------|
+| 1 | `ie.extract(url)` 抛出 `UserNotLive(expected=True)` | UserNotLive 在 except 块内被捕获 |
+| 2 | 无 `wait_for_video` → 跳过 report_warning | 异常仍在 except 块内 |
+| 3 | 调用 `self._wait_for_video()` | — |
+| 4 | `_wait_for_video` 内部检查 `not self.params.get('wait_for_video')` → True → **直接 return，不抛异常** | — |
+| 5 | `raise` 执行 → **重新抛出原始的 UserNotLive** | 当前异常：UserNotLive |
+| 6 | UserNotLive 向上传播到装饰器 | — |
+| 7 | 装饰器中 UserNotLive 不匹配前几个 except → 匹配 `except ExtractorError` | — |
+| 8 | `self.report_error(str(e), ...)` → `trouble()` → 由 ignoreerrors 决定终止或继续 | 见第 4.2 节 |
+
+**结果：UserNotLive 被当作普通 ExtractorError 处理。**
+
+#### 5.3.3 入口②：提取成功但无 formats/url 的传播顺序
+
+位置：`yt_dlp/YoutubeDL.py#L1880-L1882`
+
+```python
+if process:
+    self._wait_for_video(ie_result)   # ← 传入实际的 ie_result
+    return self.process_ie_result(ie_result, download, extra_info)
+```
+
+这种情况发生在提取器返回了元数据（标题、描述等）但没有视频流地址时。
+
+| 步骤 | 发生了什么 | 异常状态 |
+|------|-----------|---------|
+| 1 | `ie.extract(url)` 成功返回 ie_result（无异常） | 无异常 |
+| 2 | 执行到 `self._wait_for_video(ie_result)`（**传入实际的 ie_result**） | — |
+| 3 | 内部检查通过（无 formats/url）→ 进入等待循环 | — |
+| 4 | 等待结束 → 抛出 `ReExtractInfo(expected=True)` | 当前异常：ReExtractInfo |
+| 5 | 这个异常没有被 `__extract_info` 内部任何 except 捕获，直接向上传播 | — |
+| 6 | 装饰器匹配 `except ReExtractInfo` → 打印提示 → `continue` → 重新提取 | 重新调用 `__extract_info` |
+
+**入口① vs 入口②的区别：**
+- 入口①调用 `_wait_for_video()` 不传参数（ie_result 默认为 `{}`），无法利用 release_timestamp 计算等待时间
+- 入口②调用 `_wait_for_video(ie_result)` 传入实际结果，可以根据 `release_timestamp` 或 `live_status == 'is_upcoming'` 精准计算等待时间
 
 ### 5.4 `_wait_for_video` 等待逻辑
 
@@ -269,13 +336,20 @@ except UserNotLive as e:
 - 结果类型是 `video`
 - 结果中没有 `formats` 和 `url`（即没有可下载的格式）
 
+**等待时间计算（入口②传入 ie_result 时）：**
+1. 优先使用 `release_timestamp - now`（精准的排期时间）
+2. 如果没有 release_timestamp 但 `live_status == 'is_upcoming'`，在 `[min_wait, max_wait]` 区间内随机取一个值
+3. 最终等待时间 = `min(max(计算值, min_wait), max_wait)`，夹在用户给定的范围内
+
 **等待结束方式：**
 - 定时到达 → 抛出 `ReExtractInfo('[wait] Wait period ended', expected=True)`
-- 用户按 Ctrl+C → 抛出 `ReExtractInfo('[wait] Interrupted by user', expected=True)`
+- 用户按 Ctrl+C → 被内部 `except KeyboardInterrupt` 捕获 → 立即抛出 `ReExtractInfo('[wait] Interrupted by user', expected=True)`（不等了，马上重试一次）
 
 **重新提取机制：**
-`_handle_extraction_exceptions` 装饰器捕获 `ReExtractInfo` 后，会重新执行提取函数。
-见 `yt_dlp/YoutubeDL.py#L1721-L1751`
+`_handle_extraction_exceptions` 装饰器是一个 `while True` 循环，捕获 `ReExtractInfo` 后 `continue`，从头重新调用被装饰的函数。见 `yt_dlp/YoutubeDL.py#L1721-L1751`
+
+**关于无限循环：**
+装饰器的 while True + ReExtractInfo 的组合理论上可以无限重提取。对于等待直播这是合理行为——用户设置 `--wait-for-video` 就是希望等到直播开始。用户可以在等待期间按 Ctrl+C 立即触发一次重提取，或在非等待期间按 Ctrl+C 中断整个程序。
 
 ### 5.5 无格式选择时的降级
 
@@ -482,13 +556,13 @@ if count > retries:
 | 属性 | 说明 |
 |------|------|
 | **所在层** | Layer B（YoutubeDL 调度层），但其降级效果影响 Layer A |
-| **入口①** | `__extract_info` 中捕获 `UserNotLive` — `yt_dlp/YoutubeDL.py#L1862-L1867`<br>→ 调用 `_wait_for_video()` → 抛出 `ReExtractInfo` |
-| **入口②** | `__extract_info` 提取成功后，结果无 formats/url — `yt_dlp/YoutubeDL.py#L1881`<br>→ 调用 `_wait_for_video(ie_result)` → 抛出 `ReExtractInfo` |
-| **入口③** | Layer A 中的降级判断 — `ignore_no_formats_error or wait_for_video` 条件<br>→ 影响是否抛出异常（见机制二） |
+| **入口①（捕获 UserNotLive）** | `__extract_info` 中 `except UserNotLive` 块 — `yt_dlp/YoutubeDL.py#L1860-L1869`<br>有 wait_for_video 参数时：`_wait_for_video()` 先抛出 ReExtractInfo，**替代原始异常**<br>无 wait_for_video 参数时：`_wait_for_video()` 直接 return，然后 `raise` 重新抛出 UserNotLive |
+| **入口②（提取后无格式）** | `__extract_info` 提取成功后，结果无 formats/url — `yt_dlp/YoutubeDL.py#L1880-L1882`<br>→ 调用 `_wait_for_video(ie_result)` → 抛出 `ReExtractInfo` |
+| **入口③（Layer A 降级条件）** | Layer A 中的降级判断 — `ignore_no_formats_error or wait_for_video` 条件<br>→ 影响是否抛出异常（见机制二） |
 | **触发条件** | `wait_for_video` 参数已设置，且视频无可用格式 |
 | **适用场景** | 预定直播尚未开始、即将上线的视频 |
-| **出口** | 等待结束 → 抛出 `ReExtractInfo(expected=True)`<br>→ 被 `_handle_extraction_exceptions` 捕获 → `continue` 重新执行 `__extract_info` |
-| **关键特点** | 这是一个**独立的重新提取循环**，与重试(RetryManager)无关<br>通过 `_handle_extraction_exceptions` 装饰器的 while True 循环实现 |
+| **出口** | 有 wait_for_video：等待结束 → 抛出 `ReExtractInfo(expected=True)`<br>→ 被 `_handle_extraction_exceptions` 捕获 → `continue` 重新执行 `__extract_info`<br>无 wait_for_video（入口①）：UserNotLive 作为普通 ExtractorError 传播 → `report_error()` → `trouble()` → 机制三 |
+| **关键特点** | 这是一个**独立的重新提取循环**，与重试(RetryManager)无关<br>通过 `_handle_extraction_exceptions` 装饰器的 while True 循环实现<br>入口①的 `_wait_for_video()` 在 `raise` 之前执行，有参数时会"吃掉"原始 UserNotLive |
 
 ### 9.3 各机制之间的影响关系
 
@@ -566,17 +640,20 @@ __extract_info 被 _handle_extraction_exceptions 装饰
 
 ### 9.5 `__extract_info` 内部的 wait_for_video 时序
 
-代码位于 `yt_dlp/YoutubeDL.py#L1857-L1882`：
+代码位于 `yt_dlp/YoutubeDL.py#L1857-L1884`：
 
 ```
-__extract_info(url, ie, ...)
+__extract_info(url, ie, ...)   ← 被 _handle_extraction_exceptions 装饰（while True 循环）
     │
     try:
         ie_result = ie.extract(url)     ←── Layer A 在此执行
-    except UserNotLive:                  ←── 入口①
-        if wait_for_video: report_warning(e)
-        _wait_for_video()               ←── 等待 → 抛出 ReExtractInfo
-        raise                           ←── 向装饰器传播
+    except UserNotLive as e:            ←── 入口①
+        if process:
+            if wait_for_video: report_warning(e)
+            _wait_for_video()           ←── 有参数时：等待 → 抛出 ReExtractInfo
+                                          ←── 无参数时：直接 return（不抛异常）
+        raise                           ←── 只有上面不抛异常时才执行
+                                          ←── 重新抛出 UserNotLive
     │
     ie_result 不为 None
     │
@@ -585,13 +662,38 @@ __extract_info(url, ie, ...)
         return process_ie_result(...)
 ```
 
-**注意：** 入口①和入口②都会抛出 `ReExtractInfo`，
-但入口①的 `raise` 会**先**向上传播 `UserNotLive`，
-只有当装饰器不匹配该异常类型时才会被外层处理。
-实际上 `UserNotLive` 是 `ExtractorError` 的子类，
-所以装饰器会在 `ExtractorError` 分支处理它，
-调用 `report_error()` → `trouble()` → 机制三。
-而 `_wait_for_video()` 抛出的 `ReExtractInfo` 会在装饰器的 `ReExtractInfo` 分支触发重提取。
+**入口①的关键时序（有 wait_for_video 参数）：**
+
+1. `ie.extract(url)` 抛出 `UserNotLive`
+2. 进入 except 块，执行 `report_warning(e)`（如果有参数）
+3. 调用 `_wait_for_video()`——**此时 except 块还没有结束**
+4. `_wait_for_video()` 内部等待完毕，抛出 `ReExtractInfo(expected=True)`
+5. **这个 ReExtractInfo 从 except 块内部抛出，覆盖了原来捕获的 UserNotLive**
+6. 后面的 `raise` 语句**永远不会被执行**（因为 Python 在 except 块内遇到新异常会中断当前 except 块）
+7. ReExtractInfo 向上传播到装饰器的 `except ReExtractInfo` 分支 → `continue` → 重提取
+
+**入口①的关键时序（无 wait_for_video 参数）：**
+
+1. `ie.extract(url)` 抛出 `UserNotLive`
+2. 进入 except 块
+3. 调用 `_wait_for_video()` → 内部检查无参数 → 直接 return
+4. `raise` 执行，重新抛出原始 `UserNotLive`
+5. UserNotLive（是 ExtractorError 子类）向上传播到装饰器的 `except ExtractorError` 分支
+6. `report_error()` → `trouble()` → 机制三（ignoreerrors）
+
+**入口②的时序（提取成功但无 formats）：**
+
+1. `ie.extract(url)` 正常返回 ie_result（无异常）
+2. 执行到 `if process:` 块
+3. 调用 `_wait_for_video(ie_result)`——**注意这里传入了实际的 ie_result**，可以利用 release_timestamp
+4. 内部检查无 formats/url → 等待 → 抛出 `ReExtractInfo`
+5. 这个异常没有被 `__extract_info` 内部任何 except 捕获，直接向上传播
+6. 装饰器的 `except ReExtractInfo` 分支 → `continue` → 重提取
+
+**总结：入口①和入口②的区别**
+- 入口①：`_wait_for_video()` 不传参数（默认 `{}`），无法利用 release_timestamp 计算等待时间
+- 入口②：`_wait_for_video(ie_result)` 传实际结果，可根据 `release_timestamp` 精准等待
+- 两者最终都是通过抛出 `ReExtractInfo` 触发重提取循环
 
 ### 9.6 `trouble()` 的完整分支
 
