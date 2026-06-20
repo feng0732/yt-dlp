@@ -204,7 +204,7 @@ if not expires_utc:
 - **持久 Cookie**：`expires_utc` 为非零整数时直接使用其值
 - **边界模糊**：`not expires_utc` 的判断覆盖了 `0`、`None`、空值等全部 falsy 值，这些都会被当作会话 Cookie 处理
 
-> 注意：代码中**未对 `expires_utc` 做单位转换**。Chromium `cookies` 表的 `expires_utc` 为微秒级时间戳（基于 FILETIME epoch 或 Unix epoch 取决于具体版本），而 Python `http.cookiejar.Cookie` 的 `expires` 期望的是秒级 POSIX 时间戳。实际使用中 Chromium 版本差异可能导致过期时间量级偏差。
+> **事实核对**：代码中**未对 `expires_utc` 做任何单位或 epoch 转换**。Chromium `cookies` 表的 `expires_utc` 是 **FILETIME 格式**——自 `1601-01-01 UTC` 起的**微秒**数，而 Python `http.cookiejar.Cookie` 的 `expires` 期望的是自 `1970-01-01 UTC` 起的**秒**数。因此除会话 Cookie 外，所有持久 Cookie 的过期时间都会被解释为约公元 30000 年以后，实际上等于「永不过期」。这与浏览器原生行为存在巨大偏差，但实际使用中由于 yt-dlp 是短生命周期程序，通常不会触发过期判断，因此问题不明显。
 
 **域名（host_key → domain / domain_specified / domain_initial_dot）**：
 
@@ -272,10 +272,12 @@ Safari 使用自定义的二进制格式 `Cookies.binarycookies`，结构为：
 
 [YoutubeDLCookieJar](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1276-L1420) 继承自 `http.cookiejar.MozillaCookieJar`，[load()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1354-L1403) 方法：
 
-1. 逐行预处理：识别 `#HttpOnly_` 前缀并去除；跳过注释和空行；校验每行恰好 7 个 tab 分隔字段；校验 expires 格式
+1. 逐行预处理：识别 `#HttpOnly_` 前缀并去除（但**未将 HttpOnly 属性存入 Cookie 对象**）；跳过注释和空行；校验每行恰好 7 个 tab 分隔字段；校验 expires 格式
 2. 若文件被误识别为 JSON 格式，抛出明确错误提示
 3. 调用父类 `_really_load()` 解析 Netscape 格式
 4. 将 `expires=0` 的 Cookie 标记为会话 Cookie（`discard=True`，`expires=None`），补齐 Python 标准库的缺陷
+
+> **事实核对**：`prepare_line()` 中仅仅是 `line = line[len(self._HTTPONLY_PREFIX):]` 去掉了前缀，但没有调用任何方法将 HttpOnly 标志设置到 Cookie 对象上。父类 `MozillaCookieJar._really_load()` 也不支持 HttpOnly 属性。同时，[`_really_save()`](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1312-L1331) 在写回文件时也不会添加 `#HttpOnly_` 前缀。因此，**文件加载路径同样不保留 HttpOnly 属性**——`#HttpOnly_` 前缀只是为了兼容 curl 的文件格式，避免解析错误，而非真正保留该安全属性。
 
 [save()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1333-L1352) 方法在下载完成后被调用，将 jar 中的 Cookie 写回文件（会话 Cookie 的 expires 写为 0）。
 
@@ -350,12 +352,12 @@ for cookie in self:
 | domain_initial_dot | `host_key.startswith('.')` | `host.startswith('.')` | `domain.startswith('.')` | 由父类设置 |
 | path | ✓ 原封传入 | ✓ 原封传入 | ✓ 原封传入 | ✓ 原封传入 |
 | secure | is_secure / secure 列动态适配 | isSecure 列 | flags 位运算 | https_only 列 |
-| expires | 0 → None，其余原样 | 原样传入（毫秒级需除以 1000） | Mac Absolute Time → POSIX | 0 → None，其余原样 |
+| expires | 0 → None，其余原样（FILETIME 微秒直接作 POSIX 秒使用） | 原样传入（毫秒级需除以 1000） | Mac Absolute Time → POSIX | 0 → None，其余原样 |
 | discard | 恒 False | 恒 False | 恒 False | 会话 Cookie 为 True |
-| HttpOnly | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✓ 行前缀 `#HttpOnly_` |
+| HttpOnly | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✗ 仅去除前缀 `#HttpOnly_`，未设置属性 |
 | SameSite | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✗ 不支持 |
 
-> **关键观察**：浏览器来源都不保留 HttpOnly 和 SameSite 属性，只有 Netscape 文件格式通过行前缀 `#HttpOnly_` 保留 HttpOnly 标记。这意味着从浏览器导入的 Cookie 在 yt-dlp 中**全部表现为非 HttpOnly**，这在安全属性上比浏览器原生环境更宽松。
+> **关键观察**：**所有四个来源都不保留 HttpOnly 和 SameSite 属性**。浏览器来源的 SQL 查询未选择 `is_httponly`、`samesite` 等字段；文件来源仅在解析时去除 `#HttpOnly_` 前缀以避免解析错误，但没有将 HttpOnly 标志存入 Cookie 对象。这意味着 yt-dlp 中所有导入的 Cookie 都表现为非 HttpOnly、无 SameSite 限制，在安全属性上比浏览器原生环境显著宽松。
 
 ---
 
