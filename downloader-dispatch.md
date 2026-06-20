@@ -256,7 +256,7 @@ def get_suitable_downloader(info_dict, params={}, default=NO_DEFAULT, protocol=N
 **适用场景**：
 - 非直播 HLS (`m3u8_native` 协议)
 - 无 DRM 保护（FairPlay/PlayReady/Flash Access）
-- 加密方式仅为 NONE 或 AES-128（若 pycryptodomex 不可用会警告并降级）
+- 加密方式仅为 NONE 或 AES-128（**注意**：pycryptodomex 不可用**不一定**降级，见下方详细分析）
 - 用户设置 `--downloader native` 或 `--hls-prefer-native`
 
 **分派路径**：
@@ -276,27 +276,82 @@ protocol = m3u8_native
 ```
 
 **内部再分派**（HlsFD.real_download）：
-位置：`yt_dlp/downloader/hls.py` L74-L140
+位置：`yt_dlp/downloader/hls.py` L74-L128
 
 1. 下载并解析 m3u8 manifest（或使用 `hls_media_playlist_data` 中缓存的）
 2. `can_download` 能力检查：
    - 不是直播（双重校验）
    - 无 DRM 标签
    - 加密方式仅为 NONE 或 AES-128
-3. **不支持时降级**：直接创建 `FFmpegFD` 实例并调用其 `real_download`
-4. **AES-128 + 无 pycryptodomex**：若 ffmpeg 可用也降级到 FFmpegFD
+3. **AES-128 + pycryptodomex 缺失的精细处理**（⚠️ 之前说法不准确，详见下方 3.2.3 节）
+4. **其他不支持情况时降级**：直接创建 `FFmpegFD` 实例并调用其 `real_download`
 5. 尝试寻找支持 `m3u8_frag_urls` 协议的外部下载器接管片段批量下载
 6. 无外部下载器时，使用 `FragmentFD` 机制，内部用 `HttpFD` 逐片段下载
 
-**片段下载机制**：
+**片段下载与解密机制**：
 - `HlsFD` 继承自 `FragmentFD`
 - `FragmentFD._download_fragment` 创建 `HttpQuietDownloader`（即 `HttpFD`，屏蔽输出）下载每个片段
-- 下载后若有 AES-128 加密，用 Cryptodome 或纯 Python 实现解密
+- 下载后若有 AES-128 加密，通过 `aes_cbc_decrypt_bytes` 解密（`yt_dlp/aes.py`）：
+  - Cryptodome.AES 可用时 → pycryptodomex 快速解密
+  - Cryptodome.AES 不可用时 → 纯 Python 原生 AES 实现（极慢，但功能可用）
 - 按顺序追加到目标文件（WebVTT 字幕还要特殊打包）
 
 ---
 
-#### 3.2.2 FFmpegFD（FFmpeg 处理 HLS）
+#### 3.2.3 AES-128 加密 + pycryptodomex 缺失的真实降级逻辑（⚠️ 纠正：不一定降级）
+
+**之前错误结论**：
+> "AES-128 + 无 pycryptodomex：若 ffmpeg 可用也降级到 FFmpegFD"
+
+**正确结论**：pycryptodomex 缺失时**有 4 种组合**，并非一定降级。
+
+**判断代码**（`yt_dlp/downloader/hls.py` L94-L109）：
+```python
+can_download, message = self.can_download(s, info_dict, self.params.get('allow_unplayable_formats')), None
+if can_download:
+    has_ffmpeg = FFmpegFD.available()
+    if not Cryptodome.AES and '#EXT-X-KEY:METHOD=AES-128' in s:
+        # Even if pycryptodomex isn't available, force HlsFD for m3u8s that won't work with ffmpeg
+        ffmpeg_can_dl = not traverse_obj(info_dict, ((
+            'extra_param_to_segment_url', 'extra_param_to_key_url',
+            'hls_media_playlist_data', ('hls_aes', ('uri', 'key', 'iv')),
+        ), any))
+        message = 'The stream has AES-128 encryption and {} available'.format(
+            'neither ffmpeg nor pycryptodomex are' if ffmpeg_can_dl and not has_ffmpeg else
+            'pycryptodomex is not')
+        if has_ffmpeg and ffmpeg_can_dl:
+            can_download = False          # 只有这种情况才降级
+        else:
+            message += '; decryption will be performed natively, but will be extremely slow'
+```
+
+**四种组合的真实结果**：
+
+| Cryptodome.AES | `FFmpegFD.available()` | `ffmpeg_can_dl`（无特殊参数） | 结果 | 说明 |
+|---|---|---|---|---|
+| ✅ 可用 | 任意 | 任意 | ✅ HlsFD 原生下载，Cryptodome 快速解密 | 最佳路径 |
+| ❌ 不可用 | ✅ 可用 | ✅ 可处理（无 extra_param/hls_aes） | ❌ `can_download = False` → 降级 FFmpegFD | 唯一降级情况 |
+| ❌ 不可用 | ✅ 可用 | ❌ 不可处理（有 extra_param/hls_aes 等）| ⚠️ HlsFD 继续，纯 Python 解密（极慢） | FFmpeg 无法处理这些特殊参数 |
+| ❌ 不可用 | ❌ 不可用 | ✅/❌ | ⚠️ HlsFD 继续，纯 Python 解密（极慢） | 无 FFmpeg 可用，只能硬解 |
+
+**`ffmpeg_can_dl = False` 的场景**（FFmpeg 无法处理，不降级）：
+- `extra_param_to_segment_url`：片段 URL 需要额外 query 参数
+- `extra_param_to_key_url`：密钥 URL 需要额外 query 参数
+- `hls_media_playlist_data`：manifest 数据内嵌在 info_dict 中
+- `hls_aes.uri` / `hls_aes.key` / `hls_aes.iv`：AES 密钥/IV 由 extractor 直接提供
+
+**纯 Python AES 实现的位置**：`yt_dlp/aes.py` L17-L19
+```python
+else:
+    def aes_cbc_decrypt_bytes(data, key, iv):
+        """ Decrypt bytes with AES-CBC using native implementation since pycryptodome is unavailable """
+        return bytes(aes_cbc_decrypt(*map(list, (data, key, iv))))
+```
+> 此实现不依赖任何外部库，但性能远低于 Cryptodome（每片段约几十毫秒 vs 几微秒），长视频会显著变慢。
+
+---
+
+#### 3.2.4 FFmpegFD（FFmpeg 处理 HLS）
 
 **适用场景**：
 - HLS 直播流 (`is_live=True`)
@@ -339,9 +394,16 @@ protocol = m3u8 或 m3u8_native
 
 ---
 
-#### 3.3.2 直播 DASH 走 FFmpeg 的完整条件链
+#### 3.3.2 直播 DASH 走 FFmpeg 的真实条件（⚠️ 纠正：强制 native 时只报错，不兜底 FFmpeg）
 
-**判断代码**（`yt_dlp/downloader/__init__.py` L109-L111）：
+**之前错误结论**：
+> "DASH 直播有三道关卡确保走 FFmpeg（分派层、DashSegmentsFD 内部二次报错、FFmpeg `-re` 参数适配）"
+
+**正确结论**：DASH 直播走 FFmpeg **只有一道硬关卡**（分派层），且可以被 `--downloader native` 绕过。绕过之后 DashSegmentsFD **只报错，不降级 FFmpeg**。
+
+---
+
+**分派层判断代码**（`yt_dlp/downloader/__init__.py` L109-L111）：
 ```python
 if protocol == 'http_dash_segments':
     if info_dict.get('is_live') and (external_downloader or '').lower() != 'native':
@@ -353,21 +415,44 @@ if protocol == 'http_dash_segments':
 2. `is_live == True`（由 extractor 设置，不是从 URL 推断）
 3. 用户**没有**强制指定 `--downloader native`（即 `external_downloader` 是 None / ffmpeg / aria2c 等非 native 值）
 
+**当条件 3 不满足（用户强制 native）时**：
+- 分派层条件不成立，继续往下 → 查 `PROTOCOL_MAP` → 返回 `DashSegmentsFD`
+- 此时进入 DashSegmentsFD.real_download
+
+**DashSegmentsFD 直播处理代码**（`yt_dlp/downloader/dash.py` L21-L22）：
+```python
+if info_dict.get('is_live'):
+    self.report_error('Live DASH videos are not supported')
+```
+
+⚠️ **关键发现**：这里只调用了 `report_error`，**没有创建 FFmpegFD 兜底，没有降级逻辑**。执行完 `report_error` 后函数继续往下执行，但后续 `fragments` 解析会失败或下载异常，最终返回 `False`（下载失败）。
+
 **FFmpeg 侧直播 DASH 特殊处理**（`yt_dlp/downloader/external.py` L484-L489）：
 ```python
 elif protocol == 'http_dash_segments' and info_dict.get('is_live'):
     # 直播 DASH 加 -re 防止 ffmpeg 读超出最新可用分片
     args += ['-re']  # 别名 -readrate 1，但兼容旧版 ffmpeg
 ```
+> 这段只有在分派层已选择 FFmpegFD 时才会执行。
 
-**DashSegmentsFD 直播兜底报错**（`yt_dlp/downloader/dash.py` L21-L22）：
-如果因某种原因（如用户强制 `--downloader native`）直播 DASH 到达了 DashSegmentsFD，内部还会二次检查并报错：
-```python
-if info_dict.get('is_live'):
-    self.report_error('Live DASH videos are not supported')
-```
+---
 
-> 结论：DASH 直播有**三道关卡**确保走 FFmpeg（分派层、DashSegmentsFD 内部二次报错、FFmpeg `-re` 参数适配）
+**DASH 直播完整决策矩阵**：
+
+| 用户参数 | 分派层结果 | DashSegmentsFD 内部 | 最终结果 |
+|---------|-----------|-------------------|---------|
+| 默认（无 `--downloader`） | 返回 FFmpegFD ✅ | 不执行 | FFmpeg 下载（加 `-re`） |
+| `--downloader ffmpeg` | 返回 FFmpegFD ✅ | 不执行 | FFmpeg 下载（加 `-re`） |
+| `--downloader aria2c` 等 | 先返回 Aria2cFD（若支持 DASH）否则回退 → 见下方 | - | - |
+| `--downloader native` ⚠️ | 返回 **DashSegmentsFD** ❌ | `report_error` + 无降级 | **下载失败报错**，不走 FFmpeg |
+
+> **修正结论**：DASH 直播**没有三道关卡**。分派层是唯一走 FFmpeg 的路径，但 `--downloader native` 可以明确绕过。DashSegmentsFD 内部只有报错，没有任何兜底逻辑确保走 FFmpeg。用户若误传 `--downloader native`，DASH 直播会直接失败退出。
+
+**补充：外部下载器（非 native/非 ffmpeg）处理 DASH 直播**：
+- `--downloader aria2c`：进入 `_get_suitable_downloader` L104-L107，`external_downloader != 'native'`，先检测 Aria2cFD 的 `can_download`
+- Aria2cFD `SUPPORTED_PROTOCOLS` 是 `('http', 'https', 'ftp', 'ftps')`，**不含** `http_dash_segments` → `can_download` 为假
+- 继续往下 → 命中 L109-L111 的 DASH 直播条件（因为 `external_downloader='aria2c' != 'native'`）→ 返回 FFmpegFD
+- 所以：外部下载器（除了 native）即使不支持 DASH，也会被分派层"矫正"回 FFmpegFD。**只有 `'native'` 这个字符串会绕过分派层的 DASH 直播检测**。
 
 ---
 
@@ -383,7 +468,7 @@ protocol = http_dash_segments / http_dash_segments_generator（单协议，len==
   ├─> ① 无分段截取需求
   ├─> ② 未指定支持 DASH 的外部下载器（或指定了 native）
   ├─> ③ 不是 stdout 多格式合并
-  ├─> ④ 非 is_live 或 强制 native（后者会报错）
+  ├─> ④ 非 is_live（或强制 native，后者进入 DashSegmentsFD 后 report_error 报错退出，不兜底 FFmpeg）
   │
   ▼
 len(downloaders) == 1 → 返回 PROTOCOL_MAP 中的 DashSegmentsFD
@@ -851,6 +936,42 @@ YoutubeDL.process_info
   └─> 无需后处理合并，已一步完成
 ```
 
+### 7.10 DASH 直播 + `--downloader native`（⚠️ 异常路径：只报错，不兜底 FFmpeg）
+
+```
+用户参数: --downloader native  (强制原生下载器)
+
+YoutubeDL.process_info
+  └─> protocol = 'http_dash_segments'，is_live=True
+  │
+  └─> get_suitable_downloader(info)
+      └─> _get_suitable_downloader(info, 'http_dash_segments', ...)
+          ├─> ① 无分段需求
+          ├─> ② external_downloader='native' → 跳过外部下载器检测
+          ├─> ③ 非 stdout 合并
+          ├─> ④ protocol==http_dash_segments && is_live=True
+          │   └─> 但 (external_downloader or '').lower() == 'native'
+          │   └─> 条件不成立 ❌ → 不返回 FFmpegFD
+          ├─> ⑤ 非 HLS，跳过
+          └─> ⑥ PROTOCOL_MAP['http_dash_segments'] → DashSegmentsFD
+  │
+  └─> self.dl(temp_filename, info_dict)
+      └─> DashSegmentsFD.download(filename, info_dict)
+          └─> DashSegmentsFD.real_download (dash.py L17-L24)
+              ├─> protocol 不含 generator → 进入 else 分支
+              ├─> info_dict.get('is_live') → True ⚠️
+              ├─> self.report_error('Live DASH videos are not supported')  ← 只报错
+              │   （无 FFmpegFD fallback，无降级逻辑）
+              ├─> 继续执行: real_downloader = get_suitable_downloader(..., protocol='dash_frag_urls')
+              ├─> 后续 fragments 解析/下载因直播无固定片段列表失败
+              └─> 最终返回 False（下载失败）
+
+最终结果: 用户看到 "ERROR: Live DASH videos are not supported"，下载中断。
+         不会自动切换到 FFmpeg，也没有任何兜底降级。
+```
+
+> **关键教训**：分派层的 `!= 'native'` 判断保护了默认路径和 ffmpeg 等外部下载器，但 `'native'` 作为特殊字符串被硬编码排除在外。用户若错误地使用 `--downloader native` 下载 DASH 直播，不会得到 FFmpeg 兜底，只会得到一条报错。
+
 ---
 
 ## 八、关键设计模式与决策点
@@ -862,9 +983,10 @@ YoutubeDL.process_info
 3. **运行时再分派**：下载器内部 `real_download` 获取 manifest 后再次决策（HlsFD 降级 FFmpeg、DASH/HLS 委托外部伪协议下载器）
 
 这种设计允许：
-- 运行时检测能力（如下载 m3u8 manifest 后才知道是否有 DRM）
-- 优雅降级（原生不行就用 FFmpeg）
+- 运行时检测能力（如下载 m3u8 manifest 后才知道是否有 DRM、是否缺 pycryptodomex）
+- 有条件降级（HlsFD 原生不支持就用 FFmpeg，但强制 native 或缺 FFmpeg 时例外）
 - 外部下载器接管片段级批量下载（伪协议扩展点）
+- 兜底策略但非万无一失（DASH 直播 + 强制 native 会直接报错失败，不降转 FFmpeg）
 
 ### 8.2 多协议聚合的严格漏斗（7 条路径）
 
@@ -987,17 +1109,22 @@ def _get_suitable_downloader(info_dict, protocol, params, default):
 | HLS 非直播 + 有 DRM / 原生不支持 | m3u8_native | **FFmpegFD**（降级） | ffmpeg 内部 |
 | HLS 直播 | m3u8 | **FFmpegFD**（强制） | ffmpeg 内部 |
 | HLS + `--downloader native` | m3u8_native | **HlsFD**（强制） | HttpFD |
+| HLS AES-128 + Cryptodome 缺失 + FFmpeg 可处理 ⚠️ | m3u8_native | **FFmpegFD**（降级） | ffmpeg 内部 |
+| HLS AES-128 + Cryptodome 缺失 + FFmpeg 不可处理 ⚠️ | m3u8_native | **HlsFD**（纯 Python AES 解密，极慢） | HttpFD |
 | DASH 非直播（单轨） | http_dash_segments | **DashSegmentsFD** | HttpFD |
 | DASH 非直播（音视频分轨）⚠️ | http_dash_segments+http_dash_segments | **None → 路径拆分** → 逐轨 DashSegmentsFD | 逐轨 HttpFD → FFmpegMergerPP 合并 |
 | DASH 直播回放多轨（--live-from-start） | http_dash_segments_generator+... | **DashSegmentsFD**（唯一多轨统一非 FFmpeg） | 多轨并行 HttpFD |
 | DASH 直播（默认） | http_dash_segments | **FFmpegFD**（强制） | ffmpeg 内部 (-re) |
-| DASH + `--downloader native` + 直播 | http_dash_segments | DashSegmentsFD → **报错退出** | - |
+| DASH + `--downloader native` + 直播 ⚠️ | http_dash_segments | DashSegmentsFD → **report_error 报错，不兜底 FFmpeg，下载失败** | - |
 | DASH + `--downloader ffmpeg` | http_dash_segments | **FFmpegFD**（用户指定） | ffmpeg 内部 |
 | 多格式下载器不统一 | A+B | None → **路径拆分** | 逐轨各自 |
 | 多格式全指向 FFmpeg 且可合并 | 任意组合 | **FFmpegFD**（直接合并） | ffmpeg 多输入 |
 | 分段截取（任意协议） | 任意 | **FFmpegFD**（强制） | ffmpeg -ss/-t |
 
-> ⚠️ 表格中标注 ⚠️ 的行是**之前文档错误、本次纠正的结论**：普通 DASH 音视频分轨不会统一走 DashSegmentsFD，而是返回 None 走路径拆分。
+> ⚠️ 表格中标注 ⚠️ 的行是**本次或之前纠正的错误结论**：
+> 1. 普通 DASH 音视频分轨不会统一走 DashSegmentsFD，而是返回 None 走路径拆分
+> 2. HLS AES-128 + pycryptodomex 缺失**不一定**降级到 FFmpeg，有 4 种组合（详见 3.2.3）
+> 3. DASH 直播 + `--downloader native` **不会兜底到 FFmpeg**，DashSegmentsFD 只报错返回 False（下载失败）
 
 ### 10.2 核心层次关系
 
@@ -1027,4 +1154,4 @@ def _get_suitable_downloader(info_dict, protocol, params, default):
 ```
 
 **一句话总结**：
-> **HTTP 是基础**（所有分片最终都落到 HttpFD），**HLS 有原生/FFmpeg 两条路**（取决于直播/DRM/用户偏好），**DASH 非直播单轨走原生、直播强制 FFmpeg、普通多轨返回 None 走路径拆分**（只有 `--live-from-start` 的 generator 多轨才统一 DashSegmentsFD），**FFmpeg 是万能兜底+合并器**，**下载器不统一/普通 DASH 多轨时逐轨拆分后分别下载再合并**。三者不是互斥关系，而是**层次 + 降级 + 路径拆分**的组合关系。
+> **HTTP 是基础**（所有分片最终都落到 HttpFD），**HLS 有原生/FFmpeg 两条路**（取决于直播/DRM/用户偏好，AES-128 加密在 pycryptodomex 缺失时**不一定降级**，仅 FFmpeg 可处理且可用时才降级，否则走纯 Python 原生解密极慢路径），**DASH 非直播单轨走原生、直播默认强制 FFmpeg、但 `--downloader native` 会绕过分派层导致 DashSegmentsFD 只报错不兜底、普通多轨返回 None 走路径拆分**（只有 `--live-from-start` 的 generator 多轨才统一 DashSegmentsFD），**FFmpeg 是万能降级/合并器但存在盲点**（强制 native DASH 直播不会兜底），**下载器不统一/普通 DASH 多轨时逐轨拆分后分别下载再合并**。三者不是互斥关系，而是**层次 + 有条件降级 + 路径拆分**的组合关系。
