@@ -329,7 +329,7 @@ _extract_embeds(url, webpage)
     │     ├── 遍历顺序来源: self._downloader._ies.values()
     │     │     └── _ies 的注册顺序由 extractors.py 第 25-30 行精心设计:
     │     │           1. Youtube 相关 IE 优先（提高匹配性能）
-    │     │           2. 其他所有 IE（按字母/模块导入顺序，约 1500+ 个）
+    │     │           2. 其他所有 IE（按类名排序后的导入表顺序，约 1500+ 个）
     │     │           3. GenericIE 最后（但 GenericIE 自己不参与嵌入扫描）
     │     │
     │     ├── 对每个 IE:
