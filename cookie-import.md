@@ -272,14 +272,47 @@ Safari 使用自定义的二进制格式 `Cookies.binarycookies`，结构为：
 
 [YoutubeDLCookieJar](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1276-L1420) 继承自 `http.cookiejar.MozillaCookieJar`，[load()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1354-L1403) 方法：
 
-1. 逐行预处理：识别 `#HttpOnly_` 前缀并去除（但**未将 HttpOnly 属性存入 Cookie 对象**）；跳过注释和空行；校验每行恰好 7 个 tab 分隔字段；校验 expires 格式
+1. 逐行预处理（[prepare_line()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1362-L1374)）：识别 `#HttpOnly_` 前缀并去除；跳过注释和空行；校验每行恰好 7 个 tab 分隔字段；校验 expires 格式；将预处理后的行写入 StringIO
 2. 若文件被误识别为 JSON 格式，抛出明确错误提示
-3. 调用父类 `_really_load()` 解析 Netscape 格式
+3. 调用父类 `_really_load()` 解析 StringIO 中的 Netscape 格式
 4. 将 `expires=0` 的 Cookie 标记为会话 Cookie（`discard=True`，`expires=None`），补齐 Python 标准库的缺陷
 
-> **事实核对**：`prepare_line()` 中仅仅是 `line = line[len(self._HTTPONLY_PREFIX):]` 去掉了前缀，但没有调用任何方法将 HttpOnly 标志设置到 Cookie 对象上。父类 `MozillaCookieJar._really_load()` 也不支持 HttpOnly 属性。同时，[`_really_save()`](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1312-L1331) 在写回文件时也不会添加 `#HttpOnly_` 前缀。因此，**文件加载路径同样不保留 HttpOnly 属性**——`#HttpOnly_` 前缀只是为了兼容 curl 的文件格式，避免解析错误，而非真正保留该安全属性。
+#### HttpOnly 前缀预处理与父类解析能力的因果关系
 
-[save()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1333-L1352) 方法在下载完成后被调用，将 jar 中的 Cookie 写回文件（会话 Cookie 的 expires 写为 0）。
+**父类 `MozillaCookieJar._really_load()` 本身是支持 HttpOnly 的**。标准库的解析逻辑为：
+
+```python
+# http.cookiejar.MozillaCookieJar._really_load() 中的关键片段
+if line.startswith(HTTPONLY_PREFIX):          # '#HttpOnly_'
+    rest[HTTPONLY_ATTR] = ""                  # rest['HTTPOnly'] = ""
+    line = line[len(HTTPONLY_PREFIX):]
+```
+
+父类在遇到 `#HttpOnly_` 前缀时，会将其存入 Cookie 对象的 `rest` 字典（`rest={'HTTPOnly': ''}`），然后剥离前缀继续解析。这意味着**如果父类直接读取原始文件，HttpOnly 属性是可以被保留的**。
+
+**HttpOnly 属性丢失的根因**在于 yt-dlp 的 `load()` 在调用父类之前插入了一层预处理。数据流如下：
+
+```
+原始文件行: #HttpOnly_example.com\tTRUE\t/\tFALSE\t0\tsid\tabc123
+    │
+    ▼ prepare_line()
+    ├─ 检测 #HttpOnly_ 前缀 → 去除前缀
+    ├─ 验证字段数（7个tab分隔）、expires 格式
+    └─ 写入 StringIO: example.com\tTRUE\t/\tFALSE\t0\tsid\tabc123
+    │
+    ▼ _really_load() 从 StringIO 读取
+    ├─ line.startswith('#HttpOnly_') → False（前缀已被去除）
+    ├─ rest 字典为空 {}，HttpOnly 属性未设置
+    └─ 正常解析 Cookie，但 rest 中无 HTTPOnly 条目
+```
+
+`prepare_line()` 必须先去除 `#HttpOnly_` 前缀，因为后续的字段数校验（`line.split('\t')` 长度必须为 7）和 expires 格式校验需要操作干净的数据行——如果不去除前缀，domain 字段会变成 `#HttpOnly_example.com` 而非 `example.com`，或者当 `#HttpOnly_` 行首字符 `#` 触发注释跳过逻辑时，整行会被误判为注释而跳过校验。
+
+但 `prepare_line()` 在去除前缀后写入 StringIO 的是**剥离后的行**，而非原始行。这导致 `_really_load()` 从 StringIO 中读到的行永远不以 `#HttpOnly_` 开头，父类的 HttpOnly 检测分支永远不会执行。
+
+**简言之：yt-dlp 的自定义校验层需要去除前缀来正确验证字段，但去除后写入 StringIO 的副效果是绕过了父类已有的 HttpOnly 保留机制。** 这是一个校验需求与属性保留之间的架构冲突——`prepare_line()` 的职责是「验证」，但它同时也承担了「数据转换」的角色，转换后的数据丢失了父类能识别的 HttpOnly 标记。
+
+[save()](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1312-L1352) 同样不处理 HttpOnly——[`_really_save()`](file:///d:/fz/0601-2/solo-dogfeeding/code/89-yt-dlp/yt_dlp/cookies.py#L1312-L1331) 写回文件时不检查 Cookie 的 `rest` 字典，不添加 `#HttpOnly_` 前缀。因此即使 Cookie 对象中保留了 `rest['HTTPOnly']`，保存时也会丢失。
 
 ### 2.6 统一内存结构
 
@@ -354,10 +387,10 @@ for cookie in self:
 | secure | is_secure / secure 列动态适配 | isSecure 列 | flags 位运算 | https_only 列 |
 | expires | 0 → None，其余原样（FILETIME 微秒直接作 POSIX 秒使用） | 原样传入（毫秒级需除以 1000） | Mac Absolute Time → POSIX | 0 → None，其余原样 |
 | discard | 恒 False | 恒 False | 恒 False | 会话 Cookie 为 True |
-| HttpOnly | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✗ 仅去除前缀 `#HttpOnly_`，未设置属性 |
+| HttpOnly | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✗ `prepare_line()` 去除前缀后写入 StringIO，绕过父类 HttpOnly 检测 |
 | SameSite | ✗ 未读取 | ✗ 未读取 | ✗ 未读取 | ✗ 不支持 |
 
-> **关键观察**：**所有四个来源都不保留 HttpOnly 和 SameSite 属性**。浏览器来源的 SQL 查询未选择 `is_httponly`、`samesite` 等字段；文件来源仅在解析时去除 `#HttpOnly_` 前缀以避免解析错误，但没有将 HttpOnly 标志存入 Cookie 对象。这意味着 yt-dlp 中所有导入的 Cookie 都表现为非 HttpOnly、无 SameSite 限制，在安全属性上比浏览器原生环境显著宽松。
+> **关键观察**：**所有四个来源都不保留 HttpOnly 和 SameSite 属性**，但丢失原因不同。浏览器来源的 SQL 查询未选择 `is_httponly`、`samesite` 等字段，属于**数据选取层面的遗漏**。文件来源的丢失则更为遗憾——父类 `MozillaCookieJar._really_load()` 本身支持 `#HttpOnly_` 前缀的检测和保留（存入 `rest['HTTPOnly']`），但 yt-dlp 的自定义校验层 `prepare_line()` 在验证字段前去除了前缀，并将去除后的行写入 StringIO，导致父类永远看不到该前缀。这是**校验预处理与属性保留之间的架构冲突**。同时 `_really_save()` 也不回写 `#HttpOnly_` 前缀，即使 Cookie 对象中保留了该属性也会在保存时丢失。
 
 ---
 
