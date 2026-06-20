@@ -338,10 +338,15 @@ _extract_embeds(url, webpage)
     ├── 第一部分: 网页嵌入入口遍历（第 1000-1018 行）
     │     │
     │     ├── 遍历顺序来源: self._downloader._ies.values()
-    │     │     └── _ies 的注册顺序由 extractors.py 第 25-30 行精心设计:
-    │     │           1. Youtube 相关 IE 优先（提高匹配性能，因为 YouTube 嵌入最常见）
-    │     │           2. 其他所有 IE（约 1500+ 个，按模块导入顺序）
-    │     │           3. GenericIE 最后（_VALID_URL = r'.*'，会被遍历到）
+    │     │     └── _ies 的注册顺序来自 extractors.py，完整链路:
+    │     │           1. dir(_extractors) 按 Python 内置的类名字母序列出所有 *IE 类
+    │     │                 (extractors.py 第 20-24 行)
+    │     │           2. itertools.chain 做三次过滤重排 (extractors.py 第 25-31 行):
+    │     │                 a) Youtube 相关 IE 提前（__module__ 含 '.youtube'）
+    │     │                 b) 除 GenericIE 外的其他所有 IE（按原字母序）
+    │     │                 c) GenericIE 单独放最后（兜底）
+    │     │           3. YoutubeDL.add_default_info_extractors() 把 _CLASS_LOOKUP 按序
+    │     │                 存入 self._ies（YoutubeDL.py 第 928-940 行）
     │     │
     │     ├── 对每个 IE:
     │     │     ├── 跳过 block_ies 中的 IE（防止递归，如 A 嵌入 B 再回 A）
@@ -387,7 +392,7 @@ _extract_embeds(url, webpage)
 >
 > 1. **优先级**：特定站点的提取器（如 YouTubeIE、VimeoIE）对自己的嵌入格式有最准确的解析能力，应该优先尝试。
 > 2. **正确性**：JW Player 等通用播放器模式是"瞎猜"，可能把非视频资源识别为视频，应该作为最后手段。
-> 3. **性能**：遍历 1500+ 个 IE 每个只跑正则扫描，很快；而播放器兜底需要做多次正则搜索、JSON 解析，相对慢。
+> 3. **性能**：大多数 IE（未重写 `_extract_from_webpage` 的）走基类默认实现，只需遍历 `_EMBED_REGEX` 正则列表，很快；少数 IE 重写了实例 method 版本（需要实例化）或做 DOM/JSON 复杂解析，相对慢一些。播放器兜底则需要多次正则搜索、JSON 解析，整体更慢。
 >
 > **为什么 GenericIE 也被遍历但不影响结果？**
 >
