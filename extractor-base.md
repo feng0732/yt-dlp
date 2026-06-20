@@ -285,17 +285,26 @@ _real_extract(url)
     │     ├── URL 无 scheme → 尝试 https:// 或 fallback 到 youtube 搜索
     │     └── 返回 url_result，让对应 IE 处理
     │
-    ├── 阶段 2: 请求网页（第 818-850 行）
-    │     ├── _request_webpage 下载响应头和前 512 字节
-    │     ├── 3xx 重定向 → 返回 url_result 跟随重定向
-    │     └── Cloudflare 403 特殊处理 → 提示 impersonation
+    ├── 阶段 2: 请求网页（第 818-856 行）
+    │     ├── _request_webpage 只拿响应句柄（response handle），不读取 body
+    │     ├── 检查 URL 跳转（3xx → 返回 url_result 跟随重定向）
+    │     ├── Cloudflare 403 特殊处理 → 提示 impersonation
+    │     └── 从响应头提取 Last-Modified、title 的兜底值
     │
     ├── 阶段 3: 直链检测（第 858-914 行）—— 最优先的快速路径
-    │     ├── Content-Type 是 audio/video/mpegurl → 直接构造 format（第 860-886 行）
-    │     ├── 前 512 字节 #EXTM3U → 解析 m3u8（第 894-899 行）
-    │     └── 前 512 字节不是 HTML → 直接返回为直链（第 903-914 行）
+    │     ├── 子步骤 3a: Content-Type 头检测（第 858-886 行）
+    │     │     └── audio/video/mpegurl → 直接构造 format 返回
+    │     ├── 子步骤 3b: 读取前 512 字节（第 892 行：first_bytes = full_response.read(512)）
+    │     ├── 子步骤 3c: #EXTM3U 魔数检测（第 894-899 行）
+    │     ├── 子步骤 3d: 非 HTML 判断（第 903-914 行）
+    │     └── 说明：512 字节读取属于直链检测，目的是避免下载整个大文件
     │
-    ├── 阶段 4: XML 格式检测（第 924-963 行）
+    ├── 阶段 4: 读取完整网页（第 916-922 行）
+    │     ├── _webpage_read_content 把剩余 body + first_bytes 前缀拼接成完整 HTML
+    │     ├── 特殊情况：DPG Media 隐私门 → 重新下载网页
+    │     └── 注意：只有通过了阶段 3 的 HTML 判断，才会走到这里
+    │
+    ├── 阶段 5: XML 格式检测（第 924-963 行）
     │     ├── 尝试 XML 解析
     │     ├── RSS → _extract_rss（第 930-932 行）
     │     ├── SMIL → _parse_smil（第 937-940 行）
@@ -304,18 +313,20 @@ _real_extract(url)
     │     ├── SmoothStreamingMedia → _parse_ism_formats（第 933-936 行）
     │     └── F4M → _parse_f4m_formats（第 958-961 行）
     │
-    ├── 阶段 5: 提取基本元数据（第 965-976 行）
+    ├── 阶段 6: 提取基本元数据（第 965-976 行）
     │     ├── title / description / thumbnail / age_limit
     │     └── 作为兜底信息，后续嵌入结果会 merge 这些字段
     │
-    └── 阶段 6: 调用 _extract_embeds（第 978-984 行）
+    └── 阶段 7: 调用 _extract_embeds（第 978-984 行）
           └── embeds = list(self._extract_embeds(...))
               ├── 1 个嵌入 → merge_dicts(embeds[0], info_dict)
               ├── 多个嵌入 → playlist_result(embeds, **info_dict)
               └── 0 个嵌入 → raise UnsupportedError(url)
 ```
 
-> **关键观察**：直链检测在阶段 3 就完成了，远早于嵌入提取。这意味着如果 URL 直接指向视频文件，不会进入嵌入扫描流程。
+> **关键校准**：
+> - `_request_webpage` 只负责拿响应句柄，body 完全未读取。前 512 字节读取（`full_response.read(512)`）发生在**阶段 3 直链检测**中，目的是避免对大文件下载整个 body。
+> - 只有通过了 `is_html(first_bytes)` 判断（确定是 HTML 而非二进制文件），才会进入阶段 4 读取完整网页内容。
 
 ### 5.2 `_extract_embeds` 内部顺序：嵌入遍历 vs 播放器兜底
 
@@ -328,16 +339,22 @@ _extract_embeds(url, webpage)
     │     │
     │     ├── 遍历顺序来源: self._downloader._ies.values()
     │     │     └── _ies 的注册顺序由 extractors.py 第 25-30 行精心设计:
-    │     │           1. Youtube 相关 IE 优先（提高匹配性能）
-    │     │           2. 其他所有 IE（按类名排序后的导入表顺序，约 1500+ 个）
-    │     │           3. GenericIE 最后（但 GenericIE 自己不参与嵌入扫描）
+    │     │           1. Youtube 相关 IE 优先（提高匹配性能，因为 YouTube 嵌入最常见）
+    │     │           2. 其他所有 IE（约 1500+ 个，按模块导入顺序）
+    │     │           3. GenericIE 最后（_VALID_URL = r'.*'，会被遍历到）
     │     │
     │     ├── 对每个 IE:
-    │     │     ├── 跳过 block_ies 中的 IE（防止递归）
+    │     │     ├── 跳过 block_ies 中的 IE（防止递归，如 A 嵌入 B 再回 A）
     │     │     ├── gen = ie.extract_from_webpage(ydl, url, webpage)
     │     │     ├── 手动迭代生成器（next(gen)）
     │     │     ├── 捕获 StopExtraction → 独占，立即 return
     │     │     └── 捕获 StopIteration → 收集当前 IE 的嵌入
+    │     │
+    │     ├── GenericIE 的遍历效果:
+    │     │     ├── GenericIE 未重写 _extract_from_webpage，走基类默认实现
+    │     │     ├── 基类默认实现调用 _extract_embed_urls，遍历 _EMBED_REGEX
+    │     │     ├── GenericIE 未定义 _EMBED_REGEX（默认空列表）
+    │     │     └── 结果: 遍历到 GenericIE 时 yield 零个结果，不产生影响
     │     │
     │     └── if embeds: return embeds  ← 只要有嵌入结果，就不进播放器兜底
     │
@@ -372,13 +389,85 @@ _extract_embeds(url, webpage)
 > 2. **正确性**：JW Player 等通用播放器模式是"瞎猜"，可能把非视频资源识别为视频，应该作为最后手段。
 > 3. **性能**：遍历 1500+ 个 IE 每个只跑正则扫描，很快；而播放器兜底需要做多次正则搜索、JSON 解析，相对慢。
 >
+> **为什么 GenericIE 也被遍历但不影响结果？**
+>
+> GenericIE 注册时排在最后（`extractors.py` 第 29-30 行把 `GenericIE` 放到末尾）。它的 `_VALID_URL = r'.*'`，不像纯嵌入 IE（`_VALID_URL = False`）那样被跳过匹配。但 GenericIE：
+> - 没有定义 `_EMBED_REGEX`（基类默认 `[]`）
+> - 没有重写 `_extract_from_webpage`（走基类默认实现）
+>
+> 因此遍历到它时，调用链是：基类 `_extract_from_webpage` → `_extract_embed_urls` → 遍历空 `_EMBED_REGEX` → yield 零结果，什么都不发生。如果要让 GenericIE 自己也参与嵌入提取，需要显式重写这两个方法之一。
+>
 > **为什么第一部分找到任何嵌入就立即 return，不继续找更多？**
 >
 > 这是一个保守设计：如果某个专业 IE 已经识别出嵌入，就相信它的结果，不再让通用兜底模式产生多余结果。但如果多个 IE 都返回了结果（没有独占），会全部收集起来作为播放列表。
 
-### 5.3 StopExtraction 独占异常的捕获机制
+### 5.3 `_extract_from_webpage` 的两种实现方式（不只是正则扫描）
 
-#### 5.3.1 异常抛出点
+在讲独占异常之前，先厘清一个常见的误解：`_extract_from_webpage` 不只是正则扫描 HTML。基类默认实现确实基于 `_EMBED_REGEX` 正则，但子类可以重写为任意复杂度的逻辑。
+
+`InfoExtractor.extract_from_webpage`（调度层，`common.py` 第 4083 行）用 `types.MethodType` 检测判断使用哪种版本：
+```python
+ie = (cls if isinstance(cls._extract_from_webpage, types.MethodType)
+      else ydl.get_info_extractor(cls.ie_key()))
+```
+- **classmethod 版本**（`@classmethod def _extract_from_webpage`）→ 直接用 `cls` 调用，不需要实例化，适合纯 HTML 正则/JSON 解析场景。
+- **instance method 版本**（`def _extract_from_webpage`，没有 `@classmethod`）→ 需要 `ydl.get_info_extractor()` 创建实例，会触发初始化，适合需要登录态、cookies、缓存等有状态场景。
+
+#### 5.3.1 instance method 重写：DOM 查询 + JSON 解析 + 列表构造
+
+以 `WordpressPlaylistEmbedIE._extract_from_webpage`（`wordpress.py` 第 53-73 行）为例，这是一个 instance method（用了 `self`）：
+
+```python
+_VALID_URL = False  # 纯嵌入 IE，不直接匹配 URL
+IE_NAME = 'wordpress:playlist'
+
+def _extract_from_webpage(self, url, webpage):  # 注意是 instance method（无 @classmethod）
+    for i, j in enumerate(get_elements_by_class('wp-playlist-script', webpage)):
+        playlist_json = self._parse_json(j, self._generic_id(url), fatal=False, ignore_extra=True) or {}
+        entries = [{
+            'id': self._generic_id(track['src']),
+            'title': track.get('title'),
+            'url': track.get('src'),
+            'thumbnail': traverse_obj(track, ('thumb', 'src')),
+            # ... duration, artist, genre 等
+        } for track in traverse_obj(playlist_json, ('tracks', ...))]
+        yield self.playlist_result(entries, ...)
+```
+
+这个实现做了哪些事（远超正则扫描）：
+1. `get_elements_by_class` 按 class 名查找 DOM 元素
+2. `_parse_json` 解析 WordPress 嵌入在 `<script>` 标签中的 JSON 配置
+3. `traverse_obj` 从嵌套 JSON 中提取音轨信息
+4. 构造完整的 entries 列表（id/title/url/thumbnail/meta）
+5. `playlist_result` 包装为播放列表
+6. **完全没有使用任何 `_EMBED_REGEX`**
+
+#### 5.3.2 instance method 重写：需要状态的复杂提取
+
+instance method 版本（无 `@classmethod`）会被 `extract_from_webpage` 调度到实例化路径（`ydl.get_info_extractor(cls.ie_key())`），因此可以：
+- 访问 `self.cache` 读写缓存
+- 访问 `self.cookiejar` 读取 cookies
+- 调用 `self._download_webpage` / `self._download_json` 发起额外网络请求
+- 利用 `self` 上的初始化状态（token、session 等）
+
+#### 5.3.3 classmethod 重写：无状态的轻量提取
+
+如果不需要实例状态，可以用 `@classmethod`，避免实例化开销（约 1500+ 个 IE 中大多数是这种模式）。基类默认实现本身就是 classmethod。
+
+#### 5.3.4 基类默认实现：基于 `_EMBED_REGEX` 的正则扫描
+
+如果子类没有重写 `_extract_from_webpage`，走基类默认实现（`common.py` 第 4092-4095 行）：
+```python
+@classmethod
+def _extract_from_webpage(cls, url, webpage):
+    for embed_url in orderedSet(cls._extract_embed_urls(url, webpage) or [], lazy=True):
+        yield cls.url_result(embed_url, None if cls._VALID_URL is False else cls)
+```
+这个默认实现确实只做正则扫描（通过 `_extract_embed_urls` → `_EMBED_REGEX`），但这是**最低限度的兜底**，子类可以任意重写。
+
+### 5.4 StopExtraction 独占异常的捕获机制
+
+#### 5.4.1 异常抛出点
 
 `InfoExtractor.StopExtraction` 定义在 `common.py` 第 4113-4114 行：
 ```python
@@ -386,17 +475,17 @@ class StopExtraction(Exception):
     pass
 ```
 
-子类在重写 `_extract_from_webpage` 时，检测到网页特征后抛出：
+子类在重写 `_extract_from_webpage` 时，检测到网页特征后抛出。可以配合 5.3 中提到的任意一种实现方式使用：
 ```python
-@classmethod
+@classmethod  # 或 instance method
 def _extract_from_webpage(cls, url, webpage):
-    if 'invidious-player' in webpage:
-        info_dict = {...}  # 直接从网页提取信息
+    if 'invidious-player' in webpage:  # DOM/JSON/DOM操作/正则都可能
+        info_dict = {...}
         yield info_dict
-        raise cls.StopExtraction  # 告诉 GenericIE 别再找其他 IE 了
+        raise cls.StopExtraction  # 告诉 GenericIE：别再找其他 IE 了
 ```
 
-#### 5.3.2 完整传播路径
+#### 5.4.2 完整传播路径
 
 异常从抛出到捕获要经过三层调用：
 
@@ -419,7 +508,7 @@ def _extract_from_webpage(cls, url, webpage):
             return current_embeds  # 立即返回，后续 IE 不再遍历
 ```
 
-#### 5.3.3 关键实现细节
+#### 5.4.3 关键实现细节
 
 **细节 1：手动迭代生成器，而非 for 循环**
 
@@ -486,7 +575,7 @@ self.report_detected(f'{ie.IE_NAME} exclusive embed', len(current_embeds),
 - 如果之前的 IE 已经识别了一些嵌入，那些很可能是误报（比如 invidious 页面里也有 YouTube 嵌入 URL，但实际上应该用 invidious 自己的提取器）。
 - 但这是一个权衡：可能会丢失一些真正的多嵌入场景。所以独占机制应该谨慎使用，只在"这个网页是我的实例"时才触发。
 
-### 5.4 四层架构（回顾与补充）
+### 5.5 四层架构（回顾与补充）
 
 ```
 用户 URL → GenericIE._real_extract()
@@ -501,7 +590,7 @@ self.report_detected(f'{ie.IE_NAME} exclusive embed', len(current_embeds),
             └── 或者: 子类重写 _extract_from_webpage() 做深度提取 + 独占
 ```
 
-### 5.5 边界总结
+### 5.6 边界总结
 
 | 组件 | 位置 | 层级 | 可被覆盖？ |
 |---|---|---|---|
