@@ -357,10 +357,14 @@ def url_result(url, ie=None, video_id=None, video_title=None, *, url_transparent
 
 **返回值结构与字段优先级**：
 - `**kwargs` 先展开，然后 `_type` 和 `url` 会**覆盖** kwargs 中同名的键
-- `_type`: 有两种类型 —— `'url'`（纯转发）和 `'url_transparent'`（保留元数据）
+- `_type`: 有两种类型 —— `'url'`（普通接力）和 `'url_transparent'`（透明接力，合并外层字段）
 - `url`: 需要被重新处理的目标 URL（优先级最高，不可被 kwargs 覆盖）
 - `ie_key`（可选）：指定处理该 URL 的提取器名称，跳过 URL 匹配阶段
-- 其他字段：在后续 `extract_info` 调用中作为 `extra_info` 传递，通过 `add_extra_info`（`setdefault`，不覆盖已有值）合并
+- ⚠️ **其他字段（title、description 等通过 kwargs 传入的字段）**：
+  - 这些字段是 `ie_result` 的成员，**不会**自动作为 `extra_info` 参数传递给下一个 `extract_info`
+  - 它们的命运取决于 `_type`：
+    - `_type='url'`（普通接力）：这些字段**不会**传递给下一个提取器，接力时仅透传 `extra_info` 参数（加公共逻辑合并的 `original_url`）
+    - `_type='url_transparent'`（透明接力）：这些字段（非豁免且非 None）会通过 `new_result.update(filter_dict(ie_result, ...))` **覆盖合并**到内层提取结果
 
 ### 5.2 完整接力路径：从提取到二次分派
 
@@ -371,30 +375,39 @@ def url_result(url, ie=None, video_id=None, video_title=None, *, url_transparent
 **入口**: [YoutubeDL.extract_info()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1671-L1719)
 
 ```
-用户输入 URL
+用户输入 URL (+ 可选 extra_info 参数)
     │
     ▼
-extract_info(url)
+extract_info(url, extra_info=extra_info)
     │
     ├─► 遍历 self._ies，找到第一个 suitable(url) 的提取器
     │
     ▼
-__extract_info(url, ie_instance, ...)    ← 传入的是实例（通过 get_info_extractor 创建）
+__extract_info(url, ie_instance, download, extra_info, process)
+    │   ↑↑↑ 注意：extra_info 是独立的函数参数，不是 ie_result 的一部分
     │
     ├─► ie.extract(url)
     │     │
     │     ├─► ie.initialize()     ← 登录、初始化等
     │     └─► ie._real_extract(url)
     │           │
-    │           └─► 返回值可能是：
+    │           └─► 返回 ie_result（提取器返回的字典，包含 _type, url, 及其他字段如 title/description）
     │                 ├─► {'_type': 'video', ...}        ← 最终结果
-    │                 ├─► {'_type': 'url', 'url': ...}   ← 需要接力
-    │                 └─► {'_type': 'url_transparent', ...} ← 透明接力
+    │                 ├─► {'_type': 'url', 'url': ..., 'title': ...}   ← 普通接力请求
+    │                 └─► {'_type': 'url_transparent', ..., 'title': ...} ← 透明接力请求
     │
-    ├─► add_default_extra_info(ie_result, ie, url)
+    ├─► 第 1877-1878 行：若 extra_info 含 original_url → setdefault 到 ie_result
+    ├─► add_default_extra_info(ie_result, ie, url)  （setdefault 到 ie_result）
     │
-    └─► process_ie_result(ie_result, ...)
+    └─► process_ie_result(ie_result, download, extra_info)
+          ↑↑↑ 两个独立数据：ie_result（字典，提取器返回）+ extra_info（字典，函数参数）
 ```
+
+**⚠️ 关键区分**：从这里开始有两条完全独立的数据管线：
+1. **`ie_result`**：提取器 `_real_extract()` 返回的字典，包含 `_type`、`url`、以及提取器通过 `url_result(**kwargs)` 传入的 title/description/id 等字段
+2. **`extra_info`**：`extract_info()` 的函数参数，通常来自播放列表上下文或上层调用者透传
+
+这两者在 `process_ie_result` 中的处理方式完全不同，切勿混淆。
 
 #### 第二阶段：二次分派（核心）
 
@@ -845,14 +858,16 @@ URL 输入
         ▼                               ▼
   process_ie_result(ie_result)    接力开始！
         │
-        ├─► _type == 'url'
-        │     └─► 递归调用 extract_info(url, ie_key=?, extra_info=...)
+        ├─► _type == 'url'（普通接力）
+        │     └─► 递归调用 extract_info(url, ie_key=?, extra_info=extra_info)
+        │           ↑↑↑ 只透传 extra_info 参数，ie_result 中的 title/description 等不传递
         │           └─► 回到顶部，重新匹配提取器
         │
-        ├─► _type == 'url_transparent'
-        │     ├─► extract_info(..., process=False) 先取原始结果
-        │     ├─► 合并外层页面元数据(title/description等)
-        │     └─► 递归 process_ie_result 继续处理
+        ├─► _type == 'url_transparent'（透明接力）
+        │     ├─► extract_info(..., extra_info=extra_info, process=False) 先取内层结果
+        │     ├─► ⚠️ 关键：new_result.update(filter_dict(ie_result, ...))
+        │     │        外层 ie_result 的非豁免字段覆盖合并到内层结果
+        │     └─► 递归 process_ie_result(new_result, extra_info=extra_info) 继续处理
         │
         └─► _type == 'video'
               └─► process_video_result → 下载/后处理
