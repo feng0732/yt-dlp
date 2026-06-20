@@ -248,7 +248,7 @@ if self.params.get('force_write_download_archive'):
 
 ## 5. after_video 阶段与归档写入的先后关系
 
-### 5.1 执行顺序
+### 5.1 总体执行顺序
 
 在 `process_video_result` 中，当 `download=True` 时的关键执行顺序：
 
@@ -256,54 +256,128 @@ if self.params.get('force_write_download_archive'):
 1. 循环处理每个 format，调用 process_info(new_info)
    → 每个 format 独立设置 __write_download_archive 标记
 
-2. 多格式决策 & 写入归档（L3140-3143）
+2. 多格式决策 & 写入归档
    write_archive = {f.get('__write_download_archive', False) for f in downloaded_formats}
    if True in write_archive and False not in write_archive:
-       self.record_download_archive(info_dict)   ← 归档落盘
+       self.record_download_archive(info_dict)   ← 【归档落盘】
 
-3. 运行 after_video 后处理（L3145-3146）
+3. 运行 after_video 后处理
    info_dict['requested_downloads'] = downloaded_formats
    info_dict = self.run_all_pps('after_video', info_dict)  ← after_video 阶段
 
-4. 若 max_downloads_reached 则抛出异常
+4. 若 max_downloads_reached 则抛出 MaxDownloadsReached 异常
 ```
 
-**结论：归档写入发生在 after_video 阶段之前。**
+**结论：归档写入发生在整个 after_video 阶段之前。after_video 阶段内任何步骤失败，归档都已落盘且不会回滚。**
 
-### 5.2 after_video 阶段包含什么
+---
 
-after_video 是视频级别的最后一个后处理时机，在所有格式都下载处理完成后执行一次。
+### 5.2 after_video 阶段内部步骤详解
 
-默认没有内置的 after_video 后处理器，用户可通过配置添加自定义 PP。
+`run_all_pps('after_video', info)` 内部包含两大步骤：
 
-`run_all_pps('after_video', info)` 内部执行：
-1. `_forceprint('after_video', info)` — 打印 after_video 时机的模板
-2. 遍历所有注册在 `after_video` 时机的 PP，依次调用 `run_pp`
+```
+步骤 A：_forceprint('after_video', info)   ← 模板输出 + 写文件
+  A1：forceprint — 输出模板到 stdout
+  A2：print_to_file — 输出模板写入文件
 
-### 5.3 after_video 阶段失败时的归档状态
+步骤 B：遍历 after_video 时机的所有后处理器
+  每个 PP 调用 run_pp(pp, info)
+```
 
-**after_video 阶段失败，归档已经落盘。**
+各步骤与归档写入的先后关系：**全部都在归档写入之后**。
 
-具体分析：
+---
 
-| 失败场景 | 归档是否已写入 | 异常是否向上抛出 | 归档是否回滚 |
+### 5.3 步骤 A1：forceprint（模板输出到 stdout）
+
+**行为**：遍历 `params['forceprint']['after_video']` 中的模板，渲染后输出到 stdout。
+
+**失败场景**：
+- 模板渲染失败（`evaluate_outtmpl` 抛异常，如 KeyError、ValueError 等）
+- stdout 写入失败（极罕见）
+
+**是否受 ignoreerrors 影响**：❌ 不受影响。`_forceprint` 中没有 try-catch，异常会直接向上抛出。
+
+**归档状态**：✅ 已落盘，无回滚。
+
+**后续影响**：异常向上抛出，终止当前视频处理，后续 PP 不再执行。
+
+---
+
+### 5.4 步骤 A2：print_to_file（输出写文件）
+
+**行为**：遍历 `params['print_to_file']['after_video']` 中的 (模板, 文件路径) 对，渲染后追加写入文件。
+
+**失败场景及行为**：
+
+| 失败场景 | 行为 | 是否抛异常 |
+|---|---|---|
+| 父目录创建失败 | `_ensure_dir_exists` 返回 False，**静默跳过**该文件写入 | ❌ 不抛 |
+| `open(file, 'a')` 失败（权限、磁盘满等） | 直接抛出 OSError | ✅ 抛异常 |
+| `f.write(...)` 失败 | 直接抛出 OSError | ✅ 抛异常 |
+
+**是否受 ignoreerrors 影响**：❌ 不受影响。`_forceprint` 中没有捕获 OSError 的逻辑，异常会直接向上抛出。
+
+**归档状态**：✅ 已落盘，无回滚。
+
+**注意**：目录创建失败是静默跳过的，不会导致 after_video 阶段失败。只有文件打开/写入本身失败才会抛异常。
+
+---
+
+### 5.5 步骤 B：自定义后处理器（PP）
+
+**行为**：遍历所有注册在 `after_video` 时机的后处理器，依次调用 `run_pp(pp, info)`。
+
+`run_pp` 内部对 `PostProcessingError` 的处理：
+```python
+try:
+    files_to_delete, infodict = pp.run(infodict)
+except PostProcessingError as e:
+    if self.params.get('ignoreerrors') is True:
+        self.report_error(e)
+        return infodict   # 忽略错误，继续下一个 PP
+    raise                # 向上抛出
+```
+
+**是否受 ignoreerrors 影响**：✅ 受影响，但只有 `ignoreerrors is True`（完全等于 True，不包括 'only_download' 等其他真值）时才会忽略。
+
+**失败场景详细分析**：
+
+| 失败场景 | ignoreerrors=True | ignoreerrors=False/None | 归档状态 |
 |---|---|---|---|
-| after_video PP 抛出 PostProcessingError（ignoreerrors≠True） | ✅ 已写入 | ✅ 向上抛出 | ❌ 不回滚 |
-| after_video PP 抛出 PostProcessingError（ignoreerrors=True） | ✅ 已写入 | ❌ 被 run_pp 捕获，继续 | ❌ 不回滚 |
-| max_downloads_reached 抛出 MaxDownloadsReached | ✅ 已写入 | ✅ 向上抛出 | ❌ 不回滚 |
+| PP 抛出 PostProcessingError | report_error + 继续后续 PP | 向上抛出，终止处理 | ✅ 已落盘，无回滚 |
+| PP 抛出非 PostProcessingError 异常（如 OSError、KeyError 等） | 向上抛出（未被捕获） | 向上抛出 | ✅ 已落盘，无回滚 |
 
-**关键原因**：
-- `record_download_archive` 是同步写入文件的（locked_file + write + close），执行完毕即落盘
-- 写入后没有任何回滚机制
-- 即使 after_video 阶段随后失败并抛出异常，归档文件和内存中的 `self.archive` set 都已经包含了该记录
+**关键点**：
+- `ignoreerrors` 只对 `PostProcessingError` 有效
+- PP 如果抛出其他类型异常，无论 ignoreerrors 如何设置，都会向上抛出
+- 异常向上抛出时，后续 PP 不再执行，但归档已写入不会回滚
 
-### 5.4 设计含义
+---
+
+### 5.6 after_video 失败总表
+
+| 失败步骤 | 失败类型 | 受 ignoreerrors 影响 | 异常是否抛出 | 归档是否已写入 | 归档是否回滚 |
+|---|---|---|---|---|---|
+| forceprint 模板渲染失败 | 非 PP 异常 | ❌ 不受 | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
+| print_to_file 目录创建失败 | 非 PP 异常 | ❌ 不受 | ❌ 静默跳过 | ✅ 已写入 | ❌ 不回滚 |
+| print_to_file open/write 失败 | OSError | ❌ 不受 | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
+| 自定义 PP 抛 PostProcessingError | PP 异常 | ✅ 受（ignoreerrors is True 时忽略） | 取决于设置 | ✅ 已写入 | ❌ 不回滚 |
+| 自定义 PP 抛其他异常 | 非 PP 异常 | ❌ 不受 | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
+| max_downloads_reached | 控制流异常 | - | ✅ 抛出 | ✅ 已写入 | ❌ 不回滚 |
+
+---
+
+### 5.7 设计含义
 
 这种"先归档、后 after_video"的顺序意味着：
 
 1. **at-least-once 语义**：只要下载成功就归档，after_video 阶段的失败不影响归档记录。下次运行时该视频会被跳过。
 2. **after_video 适合做"锦上添花"的操作**：如元数据上报、统计、通知等。这些操作失败不应影响视频已下载的事实。
-3. **如果 after_video 失败需要重试**：不能依赖归档去重，需要手动清理归档记录或使用其他机制。
+3. **ignoreerrors 的有限作用**：`ignoreerrors` 只能保护 `PostProcessingError` 类型的 PP 失败，对于 `_forceprint` 中的错误（模板渲染、文件写入）无能为力。
+4. **如果 after_video 失败需要重试**：不能依赖归档去重，需要手动清理归档记录或使用其他机制。
+5. **print_to_file 目录创建静默失败**：目录创建失败不会报错也不会终止流程，可能导致写文件操作被静默跳过而用户不知情。
 
 ---
 
