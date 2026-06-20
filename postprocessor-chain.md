@@ -77,7 +77,7 @@ def pre_process(self, ie_info, key='pre_process', files_to_move=None):
 | `video` | [YoutubeDL.py:3354](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3354-L3354) | 单视频处理入口、文件名确定前 |
 | `before_dl` | [YoutubeDL.py:3449](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3449-L3449) | 字幕/缩略图写入后、实际下载前 |
 
-> **重要更正**：`video` 阶段**会执行后处理器**，并非仅用于打印。它通过 `pre_process` 方法调用，具有错误暂存机制。
+> **重要**：`video` 阶段**会执行后处理器**，并非仅用于打印。它通过 `pre_process` 方法调用，具有错误暂存机制。
 
 #### 方式二：通过 `post_process()` 方法调用（2 个阶段）
 
@@ -303,6 +303,25 @@ except PostProcessingError as err:
 - 用 `is_error=False` 调用 `report_error`，不会立即终止
 - 后续流程继续执行
 
+#### 4.3.2 `post_process` / `after_move` 阶段
+
+在 `post_process` 方法内部，错误直接向上抛出，在外层调用处被捕获：
+
+```python
+# [YoutubeDL.py:3656-3659]
+try:
+    replace_info_dict(self.post_process(dl_filename, info_dict, files_to_move))
+except PostProcessingError as err:
+    self.report_error(f'Postprocessing: {err}')
+    return  # 返回，标记当前视频处理失败
+```
+
+**行为**：当前视频处理失败，返回错误，但播放列表可能继续（取决于外层循环）。
+
+#### 4.3.3 `after_video` / `playlist` 阶段
+
+直接调用 `run_all_pps`，没有外层 try-catch，错误直接向上传播。
+
 ### 4.4 暂存错误的重新抛出机制（4 个检查点详解）
 
 [_raise_pending_errors](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L2822-L2825) 定义：
@@ -341,7 +360,7 @@ return ie_result
 
 ---
 
-#### 检查点 ②：视频结果处理完成后
+#### 检查点 ②：视频结果处理完成后（兜底）
 
 **调用位置**：[YoutubeDL.py:1942](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L1942-L1942)
 
@@ -379,21 +398,49 @@ for fmt, chapter in itertools.product(formats_to_download, requested_ranges):
 
 ---
 
-#### 检查点 ④：下载完成后、后处理之前
+#### 检查点 ④：下载完成后、后处理之前（**仅在 else 块内**）
 
 **调用位置**：[YoutubeDL.py:3596](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3596-L3596)
 
-**代码上下文**：
+**代码上下文**（注意缩进，展示 if-else 结构）：
+
 ```python
-# process_info 内部
-# ... 执行下载、捕获下载异常 ...
-self._raise_pending_errors(info_dict)          # ← 检查点④
-if success and full_filename != '-':
-    fixup()                                     # 动态注入 Fixup PP
-    replace_info_dict(self.post_process(dl_filename, info_dict, files_to_move))
+        if self.params.get('skip_download'):                 # 8 空格 — if 块
+            info_dict['filepath'] = temp_filename            # 12 空格
+            info_dict['__finaldir'] = ...                    # 12 空格
+            info_dict['__files_to_move'] = files_to_move     # 12 空格
+            replace_info_dict(self.run_pp(                   # 12 空格
+                MoveFilesAfterDownloadPP(self, False), info_dict))
+            info_dict['__write_download_archive'] = ...      # 12 空格
+        else:                                                # 8 空格 — else 块
+            info_dict.setdefault('__postprocessors', [])     # 12 空格
+            try:                                             # 12 空格
+                ... # 下载逻辑                               # 16+ 空格
+            except network_exceptions as err:                # 12 空格
+                self.report_error(...)                       # 16 空格
+                return                                       # 16 空格
+            except OSError as err:                           # 12 空格
+                raise UnavailableVideoError(err)             # 16 空格
+            except ContentTooShortError as err:              # 12 空格
+                self.report_error(...)                       # 16 空格
+                return                                       # 16 空格
+
+            self._raise_pending_errors(info_dict)            # 12 空格 ← 检查点④，在 else 内
+            if success and full_filename != '-':             # 12 空格 ← 也在 else 内
+                fixup()                                      # 16 空格
+                try:
+                    replace_info_dict(self.post_process(...))# 20 空格
+                except PostProcessingError as err:
+                    self.report_error(...)                   # 20 空格
+                    return                                   # 16 空格
+                info_dict['__write_download_archive'] = True # 16 空格
+
+        assert info_dict is original_infodict                # 8 空格 — if-else 结束后
 ```
 
-**触发场景**：下载完成（或下载异常被捕获）后，**在执行 fixup 和 `post_process` 之前**检查暂存错误。如果 `before_dl` 阶段暂存了错误，会在进行任何后处理操作之前被抛出。
+> **关键发现**：检查点④（L3596）位于 `else` 块内部（12 空格缩进），**`skip_download` 分支是 `if` 块，不会执行到此行**。`skip_download` 分支执行完 `MoveFilesAfterDownloadPP` 后直接跳到 if-else 之后的 `assert`（L3669）和 `check_max_downloads()`（L3672）。
+
+**触发场景**：仅在**实际下载流程**（else 块）中，下载完成（或下载异常被捕获）后，**在执行 fixup 和 `post_process` 之前**检查暂存错误。如果 `before_dl` 阶段暂存了错误，会在进行任何后处理操作之前被抛出。
 
 ---
 
@@ -424,56 +471,35 @@ process_ie_result
                         │
                         ├─ before_dl 阶段 → 暂存错误
                         │
-                        ├─ 【组 B：路径 11-13】
-                        │    ├─ skip_download / 正常下载
-                        │    ├─ 检查点④（L3596）← 下载后、后处理前
-                        │    ├─ fixup + post_process（不暂存，直接抛出）
-                        │    └─ 正常结束
+                        ├─ skip_download？
+                        │    ├─ 是 → 【路径 SD】MoveFilesAfterDownloadPP → 跳过检查点④
+                        │    │
+                        │    └─ 否 → 【组 B：路径 11-13】下载流程
+                        │         ├─ 检查点④（L3596）← else 块内
+                        │         ├─ fixup + post_process（不暂存，直接抛出）
+                        │         └─ 正常结束
                         │
-                        └─ return
-                   │
-                   └─ 检查点③（L3132）← 每个格式处理完（所有路径都经过）
+                        └─ return → 检查点③
               │
               └─ 检查点②（L1942）← 整个视频处理完（兜底）
 ```
 
 **检查点覆盖率说明**：
 
-| 检查点 | 组 A（路径 1-10） | 组 B（路径 11-13） |
-|--------|------------------|------------------|
-| ④（L3596） | ❌ 不经过 | ✅ 经过 |
-| ③（L3132） | ✅ 经过 | ✅ 经过 |
-| ②（L1942） | ✅ 经过 | ✅ 经过 |
-| ①（L1934） | 仅 extract_flat | 仅 extract_flat |
+| 检查点 | 组 A（路径 1-10） | 路径 SD（skip_download） | 组 B（路径 11-13） |
+|--------|------------------|------------------------|------------------|
+| ④（L3596） | ❌ 不经过 | ❌ 不经过 | ✅ 经过 |
+| ③（L3132） | ✅ 经过 | ✅ 经过 | ✅ 经过 |
+| ②（L1942） | ✅ 经过 | ✅ 经过 | ✅ 经过 |
+| ①（L1934） | 仅 extract_flat | 仅 extract_flat | 仅 extract_flat |
 
 ---
 
-#### 4.3.2 `post_process` / `after_move` 阶段
+### 4.5 `process_info` 中的退出路径与错误检查落点
 
-在 `post_process` 方法内部，错误直接向上抛出，在外层调用处被捕获：
+`process_info` 是单个格式处理的核心函数，内部有多种退出路径，每条路径经过的后处理器阶段和错误检查点不同。
 
-```python
-# [YoutubeDL.py:3656-3659]
-try:
-    replace_info_dict(self.post_process(dl_filename, info_dict, files_to_move))
-except PostProcessingError as err:
-    self.report_error(f'Postprocessing: {err}')
-    return  # 返回，标记当前视频处理失败
-```
-
-**行为**：当前视频处理失败，返回错误，但播放列表可能继续（取决于外层循环）。
-
-#### 4.3.3 `after_video` / `playlist` 阶段
-
-直接调用 `run_all_pps`，没有外层 try-catch，错误直接向上传播。
-
----
-
-#### 4.3.4 `process_info` 中的 11 条返回路径与错误检查落点
-
-`process_info` 是单个格式处理的核心函数，内部有 **11 条返回路径**，每条路径经过的后处理器阶段和错误检查点不同。
-
-##### 关键代码位置
+#### 关键代码位置
 
 `process_info` 入口：[YoutubeDL.py:3331](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3331-L3331)
 
@@ -490,29 +516,35 @@ def replace_info_dict(new_info):
 
 **`info_dict` 通过 `clear()` + `update()` 原地修改**，因此 `__pending_error` 等字段会同步到外层调用者的字典中。
 
-##### 11 条返回路径详解
+#### 路径汇总表
 
-| 路径编号 | 返回位置 | 触发条件 | 经过的 PP 阶段 | 经过的错误检查点 |
-|---------|---------|---------|--------------|----------------|
-| 1 | [L3342](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3342-L3342) | `_match_entry` 不匹配（如标题过滤、日期范围过滤） | 无（`video` 阶段之前） | 检查点③ → 检查点② |
-| 2 | [L3373](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3373-L3373) | `simulate` 模拟模式 | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 3 | [L3376](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3376-L3376) | `full_filename is None`（文件名缺失） | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 4 | [L3378](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3378-L3378) | `_ensure_dir_exists(full_filename)` 失败 | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 5 | [L3380](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3380-L3380) | `_ensure_dir_exists(temp_filename)` 失败 | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 6 | [L3384](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3384-L3384) | `_write_description` 失败（返回 None） | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 7 | [L3388](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3388-L3388) | `_write_subtitles` 失败（返回 None） | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 8 | [L3394](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3394-L3394) | `_write_thumbnails` 失败（返回 None） | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 9 | [L3404](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3404-L3404) | `_write_info_json` 失败（返回 None） | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 10 | [L3447](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3447-L3447) | `_write_link_file` 失败 | `video` 阶段（L3354） | 检查点③ → 检查点② |
-| 11 | [L3594](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3594-L3594) | 下载异常（网络错误、文件过短等） | `video` + `before_dl` 阶段 | 检查点④ → 检查点③ → 检查点② |
-| 12 | [L3659](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3659-L3659) | `post_process` 异常 | `video` + `before_dl` 阶段 | 检查点④ → 检查点③ → 检查点② |
-| 13 | 函数结束 | 正常执行完成 | `video` + `before_dl` 阶段 | 检查点④ → 检查点③ → 检查点② |
+| 路径编号 | 返回位置 | 触发条件 | 经过的 PP 阶段 | 经过检查点④ | 经过检查点 |
+|---------|---------|---------|--------------|------------|-----------|
+| 1 | [L3342](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3342-L3342) | `_match_entry` 不匹配 | 无 | ❌ | ③ → ② |
+| 2 | [L3373](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3373-L3373) | `simulate` 模拟模式 | `video` | ❌ | ③ → ② |
+| 3 | [L3376](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3376-L3376) | `full_filename is None` | `video` | ❌ | ③ → ② |
+| 4 | [L3378](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3378-L3378) | `_ensure_dir_exists` 失败（full） | `video` | ❌ | ③ → ② |
+| 5 | [L3380](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3380-L3380) | `_ensure_dir_exists` 失败（temp） | `video` | ❌ | ③ → ② |
+| 6 | [L3384](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3384-L3384) | `_write_description` 失败 | `video` | ❌ | ③ → ② |
+| 7 | [L3388](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3388-L3388) | `_write_subtitles` 失败 | `video` | ❌ | ③ → ② |
+| 8 | [L3394](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3394-L3394) | `_write_thumbnails` 失败 | `video` | ❌ | ③ → ② |
+| 9 | [L3404](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3404-L3404) | `_write_info_json` 失败 | `video` | ❌ | ③ → ② |
+| 10 | [L3447](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3447-L3447) | `_write_link_file` 失败 | `video` | ❌ | ③ → ② |
+| SD | if-else 后 | `skip_download` 跳过下载 | `video` + `before_dl` | ❌ | ③ → ② |
+| 11 | [L3480](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3480-L3480) | 分段下载不支持（return） | `video` + `before_dl` | ❌ | ③ → ② |
+| 12 | [L3538](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3538-L3538) | ffmpeg 未安装且 abort（return） | `video` + `before_dl` | ❌ | ③ → ② |
+| 13 | [L3558](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3558-L3558) | 分格式下载时 `_ensure_dir_exists` 失败 | `video` + `before_dl` | ❌ | ③ → ② |
+| 14 | [L3589](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3589-L3589) | 网络异常（return） | `video` + `before_dl` | ❌ | ③ → ② |
+| 15 | [L3594](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3594-L3594) | 内容过短（return） | `video` + `before_dl` | ❌ | ③ → ② |
+| 16 | [L3660](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3660-L3660) | `post_process` 异常（return） | `video` + `before_dl` | ✅ | ④ → ③ → ② |
+| 17 | [L3666](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3666-L3666) | post_hook 异常（return） | `video` + `before_dl` | ✅ | ④ → ③ → ② |
+| 18 | 函数结束 | 正常执行完成 | `video` + `before_dl` | ✅ | ④ → ③ → ② |
 
-> **注意**：路径 1-10 共 10 条提前返回路径，加上路径 11-13 共 13 种退出方式。文档中说"11 条返回路径"是指提前 return 的路径（L3342-L3447 共 10 条 + L3594 共 11 条），L3659 是在外层 catch 中 return，不算函数内部的 return。
+> **路径分组关键区分**：检查点④（L3596）位于 `else` 块内部，只有经过**实际下载流程**（`else` 分支）且没有在 try 块中提前 return 的路径，才会到达检查点④。在 try 块内 return 的路径（L3480、L3538、L3558、L3589、L3594）虽然也进入了 else 块，但在 return 之前还未执行到检查点④。
 
 ---
 
-##### 路径 2：`simulate` 模拟运行路径详解
+#### 路径 2：`simulate` 模拟运行路径详解
 
 **代码位置**：[YoutubeDL.py:3370-3373](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3370-L3373)
 
@@ -537,7 +569,7 @@ if self.params.get('simulate'):
 
 ---
 
-##### 路径 3：文件名缺失 `full_filename is None`
+#### 路径 3：文件名缺失 `full_filename is None`
 
 **代码位置**：[YoutubeDL.py:3375-3376](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3375-L3376)
 
@@ -566,7 +598,7 @@ if full_filename is None:
 
 ---
 
-##### 路径 4-5：目录创建失败
+#### 路径 4-5：目录创建失败
 
 **代码位置**：[YoutubeDL.py:3377-3380](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3377-L3380)
 
@@ -607,21 +639,20 @@ def _ensure_dir_exists(self, path):
 
 ---
 
-##### `skip_download` 跳过下载路径详解
-
-**注意**：`skip_download` 不是提前返回路径，而是不执行下载，但继续执行后续流程。
+#### 路径 SD：`skip_download` 跳过下载路径详解
 
 **代码位置**：[YoutubeDL.py:3452-3457](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3452-L3457)
 
 ```python
-if self.params.get('skip_download'):
-    info_dict['filepath'] = temp_filename
-    info_dict['__finaldir'] = os.path.dirname(os.path.abspath(full_filename))
-    info_dict['__files_to_move'] = files_to_move
-    replace_info_dict(self.run_pp(MoveFilesAfterDownloadPP(self, False), info_dict))
-    info_dict['__write_download_archive'] = self.params.get('force_write_download_archive')
-else:
-    # 正常下载流程...
+if self.params.get('skip_download'):                              # 8 空格 — if 块
+    info_dict['filepath'] = temp_filename                         # 12 空格
+    info_dict['__finaldir'] = os.path.dirname(...)                # 12 空格
+    info_dict['__files_to_move'] = files_to_move                  # 12 空格
+    replace_info_dict(self.run_pp(                                # 12 空格
+        MoveFilesAfterDownloadPP(self, False), info_dict))
+    info_dict['__write_download_archive'] = ...                   # 12 空格
+else:                                                             # 8 空格 — else 块
+    ...  # 检查点④、fixup、post_process 全在 else 内
 ```
 
 **执行顺序**：
@@ -630,37 +661,41 @@ else:
 3. `pre_process(info_dict, 'before_dl')` [L3449] → `before_dl` 阶段
 4. `skip_download` 分支 [L3452]
    - 直接调用 `MoveFilesAfterDownloadPP` 移动文件
-5. 检查点④ `_raise_pending_errors` [L3596]
-6. fixup + `post_process` [L3656]
+   - 设置 `__write_download_archive`
+5. 跳过整个 `else` 块 → 直接到 [L3669](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3669-L3669) `assert` + `check_max_downloads()`
 
 **错误检查落点**：
-- 会经过检查点④（L3596）
-- 会经过检查点③（L3132）和检查点②（L1942）
-- `post_process` 阶段的错误不暂存，直接在外层捕获
+- ❌ **不会**经过检查点④（L3596）— 因为检查点④在 `else` 块内部
+- ❌ **不会**执行 fixup 和 `post_process` — 同样在 `else` 块内部
+- ✅ 会经过检查点③（L3132）和检查点②（L1942）
+
+**关键理解**：`skip_download` 分支虽然经过了 `video` + `before_dl` 两个阶段，但与正常下载路径的核心区别是：**检查点④、fixup、`post_process` 全部在 `else` 块中，`skip_download` 的 `if` 块不会进入**。暂存错误只能等到检查点③才被处理。
 
 ---
 
-##### 正常下载路径
+#### 正常下载路径（组 B）
 
-**代码位置**：[YoutubeDL.py:3458-3659](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3458-L3659)
+**代码位置**：[YoutubeDL.py:3458-3667](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3458-L3667)（`else` 块内部）
 
 **执行顺序**：
 1. `pre_process(info_dict, 'video')` [L3354] → `video` 阶段
 2. 文件写入 [L3382-3447]
 3. `pre_process(info_dict, 'before_dl')` [L3449] → `before_dl` 阶段
-4. 执行下载（try-catch 包裹）[L3461-3594]
-5. 检查点④ `_raise_pending_errors` [L3596]
-6. fixup 后处理器动态注入 [L3598-3621]
-7. `post_process` [L3656] → `post_process` + `after_move` 阶段
+4. 进入 `else` 块 [L3458]
+5. 执行下载（try-catch 包裹）[L3461-3594]
+6. 检查点④ `_raise_pending_errors` [L3596]
+7. fixup 后处理器动态注入 [L3598-3653]
+8. `post_process` [L3656] → `post_process` + `after_move` 阶段
+9. post_hooks [L3661-3666]
 
 **错误检查落点**：
-- 下载异常会被捕获，然后执行检查点④（L3596）
-- 正常下载成功也会执行检查点④（L3596）
+- 下载异常被捕获后，执行检查点④（L3596）
+- 正常下载成功也执行检查点④（L3596）
 - `post_process` 阶段错误不暂存，直接在外层捕获
 
 ---
 
-### 4.5 失败传播路径图
+### 4.6 失败传播路径图
 
 ```
 后处理器抛出 PostProcessingError
@@ -675,14 +710,17 @@ else:
                 ├─ pre_process() 包装 → 存入 __pending_error → 继续后续步骤 ⚠️
                 │    （pre_process / after_filter / video / before_dl）
                 │    │
-                │    ├─ 【路径 1-10】提前 return（L3342-L3447）
+                │    ├─ 【组 A：路径 1-10】before_dl 之前提前 return
                 │    │    └─ 跳过检查点④ → 检查点③（L3132）→ 检查点②（L1942）
                 │    │
-                │    ├─ 【路径 11-13】下载/正常结束（L3594-函数结束）
-                │    │    └─ 检查点④（L3596）→ 检查点③（L3132）→ 检查点②（L1942）
+                │    ├─ 【路径 SD】skip_download（if 块）
+                │    │    └─ 跳过检查点④（else 块内）→ 检查点③ → 检查点②
                 │    │
-                │    ├─ 检查点①（L1934）：平铺结果返回后
-                │    └─ 检查点②（L1942）：视频结果最终返回后（兜底）
+                │    ├─ 【路径 11-15】下载流程中提前 return（else→try 内）
+                │    │    └─ 跳过检查点④ → 检查点③ → 检查点②
+                │    │
+                │    └─ 【路径 16-18】下载完成后（else→try 后）
+                │         └─ 检查点④（L3596）→ 检查点③ → 检查点②
                 │
                 ├─ post_process() 方法 → 向上抛出 → 外层捕获 → 视频失败 ❌
                 │    （post_process / after_move）
@@ -691,18 +729,7 @@ else:
                      （after_video / playlist）
 ```
 
-**路径分组说明**：
-- **路径 1**：`_match_entry` 不匹配（L3342），无暂存错误
-- **路径 2-10**：`simulate`、文件名缺失、目录创建失败、文件写入失败（L3373-L3447）
-  - 只经过 `video` 阶段（L3354）
-  - 不经过检查点④（L3596）
-  - 由检查点③（L3132）处理
-- **路径 11-13**：下载异常、`post_process` 异常、正常结束（L3594-函数结束）
-  - 经过 `video` + `before_dl` 两个阶段
-  - 经过检查点④（L3596）
-  - 再经过检查点③（L3132）
-
-### 4.6 文件清理规则
+### 4.7 文件清理规则
 
 执行成功后，后处理器返回的 `files_to_delete` 列表中的文件会被处理：
 
@@ -756,31 +783,33 @@ process_ie_result
                         │
                         ├─ skip_download？
                         │    │
-                        │    ├─ 是 → 直接执行 MoveFilesAfterDownloadPP
+                        │    ├─ 是 → 【路径 SD】
+                        │    │    ├─ MoveFilesAfterDownloadPP
+                        │    │    └─ 跳过 else 块 → 函数结束 → 检查点③
                         │    │
-                        │    └─ 否 → 执行下载（try-catch 捕获异常）
+                        │    └─ 否 → 进入 else 块【实际下载流程】
                         │         │
-                        │         └─ 下载异常？ ── 是 → 【路径 11】
-                        │
-                        ├─ 检查点④：_raise_pending_errors ← 后处理之前
-                        │    │
-                        │    └─ （路径 2-10 不经过这里）
-                        │
-                        ├─ 下载成功？
-                        │    │
-                        │    ├─ 否 → return → 检查点③
-                        │    │
-                        │    └─ 是 → 动态注入 __postprocessors（Merger, Fixup）
+                        │         ├─ try: 下载逻辑
+                        │         │    ├─ 各种异常 → return → 检查点③
+                        │         │    └─ 成功
                         │         │
-                        │         └─ post_process() 方法
-                        │              ├─ additional_pps（__postprocessors）
-                        │              ├─ [post_process] 静态链
-                        │              ├─ MoveFilesAfterDownloadPP（硬编码）
-                        │              └─ [after_move] 阶段
-                        │              │
-                        │              └─ 异常？ ── 是 → 【路径 12】
+                        │         ├─ 检查点④：_raise_pending_errors ← 后处理之前
+                        │         │    （仅 else 块内可达，skip_download 不经过）
+                        │         │
+                        │         ├─ 下载成功？
+                        │         │    │
+                        │         │    ├─ 是 → fixup + 动态注入 __postprocessors
+                        │         │    │    └─ post_process() 方法
+                        │         │    │         ├─ additional_pps
+                        │         │    │         ├─ [post_process] 静态链
+                        │         │    │         ├─ MoveFilesAfterDownloadPP（硬编码）
+                        │         │    │         └─ [after_move] 阶段
+                        │         │    │
+                        │         │    └─ 否 → return → 检查点③
+                        │         │
+                        │         └─ else 块结束
                         │
-                        └─ 【路径 13】正常结束 → 检查点③
+                        └─ 函数结束 → 检查点③
                    │
                    └─ 检查点③：_raise_pending_errors ← 每个格式完成
 
@@ -793,18 +822,18 @@ process_ie_result
               └─ 播放列表完成 → [playlist] 阶段
 ```
 
-### 路径汇总表
+### 路径分组汇总
 
-| 路径 | 触发条件 | 经过 PP 阶段 | 经过检查点 |
-|------|---------|-------------|-----------|
-| 1 | `_match_entry` 不匹配 | 无 | ③ → ② |
-| 2 | `simulate` 模拟模式 | `video` | ③ → ② |
-| 3 | `full_filename is None` | `video` | ③ → ② |
-| 4-5 | 目录创建失败 | `video` | ③ → ② |
-| 6-10 | 文件写入失败 | `video` | ③ → ② |
-| 11 | 下载异常 | `video` + `before_dl` | ④ → ③ → ② |
-| 12 | `post_process` 异常 | `video` + `before_dl` | ④ → ③ → ② |
-| 13 | 正常完成 | `video` + `before_dl` | ④ → ③ → ② |
+| 组 | 路径 | 触发条件 | 经过 PP 阶段 | 经过检查点④ | 经过检查点 |
+|----|------|---------|-------------|------------|-----------|
+| A | 1 | `_match_entry` 不匹配 | 无 | ❌ | ③ → ② |
+| A | 2 | `simulate` | `video` | ❌ | ③ → ② |
+| A | 3-10 | 文件名/目录/写入失败 | `video` | ❌ | ③ → ② |
+| SD | SD | `skip_download` | `video` + `before_dl` | ❌ | ③ → ② |
+| B | 11-15 | 下载流程内异常 return | `video` + `before_dl` | ❌ | ③ → ② |
+| B | 16-18 | 下载完成后 | `video` + `before_dl` | ✅ | ④ → ③ → ② |
+
+**核心规律**：只有进入 `else` 块（实际下载流程）**且不在 try 块内 return** 的路径，才会到达检查点④。
 
 ---
 
@@ -815,33 +844,33 @@ process_ie_result
 2. **4 个阶段有错误暂存**：`pre_process`、`after_filter`、`video`、`before_dl` 通过 `pre_process()` 方法调用，错误暂存到 `__pending_error`，不会立即终止。
 
 3. **暂存错误有 4 个检查点**（按执行顺序）：
-   - 检查点④ [L3596]：下载完成后、后处理之前（最内层、最早触发）
+   - 检查点④ [L3596]：下载完成后、后处理之前（最内层、最早触发，**仅 else 块可达**）
    - 检查点③ [L3132]：每个格式 `process_info` 返回后
    - 检查点① [L1934]：`extract_flat` 平铺结果返回后
    - 检查点② [L1942]：视频结果最终返回后（兜底）
 
 4. **`_raise_pending_errors` 会清空错误**：使用 `pop` 操作，错误被处理后不会重复抛出。
 
-5. **`additional_pps` 执行顺序**：动态添加的后处理器（如 Merger、Fixup）**先于**静态链执行，且只作用于 `post_process` 阶段。
+5. **`skip_download` 不经过检查点④**：`skip_download` 是 `if` 块，检查点④在 `else` 块内部（12 空格缩进）。`skip_download` 分支执行完 `MoveFilesAfterDownloadPP` 后直接跳到 if-else 之后的代码（L3669），暂存错误只能等到检查点③处理。
 
-6. **`ignoreerrors` 的精确判断**：必须是 `True` 才忽略后处理错误，`'only_download'` 不生效。
+6. **`skip_download` 也不执行 fixup 和 `post_process`**：这些代码全部在 `else` 块内部的 `if success` 分支中，`skip_download` 分支不会进入。
 
-7. **`MoveFilesAfterDownloadPP` 的硬编码插入**：在 `post_process` 和 `after_move` 之间强制执行，不经过常规链管理。`skip_download` 模式下会更早执行（`before_dl` 之后直接调用）。
+7. **下载流程内 try 块的 return 也不经过检查点④**：路径 11-15（分段下载不支持、ffmpeg 未安装、目录创建失败、网络异常、内容过短）在 try 块内 return，此时还未执行到 L3596。
 
-8. **`_restrict_to` 的 `simulated` 参数**：设为 `False` 时，模拟模式会跳过该后处理器。
+8. **只有路径 16-18 经过检查点④**：即下载成功完成后、fixup 之前、post_process 异常、post_hook 异常、正常完成。
 
-9. **返回值约定**：跳过执行时必须返回 `([], info)` 而不是 `None`，否则元类包装会因解包失败报错。
+9. **`additional_pps` 执行顺序**：动态添加的后处理器（如 Merger、Fixup）**先于**静态链执行，且只作用于 `post_process` 阶段。
 
-10. **`simulate` 模式的检查点跳跃**：`simulate` 模式下 `process_info` 在 L3373 提前返回，**不会经过检查点④**（L3596），暂存错误会推迟到检查点③（L3132）才处理。
+10. **`ignoreerrors` 的精确判断**：必须是 `True` 才忽略后处理错误，`'only_download'` 不生效。
 
-11. **文件名缺失/目录创建失败也会跳过检查点④**：`full_filename is None` 或 `_ensure_dir_exists` 失败时，同样在 `before_dl` 阶段之前返回，不会执行检查点④。
+11. **`MoveFilesAfterDownloadPP` 的两种执行位置**：
+    - `skip_download`：在 `if` 块内直接调用 [L3456](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3456-L3456)
+    - 正常下载：在 `post_process` 方法中硬编码插入 [L3844](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3844-L3844)
 
-12. **13 条退出路径分两组**：
-    - **组 A（路径 1-10）**：`before_dl` 阶段之前返回，只经过 `video` 阶段，不经过检查点④
-    - **组 B（路径 11-13）**：经过完整流程，经过 `video` + `before_dl` 两个阶段，会经过检查点④
+12. **`_restrict_to` 的 `simulated` 参数**：设为 `False` 时，模拟模式会跳过该后处理器。
 
-13. **`info_dict` 原地修改机制**：通过 `clear()` + `update()` 原地修改，外层调用者无需重新赋值即可读取 `__pending_error`。
+13. **返回值约定**：跳过执行时必须返回 `([], info)` 而不是 `None`，否则元类包装会因解包失败报错。
 
-14. **`_match_entry` 不匹配路径最特殊**：在 `video` 阶段之前返回，不会执行任何后处理器，也不会产生 `__pending_error`。
+14. **`info_dict` 原地修改机制**：通过 `clear()` + `update()` 原地修改，外层调用者无需重新赋值即可读取 `__pending_error`。
 
-15. **`skip_download` 不是提前返回**：不执行下载，但会继续执行 `before_dl` 阶段、检查点④和 `post_process`，错误检查路径与正常下载完全相同。
+15. **`_match_entry` 不匹配路径最特殊**：在 `video` 阶段之前返回，不会执行任何后处理器，也不会产生 `__pending_error`。
