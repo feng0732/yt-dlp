@@ -147,19 +147,35 @@ def selector_function(ctx):
 
 ### 示例
 
-表达式 `bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b` 的回退链：
+表达式 `bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b` 是一个三层嵌套的二选一结构。
+虽然代码上是嵌套二叉树，但从效果上看等价于按顺序的回退链：
 
 1. 先尝试 `bv*[ext=mp4]+ba[ext=m4a]` — mp4 视频 + m4a 音频合并
 2. 失败则回退到 `b[ext=mp4]` — 预合并的 mp4 格式
 3. 再失败则回退到 `bv*+ba` — 任意最佳视频 + 任意最佳音频
 4. 最后回退到 `b` — 任意最佳预合并格式
 
-### 右结合性
+### 右结合性（嵌套二选一结构）
 
-`a/b/c` 被解析为 `PICKFIRST(a, PICKFIRST(b, c))`，即：
-- 先尝试 a
-- 失败则尝试 b
-- 再失败则尝试 c
+`a/b/c` 被解析为 `PICKFIRST(a, PICKFIRST(b, PICKFIRST(c, ...)))` —— 即每次都是一个二选一，第二个选项本身可以是另一个二选一。
+
+结构示意（嵌套二叉树）：
+```
+PICKFIRST
+├── a
+└── PICKFIRST
+    ├── b
+    └── c
+```
+
+执行流程：
+1. 先尝试最外层左分支 `a` → 有结果直接返回
+2. 失败 → 进入外层右分支（本身又是一个 PICKFIRST）
+3. 尝试内层左分支 `b` → 有结果直接返回
+4. 失败 → 进入内层右分支 `c`
+5. 有结果返回，没有结果则最终返回空
+
+从效果上看等价于"按顺序从左到右逐一尝试，取第一个成功的"，但代码结构上是**逐层嵌套的二选一**，而非扁平的多分支列表。
 
 ---
 
@@ -253,8 +269,12 @@ elif format_spec == 'mergeall':
 1. 先过滤掉 `acodec==none 且 vcodec==none` 的 storyboard 等无效格式
 2. `ctx['formats']` 是按"最差→最优"排序，所以 `formats[-1]` 是最优格式
 3. 以最优格式为起点，从次优到最差依次调用 `_merge` 层层合并
-4. 最终只产出**一个合并结果**，包含所有视频/音频流的信息
-5. 受多流策略约束：若未启用 `--video-multistreams` / `--audio-multistreams`，`_merge` 内部会按遍历顺序保留**先遇到的**视频流和**先遇到的**音频流，后续同类型流被丢弃
+4. 最终只产出**一个合并结果**
+5. 实际保留的流数量由多流策略决定：
+   - **双多流都开启**：`--video-multistreams` 且 `--audio-multistreams` → 包含**所有**视频流和音频流
+   - **仅开视频多流**：保留所有视频流，仅保留第一个音频流
+   - **仅开音频多流**：保留所有音频流，仅保留第一个视频流
+   - **都不开启（默认）**：仅保留先遇到的一个视频流和先遇到的一个音频流
 
 **多流关闭时 `_merge` 的流选择细节**：
 ```python
@@ -430,37 +450,59 @@ def final_selector(ctx):
 
 ### 默认格式规格
 
-| 条件 | 默认规格 |
-|------|----------|
-| 输出到 stdout 或 ffmpeg 不可用 | `best/bestvideo+bestaudio` |
-| 兼容模式（`--audio-multistreams` 或 `format-spec` compat） | `bestvideo+bestaudio/best` |
-| 默认 | `bestvideo*+bestaudio/best` |
+默认格式规格由 `_default_format_spec(info_dict)` 方法决定，涉及三层条件判断：
+
+**第一层：`prefer_best` 判定（优先使用预合并格式）**
+
+满足以下任一条件时，`prefer_best = True`：
+1. **输出到 stdout**：`self.params['outtmpl']['default'] == '-'` — 流式输出时不便合并多格式
+2. **直播且非从头开始**：`info_dict.get('is_live') and not self.params.get('live_from_start')` — 直播流实时推送，合并操作无法进行
+3. **ffmpeg 不可用且当前未设置 prefer_best**：后续逻辑补充的条件
+
+**第二层：ffmpeg 可用性检查与告警**
+
+若 `prefer_best` 为 False 且 ffmpeg 不可用（`can_merge() == False`）：
+1. 强制设置 `prefer_best = True` — 因为没有 ffmpeg 就无法做格式合并
+2. 调用 `_get_formats(info_dict)` 预取格式列表
+3. 分别用 `'b/bv+ba'` 和 `'bv*+ba/b'` 两套规格执行选择
+4. 若两套规格的选择结果**不一致**（即有 ffmpeg 时能选出更好的组合），则输出告警：
+   > "ffmpeg not found. The downloaded format may not be the best available. Installing ffmpeg is strongly recommended"
+
+**第三层：最终规格选定**
+
+| 条件 | 默认规格 | 说明 |
+|------|----------|------|
+| `prefer_best == True` | `best/bestvideo+bestaudio` | stdout / 直播 / 无 ffmpeg |
+| `compat == True` | `bestvideo+bestaudio/best` | 多音频流或 format-spec 兼容模式 |
+| 默认 | `bestvideo*+bestaudio/best` | 常规情况 |
+
+`compat` 触发条件：`--audio-multistreams` 开启，或 `compat_opts` 包含 `'format-spec'`。
 
 ---
 
 ## 十、表达式求值示例
 
-### `bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4] / bv*+ba/b`
+### `bv*[ext=mp4]+ba[ext=m4a]/b[ext=mp4]/bv*+ba/b`
 
 ```
-解析树:
+解析树（嵌套二选一结构）:
 PICKFIRST
-├── MERGE
-│   ├── SINGLE("bv*") with filter ext=mp4
-│   └── SINGLE("ba") with filter ext=m4a
-├── SINGLE("b") with filter ext=mp4
-├── MERGE
-│   ├── SINGLE("bv*")
-│   └── SINGLE("ba")
-└── SINGLE("b")
+├── MERGE(SINGLE("bv*")[ext=mp4], SINGLE("ba")[ext=m4a])
+└── PICKFIRST
+    ├── SINGLE("b")[ext=mp4]
+    └── PICKFIRST
+        ├── MERGE(SINGLE("bv*"), SINGLE("ba"))
+        └── SINGLE("b")
 ```
 
-执行流程：
-1. 尝试 mp4 最佳含视频 + m4a 最佳纯音频 → 有结果则返回
-2. 失败 → 尝试 mp4 最佳预合并 → 有结果则返回
-3. 失败 → 尝试任意最佳含视频 + 任意最佳纯音频 → 有结果则返回
-4. 失败 → 尝试任意最佳预合并 → 有结果则返回
-5. 全部失败 → 返回空列表
+执行流程（逐层短路回退）：
+1. 最外层左分支：尝试 mp4 最佳含视频 + m4a 最佳纯音频 → 有结果则返回
+2. 失败 → 进入第一层右分支（本身是 PICKFIRST）
+3. 第二层左分支：尝试 mp4 最佳预合并 → 有结果则返回
+4. 失败 → 进入第二层右分支（本身是 PICKFIRST）
+5. 第三层左分支：尝试任意最佳含视频 + 任意最佳纯音频 → 有结果则返回
+6. 失败 → 进入第三层右分支：尝试任意最佳预合并 → 有结果则返回
+7. 全部失败 → 返回空列表
 
 ### `bv,bv.2,ba`
 
