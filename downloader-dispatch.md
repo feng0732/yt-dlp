@@ -99,17 +99,60 @@ def get_suitable_downloader(info_dict, params={}, default=NO_DEFAULT, protocol=N
     # 特殊规则1：所有子协议都指向 FFmpeg 且支持直接合并 -> 直接返回 FFmpegFD
     if set(downloaders) == {FFmpegFD} and FFmpegFD.can_merge_formats(info_copy, params):
         return FFmpegFD
-    # 特殊规则2：全部是 DASH 生成器（直播回放）且非 stdout 多协议 -> 返回 DashSegmentsFD
+    # 特殊规则2：全部是 DASH 生成器（--live-from-start 回放）且非 stdout 多协议 -> 返回 DashSegmentsFD
     elif (set(downloaders) == {DashSegmentsFD}
           and not (to_stdout and len(protocols) > 1)
           and set(protocols) == {'http_dash_segments_generator'}):
         return DashSegmentsFD
-    # 特殊规则3：只有一个下载器（单协议 / 多协议但都选了同一个） -> 直接返回
+    # 特殊规则3：**只有一个协议**（协议列表长度为 1）时直接返回对应下载器
     elif len(downloaders) == 1:
         return downloaders[0]
-    # 多协议下载器不一致：返回 None，交给上层 YoutubeDL 做路径拆分
+    # 其他所有多协议情况：返回 None，交给上层 YoutubeDL 做路径拆分
     return None
 ```
+
+---
+
+#### ⚠️ 关键澄清：多协议聚合判断的真实条件（修正之前的错误）
+
+**之前错误结论**：
+> 特殊规则3："只有一个下载器（单协议 / 多协议但都选了同一个）→ 直接返回"
+
+**正确结论**：
+
+`downloaders` 是一个**列表**，长度永远等于 `protocols` 长度（即协议数量），不是集合。
+
+| 判断条件 | 含义 | 触发场景 |
+|---------|------|---------|
+| `len(downloaders) == 1` | **只有 1 个协议**（`protocol` 中无 `+`） | 单轨视频 / 单轨音频 / 纯字幕 |
+| `set(downloaders) == {FFmpegFD}` + `can_merge_formats` | 所有子协议都选了 FFmpegFD + FFmpeg 可直接合并 | 多轨全是 m3u8 / 多轨全是 http+直播 DASH 等 |
+| `set(downloaders) == {DashSegmentsFD}` + `set(protocols) == {'http_dash_segments_generator'}` | **所有子协议全是 `http_dash_segments_generator`** 且非 stdout 多协议 | 仅限 `--live-from-start` 的 DASH 直播回放多轨 |
+| 其他所有多协议情况 | 返回 `None` | **普通 DASH 多轨 / DASH+HLS 混合 / HTTP+DASH 等** |
+
+**多协议返回非 None 的情况只有 2.5 种**：
+
+```
+多协议 (len(protocols) >= 2)?
+  │
+  ├─> 所有下载器都是 FFmpegFD + can_merge_formats?
+  │   └─> 是 → FFmpegFD（FFmpeg 多输入 -i 直接合并）
+  │
+  ├─> 所有下载器都是 DashSegmentsFD
+  │   && 所有协议都是 http_dash_segments_generator（仅限 --live-from-start）
+  │   && 非 stdout 多协议?
+  │   └─> 是 → DashSegmentsFD（内部通过 requested_formats 处理多轨）
+  │
+  └─> 其他任何情况?
+      └─> 返回 None → YoutubeDL 做路径拆分，逐轨道独立下载
+```
+
+**典型反例（之前文档错误，现已纠正）**：
+- `http_dash_segments + http_dash_segments`（普通 DASH 音视频分轨）→ **返回 None**，不会统一 DashSegmentsFD！
+  - `set(downloaders) == {DashSegmentsFD}` ✅
+  - 但 `set(protocols) == {'http_dash_segments'}`，不是 `{'http_dash_segments_generator'}` ❌
+  - 条件不满足 → 返回 `None` → YoutubeDL 走路径拆分
+
+---
 
 **`can_merge_formats` 条件**（FFmpegFD 直接合并）：
 位置：`yt_dlp/downloader/external.py` L387-L393
@@ -282,6 +325,7 @@ protocol = m3u8 或 m3u8_native
 ### 3.3 DASH 下载（DashSegmentsFD vs FFmpegFD —— **纠正之前错误结论**）
 
 > **重要修正**：DASH **并非始终**走 DashSegmentsFD 原生分片。至少有 **5 条路径** 会交给 FFmpegFD 处理。
+> **此外，普通 DASH 多轨（非 generator）也不会统一走 DashSegmentsFD，而是返回 None 走路径拆分。**
 
 #### 3.3.1 FFmpeg 处理 DASH 的 5 种情况
 
@@ -290,7 +334,7 @@ protocol = m3u8 或 m3u8_native
 | 1 | 有 `section_start`/`section_end` 分段截取需求 + FFmpeg 可用 | `_get_suitable_downloader` ① |
 | 2 | 用户指定 `--downloader ffmpeg`（或其他支持 DASH 的外部下载器） | `_get_suitable_downloader` ② + `FFmpegFD.SUPPORTED_PROTOCOLS` 含 `http_dash_segments` |
 | 3 | `is_live=True` + 非强制 `native` | `_get_suitable_downloader` ④ |
-| 4 | 多协议（音视频分轨）都返回 FFmpegFD + `can_merge_formats` 满足 | `get_suitable_downloader` 特殊规则 ① |
+| 4 | 多协议（音视频分轨）都返回 FFmpegFD + `can_merge_formats` 满足 | `get_suitable_downloader` 特殊规则 1 |
 | 5 | 输出到 stdout + 多格式可合并 | `_get_suitable_downloader` ③ |
 
 ---
@@ -327,11 +371,14 @@ if info_dict.get('is_live'):
 
 ---
 
-#### 3.3.3 DashSegmentsFD（原生分片下载）
+#### 3.3.3 DashSegmentsFD（原生分片下载）—— 单轨 & DASH 直播回放多轨
 
 **分派路径**（满足以下全部条件）：
+
 ```
-protocol = http_dash_segments / http_dash_segments_generator
+场景 A：单轨 DASH
+─────────────────
+protocol = http_dash_segments / http_dash_segments_generator（单协议，len==1）
   │
   ├─> ① 无分段截取需求
   ├─> ② 未指定支持 DASH 的外部下载器（或指定了 native）
@@ -339,43 +386,87 @@ protocol = http_dash_segments / http_dash_segments_generator
   ├─> ④ 非 is_live 或 强制 native（后者会报错）
   │
   ▼
-PROTOCOL_MAP → DashSegmentsFD
+len(downloaders) == 1 → 返回 PROTOCOL_MAP 中的 DashSegmentsFD
 ```
 
-**适用场景**：
-- 非直播 DASH 分片视频（`http_dash_segments`）
-- DASH 直播回放（`http_dash_segments_generator`，即 `--live-from-start`）
+```
+场景 B：DASH 直播回放多轨（--live-from-start）
+──────────────────────────────────────────────
+protocol = http_dash_segments_generator + http_dash_segments_generator + ...
+  │
+  ├─> set(downloaders) == {DashSegmentsFD} ✅
+  ├─> set(protocols) == {'http_dash_segments_generator'} ✅
+  ├─> 非 (to_stdout && len(protocols) > 1) ✅
+  │
+  ▼
+特殊规则 2 → 返回 DashSegmentsFD（唯一能多协议统一的非 FFmpeg 场景）
+```
 
-**内部再分派**（DashSegmentsFD.real_download）：
+> **⚠️ 重要反例（纠正之前错误）**：
+> - `protocol = http_dash_segments + http_dash_segments`（普通 DASH 音视频分轨）
+>   - `set(protocols) == {'http_dash_segments'}`，**不是** `{'http_dash_segments_generator'}`
+>   - 不满足特殊规则 2
+>   - `len(downloaders) == 2 ≠ 1`，不满足特殊规则 3
+>   - → **返回 `None` → 走 YoutubeDL 路径拆分**，逐轨道独立下载！
+
+**适用场景**：
+- 非直播 DASH 分片视频（`http_dash_segments`，单轨）
+- DASH 直播回放（`http_dash_segments_generator`，即 `--live-from-start`，单轨或多轨）
+
+**内部多轨处理**（DashSegmentsFD.real_download）：
 位置：`yt_dlp/downloader/dash.py` L17-L68
 
+```python
+# DashSegmentsFD 内部本身支持多轨（通过 requested_formats）
+requested_formats = [{**info_dict, **fmt} for fmt in info_dict.get('requested_formats', [])]
+args = []
+for fmt in requested_formats or [info_dict]:
+    ...
+    args.append([ctx, fragments_to_download, fmt])
+# 同时下载多个轨道的片段
+return self.download_and_append_fragments_multiple(*args, is_fatal=lambda idx: idx == 0)
+```
+
+但这段多轨逻辑**只有在 DashSegmentsFD 被调用时才会执行**，而多轨场景下它被调用的**唯一机会**是所有协议都是 `http_dash_segments_generator`（`--live-from-start` 回放）。
+
+**内部再分派逻辑**：
 1. 如果是 `http_dash_segments_generator`（直播回放/`--live-from-start`），明确不使用外部下载器
 2. 普通 DASH：尝试寻找支持 `dash_frag_urls` 的外部下载器（目前内置均不支持）
 3. 找到 → 将所有片段 URL 列表放入 `info_dict['fragments']`，委托外部下载器批量下载
 4. 未找到 → 使用 `FragmentFD` 机制，内部用 `HttpFD` 逐片段下载
 
-**DASH 多轨道处理**：
-- 支持 `requested_formats` 音视频多轨道（每个轨道都有独立的 `fragments` 列表）
-- 调用 `download_and_append_fragments_multiple(*args)` 逐轨道下载（可并发）
-- 若返回 FFmpegFD 合并，则 FFmpeg 用多 `-i` 参数同时读取多个 MPD URL 并 `-c copy -map` 直接合并
-
 ---
 
 ## 四、多格式下载器无法统一时的路径拆分方法
 
-当 `get_suitable_downloader` 返回 `None`（多协议对应下载器不一致）时，由 `YoutubeDL.process_info` 中的下载逻辑做**路径拆分**。
+当 `get_suitable_downloader` 返回 `None` 时，由 `YoutubeDL.process_info` 中的下载逻辑做**路径拆分**。
 
-### 4.1 触发场景
+### 4.1 触发 `None` 的完整条件清单
 
-`get_suitable_downloader` 返回 `None` 当且仅当：
-- `protocol` 是形如 `A+B+C` 的多协议组合（`split('+')` 后 ≥2 个）
-- 各协议对应下载器 `downloaders` 集合中**存在不同类**（即 `set(downloaders)` 大小 ≥2）
+`get_suitable_downloader` 返回 `None` **当且仅当全部以下条件同时成立**：
 
-典型例子：
-- 视频是 `http_dash_segments`（DashSegmentsFD）+ 音频是 `https`（HttpFD）
-- 视频是 `m3u8_native`（HlsFD）+ 音频是 `http_dash_segments`（DashSegmentsFD）
+1. `len(protocols) >= 2`（协议是 `A+B+C...` 的多协议组合，即多轨视频）
+2. **不满足** FFmpeg 直接合并：
+   - 要么 `set(downloaders) ≠ {FFmpegFD}`（轨道间下载器不同）
+   - 要么 `FFmpegFD.can_merge_formats(...)` 为假
+3. **不满足** DASH 回放统一：
+   - 要么 `set(downloaders) ≠ {DashSegmentsFD}`
+   - 要么 `set(protocols) ≠ {'http_dash_segments_generator'}`
+   - 要么是 `to_stdout` 多协议场景
 
-### 4.2 拆分算法
+**典型触发场景**：
+
+| 场景 | protocols | 下载器集合 | 命中哪条 None 条件 |
+|------|-----------|-----------|-------------------|
+| 普通 DASH 音视频分轨 | `http_dash_segments+http_dash_segments` | `{DashSegmentsFD}` | 协议不是 generator，不满足特殊规则 2 |
+| DASH 视频 + HTTP 音频 | `http_dash_segments+https` | `{DashSegmentsFD, HttpFD}` | 下载器不一致 |
+| HLS 视频 + DASH 音频 | `m3u8_native+http_dash_segments` | `{HlsFD, DashSegmentsFD}` | 下载器不一致 |
+| HLS 视频 + HTTP 音频 | `m3u8_native+https` | `{HlsFD, HttpFD}` | 下载器不一致 |
+| 多 HTTP 直链分轨（罕见） | `https+https` | `{HttpFD}` | 非 FFmpeg，非 Dash generator，无特殊规则 |
+
+---
+
+### 4.2 路径拆分算法（YoutubeDL.process_info）
 
 位置：`yt_dlp/YoutubeDL.py` L3482-L3563
 
@@ -385,9 +476,11 @@ PROTOCOL_MAP → DashSegmentsFD
   ├─> get_suitable_downloader 返回了 fd（非 None）?
   │   │是
   │   ├─> fd == FFmpegFD? ──是──> 直接交给 FFmpeg 多输入合并下载
+  │   │       （FFmpegFD._call_downloader 内部遍历 requested_formats，逐个 -i url）
   │   │否
   │   └─> 为每个 format 预分配 f{format_id} 前缀的独立文件路径
-  │       然后把所有 url 用 \n 拼接后调用 fd.download 一次
+  │       然后把所有 url 用 \n 拼接（供外部下载器如 aria2c 使用）
+  │       然后调用 fd.download 一次（只有 DashSegmentsFD 多轨回放会到这里）
   │
   └─> fd is None（下载器无法统一）?
       │
@@ -404,43 +497,58 @@ PROTOCOL_MAP → DashSegmentsFD
           │   ├─> 生成独立文件名: f{format_id}.{ext}
           │   └─> 递归调用 self.dl(fname, new_info)
           │           └─> 内部重新调用 get_suitable_downloader 为单轨道选下载器
+          │               （此时 protocol 只有 1 个，len==1，一定返回非 None）
           │
           └─> 所有轨道下载完成后 → 交给 FFmpegMergerPP 后处理合并
 ```
 
 ### 4.3 关键代码片段
 
-**路径拆分入口**（`yt_dlp/YoutubeDL.py` L3518-L3563）：
+**统一分支（fd 非 None，且非 FFmpegFD）**（`yt_dlp/YoutubeDL.py` L3518-L3527）：
 ```python
 elif fd:
-    # 所有格式能用同一个下载器（含 FFmpegFD 直接合并）
     if fd != FFmpegFD and temp_filename != '-':
+        # 为每个格式分配独立文件名（DashSegmentsFD 内部会用 fmt['filepath']）
         for f in info_dict['requested_formats']:
             f['filepath'] = fname = prepend_extension(
                 correct_ext(temp_filename, info_dict['ext']),
                 'f{}'.format(f['format_id']), info_dict['ext'])
             downloaded.append(fname)
+    # 把所有 URL 用 \n 拼接（HttpFD/CurlFD/Aria2cFD 等只看 info_dict['url']）
     info_dict['url'] = '\n'.join(f['url'] for f in info_dict['requested_formats'])
     success, real_download = self.dl(temp_filename, info_dict)  # 一次性调用
-else:
-    # 下载器无法统一：拆分逐轨道下载
-    for f in info_dict['requested_formats']:
-        new_info = dict(info_dict)
-        del new_info['requested_formats']
-        new_info.update(f)
-        if temp_filename != '-':
-            fname = prepend_extension(...)  # f{format_id}.ext
-            f['filepath'] = fname
-            downloaded.append(fname)
-        partial_success, real_download = self.dl(fname, new_info)  # 独立调用
-        # ... 聚合 success 状态
+```
+
+> **注意**：这里的 `\n` 拼接 URL 是给**单 URL 下载器**（如 Aria2cFD）设计的。但实际上 HttpFD、CurlFD、Aria2cFD、AxelFD、WgetFD、HttpieFD 的 `_make_cmd` 都只读取 `info_dict['url']` 作为**单个字符串**，不会按 `\n` 拆分。真正的多轨统一处理只在：
+> - **FFmpegFD**：遍历 `requested_formats`，每个 fmt 加一个 `-i` 参数
+> - **DashSegmentsFD**：遍历 `requested_formats`，内部 `download_and_append_fragments_multiple` 多轨并行
+
+**路径拆分分支（fd 为 None）**（`yt_dlp/YoutubeDL.py` L3549-L3563）：
+```python
+for f in info_dict['requested_formats']:
+    new_info = dict(info_dict)
+    del new_info['requested_formats']   # 去掉多轨标记
+    new_info.update(f)                  # 注入单轨 info（含独立 protocol/url/fragments）
+    if temp_filename != '-':
+        fname = prepend_extension(
+            correct_ext(temp_filename, new_info['ext']),
+            'f{}'.format(f['format_id']), new_info['ext'])
+        if not self._ensure_dir_exists(fname):
+            return
+        f['filepath'] = fname
+        downloaded.append(fname)
+    # 递归调用 dl：此时 new_info 的 protocol 只有 1 个，get_suitable_downloader 一定返回非 None
+    partial_success, real_download = self.dl(fname, new_info)
+    info_dict['__real_download'] = info_dict['__real_download'] or real_download
+    success = success and partial_success
 ```
 
 **FFmpeg 直接合并 vs 后处理合并的区别**：
-| 方式 | 触发条件 | 执行流程 | 中间文件 |
-|------|---------|---------|---------|
-| FFmpegFD 直接合并 | 所有轨道的下载器都选了 FFmpegFD + `can_merge_formats` | FFmpeg 多 `-i` 输入同时读取，输出单文件 | 无（或临时 ffmpeg 管道） |
-| 后处理合并（FFmpegMergerPP） | 下载器无法统一 / 原生分片下载 | 各轨道独立下载完成 → FFmpeg 后合并 | 多个 `f{id}.ext` 文件 |
+| 方式 | 触发条件 | 执行流程 | 中间文件 | 适用下载器 |
+|------|---------|---------|---------|-----------|
+| FFmpegFD 直接合并 | 所有轨道都选了 FFmpegFD + `can_merge_formats` | FFmpeg 多 `-i` 输入同时读取，输出单文件 | 无（或临时 ffmpeg 管道） | 仅 FFmpegFD |
+| DashSegmentsFD 多轨统一 | 所有协议都是 `http_dash_segments_generator` + 非 stdout 多轨 | DashSegmentsFD 内部多轨并行下载片段 | f{id}.ext 多文件 | 仅 DashSegmentsFD（`--live-from-start`） |
+| 后处理合并（FFmpegMergerPP） | 下载器无法统一 / 普通 DASH 多轨 / 其他多协议组合 | 各轨道独立下载完成 → FFmpeg 后合并 | 多个 `f{id}.ext` 文件 | HttpFD / HlsFD / DashSegmentsFD 等任意 |
 
 ---
 
@@ -507,6 +615,8 @@ def dl(self, name, info, subtitle=False, test=False):
 ```
 
 > **注意**：`dl` 方法假设 `get_suitable_downloader` 永远返回非 `None` 值。若返回 `None` 会在调用时抛 `TypeError`。因此 `None` 情况必须在上层 `process_info` 中（见第四节）处理完才会调用 `dl`。
+>
+> 路径拆分后逐轨调用 `self.dl(fname, new_info)` 时，`new_info` 已经被剥离了 `requested_formats` 并注入了单轨 info，此时 `protocol` 只有一个，`len(downloaders) == 1` 一定成立，所以一定返回非 None。
 
 ### 6.2 多轨下载 + 路径拆分 (`process_info` 中)
 
@@ -516,8 +626,8 @@ def dl(self, name, info, subtitle=False, test=False):
 1. 先调用一次 `get_suitable_downloader` 尝试找到统一下载器
 2. 非 FFmpegFD + 分段截取需求 → 报错（分段必须用 FFmpeg）
 3. `requested_formats` 存在时：
-   - fd 存在（下载器统一）→ 一次性调用（FFmpegFD 直接合并或原生单下载器多 url）
-   - fd 为 `None`（下载器不统一）→ **逐轨拆分下载**，FFmpegMergerPP 后合并
+   - fd 存在（下载器统一）→ 一次性调用（FFmpegFD 直接合并或 DashSegmentsFD 多轨回放）
+   - fd 为 `None`（下载器不统一 / 普通 DASH 多轨）→ **逐轨拆分下载**，FFmpegMergerPP 后合并
 4. 无 `requested_formats` → 普通单文件下载
 
 ### 6.3 合并格式时的 FFmpeg 强制校验
@@ -597,25 +707,85 @@ YoutubeDL.process_info
               └─> ffmpeg -y [-ss/-t] -i <m3u8_url> -c copy <output>
 ```
 
-### 7.4 DASH 非直播（原生分片，音视频分轨）
+### 7.4 DASH 非直播单轨（原生分片）
 
 ```
 YoutubeDL.process_info
   └─> YoutubeDL.dl
       └─> get_suitable_downloader(info)
-          ├─> determine_protocol(info) → 'http_dash_segments+http_dash_segments'
-          ├─> 对每个协议调用 _get_suitable_downloader → [DashSegmentsFD, DashSegmentsFD]
-          └─> set(downloaders) == {DashSegmentsFD}，len==1 → 返回 DashSegmentsFD
+          ├─> determine_protocol(info) → 'http_dash_segments' (len=1)
+          └─> len(downloaders) == 1 → 返回 DashSegmentsFD
       └─> DashSegmentsFD.download(filename, info)
           └─> DashSegmentsFD.real_download
               ├─> 尝试 dash_frag_urls 外部下载器（default=None）→ 无
-              └─> download_and_append_fragments_multiple(2 个轨道)
-                  ├─> 下载音频轨道片段：内部 HttpFD 逐段下载 + 追加
-                  └─> 下载视频轨道片段：内部 HttpFD 逐段下载 + 追加
-  └─> 后处理：FFmpegMergerPP 合并音视频两个 .mp4 文件
+              └─> requested_formats 为空 → [info_dict] 单轨
+                  └─> download_and_append_fragments_multiple(单轨 args)
+                      └─> 内部 HttpFD 逐段下载 + 追加
 ```
 
-### 7.5 DASH 直播（FFmpeg 直接处理）
+### 7.5 DASH 非直播音视频分轨（⚠️ 纠正之前错误：走路径拆分，不是统一 DashSegmentsFD）
+
+```
+YoutubeDL.process_info
+  └─> protocol = 'http_dash_segments+http_dash_segments'
+  │
+  └─> get_suitable_downloader(info)
+      ├─> protocols = ['http_dash_segments', 'http_dash_segments'], len=2
+      ├─> downloaders = [DashSegmentsFD, DashSegmentsFD]
+      ├─> 特殊规则1 (FFmpeg)? → set != {FFmpegFD} ❌
+      ├─> 特殊规则2 (Dash generator)?
+      │   ├─> set(downloaders) == {DashSegmentsFD} ✅
+      │   └─> set(protocols) == {'http_dash_segments_generator'}?
+      │       └─> 实际是 {'http_dash_segments'} ❌
+      ├─> 特殊规则3 (len==1)? → len==2 ❌
+      └─> → 返回 None
+  │
+  └─> fd is None 分支（路径拆分）
+      ├─> 遍历 requested_formats[0] (视频 DASH)
+      │   ├─> new_info: 剥离 requested_formats，填入单轨道 info
+      │   ├─> new_info['protocol'] = 'http_dash_segments'（单轨，len=1）
+      │   ├─> 文件名: f137.mp4
+      │   └─> self.dl('f137.mp4', new_info)
+      │           └─> get_suitable_downloader(new_info) → len==1 → DashSegmentsFD
+      │           └─> DashSegmentsFD 原生逐片段下载 → f137.mp4
+      ├─> 遍历 requested_formats[1] (音频 DASH)
+      │   ├─> new_info: 剥离 requested_formats，填入单轨道 info
+      │   ├─> new_info['protocol'] = 'http_dash_segments'（单轨，len=1）
+      │   ├─> 文件名: f140.m4a
+      │   └─> self.dl('f140.m4a', new_info)
+      │           └─> get_suitable_downloader(new_info) → len==1 → DashSegmentsFD
+      │           └─> DashSegmentsFD 原生逐片段下载 → f140.m4a
+      └─> 全部完成 → FFmpegMergerPP: ffmpeg -i f137.mp4 -i f140.m4a -c copy 合并
+```
+
+### 7.6 DASH 直播回放多轨（--live-from-start，唯一的 DashSegmentsFD 多轨统一场景）
+
+```
+YoutubeDL.process_info
+  └─> protocol = 'http_dash_segments_generator+http_dash_segments_generator'
+  │
+  └─> get_suitable_downloader(info)
+      ├─> set(downloaders) == {DashSegmentsFD} ✅
+      ├─> set(protocols) == {'http_dash_segments_generator'} ✅
+      ├─> 非 (to_stdout && len>1) ✅
+      └─> 特殊规则 2 → 返回 DashSegmentsFD
+  │
+  └─> fd != FFmpegFD 分支
+      ├─> 为每个 format 预分配 f{id}.ext 文件名，存入 format['filepath']
+      ├─> info_dict['url'] = '\n'.join(urls)（DashSegmentsFD 实际不用这个）
+      └─> self.dl(temp_filename, info_dict)
+          └─> DashSegmentsFD.download
+              └─> DashSegmentsFD.real_download
+                  ├─> protocol 含 generator → real_downloader = None（禁用外部下载器）
+                  ├─> 遍历 info_dict['requested_formats']（2 个轨道）
+                  │   ├─> 视频轨道：ctx['filename'] = format['filepath'] = f137.mp4
+                  │   └─> 音频轨道：ctx['filename'] = format['filepath'] = f140.m4a
+                  └─> download_and_append_fragments_multiple(视频args, 音频args)
+                      └─> 内部 HttpFD 多轨并行下载片段
+  └─> 后处理：FFmpegMergerPP 合并 f137.mp4 + f140.m4a
+```
+
+### 7.7 DASH 直播（FFmpeg 直接处理）
 
 ```
 YoutubeDL.process_info
@@ -632,7 +802,7 @@ YoutubeDL.process_info
                     直播 DASH 专用 -re 参数
 ```
 
-### 7.6 DASH(视频) + HTTP(音频) 下载器不统一 → 路径拆分
+### 7.8 DASH(视频) + HTTP(音频) 下载器不统一 → 路径拆分
 
 ```
 YoutubeDL.process_info
@@ -660,6 +830,27 @@ YoutubeDL.process_info
       └─> 全部完成 → FFmpegMergerPP: ffmpeg -i f137.mp4 -i f140.m4a -c copy 合并
 ```
 
+### 7.9 多 HLS 音轨 + 视频轨（全 FFmpeg 直接合并）
+
+```
+YoutubeDL.process_info
+  └─> protocol = 'm3u8+m3u8+m3u8'（或混合 m3u8_native 但都被改写为 FFmpegFD）
+  │
+  └─> get_suitable_downloader(info)
+      ├─> downloaders = [FFmpegFD, FFmpegFD, FFmpegFD]
+      ├─> set(downloaders) == {FFmpegFD} ✅
+      ├─> can_merge_formats(info, params) ✅
+      └─> → 返回 FFmpegFD
+  │
+  └─> fd == FFmpegFD 分支
+      └─> self.dl(temp_filename, info_dict)
+          └─> FFmpegFD.download
+              └─> FFmpegFD._call_downloader
+                  └─> 遍历 requested_formats: 每个 fmt 加 -ss/-t + -cookies + -headers + -i url
+                  └─> 最后加 -c copy -map 0:v:0 -map 1:a:0 ... → 输出单文件
+  └─> 无需后处理合并，已一步完成
+```
+
 ---
 
 ## 八、关键设计模式与决策点
@@ -675,9 +866,34 @@ YoutubeDL.process_info
 - 优雅降级（原生不行就用 FFmpeg）
 - 外部下载器接管片段级批量下载（伪协议扩展点）
 
-### 8.2 优先级排序（7 层漏斗）
+### 8.2 多协议聚合的严格漏斗（7 条路径）
 
-下载器选择优先级从高到低：
+多协议（`len(protocols) >= 2`）时的返回值判断：
+
+```
+多协议
+  │
+  ▼
+所有下载器都是 FFmpegFD + can_merge_formats?
+  ├─> 是 → FFmpegFD（FFmpeg 多 -i 直接合并）
+  │否
+  ▼
+所有下载器都是 DashSegmentsFD + 所有协议都是 http_dash_segments_generator + 非 stdout 多轨?
+  ├─> 是 → DashSegmentsFD（内部通过 requested_formats 多轨下载）
+  │否
+  ▼
+len(downloaders) == 1?
+  ├─> 是 → 不可能（多协议时 len>=2）
+  │否
+  ▼
+返回 None → YoutubeDL 路径拆分
+```
+
+> **纠正之前的错误理解**：`len(downloaders) == 1` 只代表**协议数量为 1**，不代表"多协议但下载器相同"。多协议但下载器相同的情况（如普通 DASH 多轨、多 HTTP 直链分轨）在当前代码中**没有统一规则**，全部返回 None 走路径拆分。
+
+### 8.3 优先级排序（7 层漏斗）
+
+单协议下载器选择优先级从高到低：
 1. 分段下载需求 (`section_start/end`) → FFmpegFD
 2. 用户指定外部下载器 → 相应 `ExternalFD`（需 `SUPPORTED_PROTOCOLS` 包含协议）
 3. stdout 输出 + 多格式可合并 → FFmpegFD
@@ -686,24 +902,41 @@ YoutubeDL.process_info
 6. 协议映射表 `PROTOCOL_MAP`
 7. 兜底默认 `HttpFD`
 
-### 8.3 递归调用
+### 8.4 递归调用
 
 `get_suitable_downloader` 内部会递归调用自身：
 - 查询 `m3u8_frag_urls` / `dash_frag_urls` 伪协议支持时（传 `default=None`）
 - 多协议组合时分别调用 `_get_suitable_downloader` 再聚合
-- YoutubeDL 路径拆分后逐轨调用（上层递归）
+- YoutubeDL 路径拆分后逐轨调用（上层递归，剥离 requested_formats 后保证单协议）
 
-### 8.4 扩展点设计
+### 8.5 扩展点设计
 
 - 新协议 → 添加到 `PROTOCOL_MAP` + 必要条件到 `_get_suitable_downloader`
 - 新外部下载器 → 继承 `ExternalFD` 并定义 `SUPPORTED_PROTOCOLS` + `_make_cmd`
 - 伪协议接管片段 → 在自定义外部下载器 `SUPPORTED_PROTOCOLS` 中加入 `m3u8_frag_urls` / `dash_frag_urls`
+- 新的多协议统一下载器 → 在 `get_suitable_downloader` 的特殊规则 1/2 之后新增分支（目前只有 FFmpeg 和 Dash generator 多轨统一）
 
 ---
 
 ## 九、代码优化建议
 
-### 9.1 `_get_suitable_downloader` 函数过长
+### 9.1 `get_suitable_downloader` 多协议聚合规则不完整
+
+当前代码对多协议情况只覆盖了 2 个特例（FFmpeg 合并和 Dash generator 回放），但像「普通 DASH 多轨」「多 HTTP 直链分轨」这类同类下载器场景却返回 None 走路径拆分。而 DashSegmentsFD 和 HttpFD 本身内部有能力处理多轨（DashSegmentsFD 用 requested_formats，HttpFD 理论上可支持多文件）。
+
+**建议**：增加同类下载器聚合分支：
+```python
+# 新增特殊规则：多协议但下载器全相同且下载器自身支持多轨
+elif len(set(downloaders)) == 1:
+    only_downloader = list(set(downloaders))[0]
+    if hasattr(only_downloader, 'can_handle_multiple_formats') and only_downloader.can_handle_multiple_formats(info_copy):
+        return only_downloader
+    # 或者更简单：如果是 FragmentFD 子类，默认支持多轨
+    if issubclass(only_downloader, FragmentFD):
+        return only_downloader
+```
+
+### 9.2 `_get_suitable_downloader` 函数过长
 
 当前实现（约 40 行）包含多个 if-elif 分支，可读性较差。建议重构为策略模式：
 
@@ -725,17 +958,17 @@ def _get_suitable_downloader(info_dict, protocol, params, default):
     return PROTOCOL_MAP.get(protocol, default or HttpFD)
 ```
 
-### 9.2 伪协议检测逻辑不清晰
+### 9.3 伪协议检测逻辑不清晰
 
 `m3u8_frag_urls` 和 `dash_frag_urls` 的检测目的不明显，建议添加注释明确说明这是**留给外部下载器的扩展点**，并在 `ExternalFD` 文档中说明用法。
 
-### 9.3 直播流判定重复
+### 9.4 直播流判定重复
 
 - `determine_protocol` 中已根据 `is_live` 将 m3u8 分流为 `m3u8`（直播）和 `m3u8_native`（非直播）
 - 但 `_get_suitable_downloader` L114 中又再次判断 `is_live` → 返回 FFmpegFD
 - 存在冗余判断（`m3u8` 协议本身已经意味着直播，除非 extractor 错误设置）
 
-### 9.4 DashSegmentsFD 直播错误与分派层重复
+### 9.5 DashSegmentsFD 直播错误与分派层重复
 
 - 分派层（`_get_suitable_downloader` ④）已经拦截 DASH 直播 → FFmpegFD
 - DashSegmentsFD 内部 L21-22 又做了一次 `is_live` 检查并报错
@@ -754,14 +987,17 @@ def _get_suitable_downloader(info_dict, protocol, params, default):
 | HLS 非直播 + 有 DRM / 原生不支持 | m3u8_native | **FFmpegFD**（降级） | ffmpeg 内部 |
 | HLS 直播 | m3u8 | **FFmpegFD**（强制） | ffmpeg 内部 |
 | HLS + `--downloader native` | m3u8_native | **HlsFD**（强制） | HttpFD |
-| DASH 非直播 | http_dash_segments | **DashSegmentsFD** | HttpFD |
+| DASH 非直播（单轨） | http_dash_segments | **DashSegmentsFD** | HttpFD |
+| DASH 非直播（音视频分轨）⚠️ | http_dash_segments+http_dash_segments | **None → 路径拆分** → 逐轨 DashSegmentsFD | 逐轨 HttpFD → FFmpegMergerPP 合并 |
+| DASH 直播回放多轨（--live-from-start） | http_dash_segments_generator+... | **DashSegmentsFD**（唯一多轨统一非 FFmpeg） | 多轨并行 HttpFD |
 | DASH 直播（默认） | http_dash_segments | **FFmpegFD**（强制） | ffmpeg 内部 (-re) |
 | DASH + `--downloader native` + 直播 | http_dash_segments | DashSegmentsFD → **报错退出** | - |
 | DASH + `--downloader ffmpeg` | http_dash_segments | **FFmpegFD**（用户指定） | ffmpeg 内部 |
-| DASH 直播回放 (`--live-from-start`) | http_dash_segments_generator | **DashSegmentsFD** | HttpFD |
 | 多格式下载器不统一 | A+B | None → **路径拆分** | 逐轨各自 |
 | 多格式全指向 FFmpeg 且可合并 | 任意组合 | **FFmpegFD**（直接合并） | ffmpeg 多输入 |
 | 分段截取（任意协议） | 任意 | **FFmpegFD**（强制） | ffmpeg -ss/-t |
+
+> ⚠️ 表格中标注 ⚠️ 的行是**之前文档错误、本次纠正的结论**：普通 DASH 音视频分轨不会统一走 DashSegmentsFD，而是返回 None 走路径拆分。
 
 ### 10.2 核心层次关系
 
@@ -782,7 +1018,13 @@ def _get_suitable_downloader(info_dict, protocol, params, default):
         │                          │                          │
         └──────────────────────────┴──────────────────────────┘
                     FragmentFD (分片下载调度基类)
+
+多协议 (A+B+C...)?
+  │
+  ├─> 全 FFmpeg + 可合并 → FFmpegFD（直接合并）
+  ├─> 全 DashSegmentsFD + 全是 generator → DashSegmentsFD（多轨统一）← 仅此一例
+  └─> 其他所有 → None → YoutubeDL 路径拆分（逐轨独立下载）
 ```
 
 **一句话总结**：
-> **HTTP 是基础**（所有分片最终都落到 HttpFD），**HLS 有原生/FFmpeg 两条路**（取决于直播/DRM/用户偏好），**DASH 非直播走原生、直播强制 FFmpeg**（用户指定 ffmpeg 时也直接 FFmpeg），**FFmpeg 是万能兜底+合并器**，**下载器不统一时逐轨拆分后分别下载再合并**。三者不是互斥关系，而是**层次 + 降级**的组合关系。
+> **HTTP 是基础**（所有分片最终都落到 HttpFD），**HLS 有原生/FFmpeg 两条路**（取决于直播/DRM/用户偏好），**DASH 非直播单轨走原生、直播强制 FFmpeg、普通多轨返回 None 走路径拆分**（只有 `--live-from-start` 的 generator 多轨才统一 DashSegmentsFD），**FFmpeg 是万能兜底+合并器**，**下载器不统一/普通 DASH 多轨时逐轨拆分后分别下载再合并**。三者不是互斥关系，而是**层次 + 降级 + 路径拆分**的组合关系。
