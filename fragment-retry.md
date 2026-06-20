@@ -16,7 +16,7 @@
 | [ism.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py) | `IsmFD` | Smooth Streaming (ISM) 分片下载 |
 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/utils/_utils.py#L5242-L5296) | `RetryManager` | 通用重试管理器 |
 
-所有协议下载器（HlsFD / DashSegmentsFD 等）均继承自 `FragmentFD`，复用其并发、重试、拼接逻辑。
+所有协议下载器（HlsFD / DashSegmentsFD 等）均继承自 `FragmentFD`，但它们使用通用基类的方式**并不一致**——有的完全走通用调度，有的绕过通用循环直接调用底层原子方法，这是最容易混淆的根源（详见第 7 章）。
 
 ---
 
@@ -359,3 +359,234 @@ HlsFD.real_download() / DashSegmentsFD.real_download()
 | `keep_fragments` | False | 是否保留已下载的分片临时文件 |
 | `continuedl` | True | 是否启用断点续传（.ytdl + 分片级 .part-FragN） |
 | `_no_ytdl_file` | False | 禁用 .ytdl 进度记录（直播等场景） |
+
+---
+
+## 7. 通用路径 vs 协议特定路径：混淆点深度解析
+
+阅读分片代码时最容易产生的误解是"所有下载器都走 `download_and_append_fragments`"。实际情况是：**4 个协议下载器采用了 3 种不同的调度架构**，只有 HLS 和 DASH 完全走通用调度，F4m 和 ISM 则绕过了通用循环。
+
+### 7.1 FragmentFD 的三层能力分层
+
+先看 `FragmentFD` 提供了哪些可复用的能力，按抽象层级分三层：
+
+| 层级 | 方法 | 能力 | 是否可被协议层绕过 |
+|------|------|------|-------------------|
+| **L3 高层调度** | `download_and_append_fragments` / `download_and_append_fragments_multiple` | 并发线程池 + RetryManager + 解密 + 顺序拼接一体化 | 是（F4m / ISM 绕过） |
+| **L2 中层流程控制** | `_prepare_frag_download` / `_start_frag_download` / `_finish_frag_download` | 打开 .part 文件、恢复 .ytdl、进度 hook、关闭/重命名 | 否（全部协议都调用） |
+| **L1 底层原子操作** | `_download_fragment` / `_read_fragment` / `_append_fragment` | 单个分片的 HTTP 下载、读回、写入目标文件 | 否（全部协议都调用） |
+
+```
+FragmentFD 能力金字塔：
+
+          ┌─────────────────────────────┐
+          │  L3: download_and_append_   │
+          │      fragments[_multiple]   │  ← HlsFD, DashSegmentsFD 使用
+          │  (线程池 + 重试 + 解密 +    │
+          │   pack_func + 顺序保证)     │
+          ├─────────────────────────────┤
+          │  L2: _prepare/_start/_      │
+          │      finish_frag_download   │  ← 所有协议必须使用
+          │  (.ytdl恢复, dest_stream,   │
+          │   进度hook, 重命名)          │
+          ├─────────────────────────────┤
+          │  L1: _download_fragment /   │
+          │      _read_fragment /       │  ← 所有协议必须使用
+          │      _append_fragment       │
+          │  (单分片HTTP, 读, 写+flush) │
+          └─────────────────────────────┘
+```
+
+### 7.2 四协议调度架构横向对比
+
+下面用表格 + 调用图逐一说明每个协议下载器对三层能力的使用方式：
+
+| 协议 | real_download 位置 | L3 高层调度 | L2 中层控制 | L1 原子操作 | 自有 RetryManager | 自有循环 |
+|------|-------------------|------------|------------|------------|-----------------|---------|
+| **HLS** | [hls.py:74](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/hls.py#L74-L409) | ✅ `download_and_append_fragments` | ✅ `_prepare_and_start_frag_download` | ✅ 由 L3 自动调用 | ❌（由 L3 提供） | ❌ |
+| **DASH** | [dash.py:17](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/dash.py#L17-L68) | ✅ `download_and_append_fragments_multiple` | ✅ `_prepare_and_start_frag_download` | ✅ 由 L3 自动调用 | ❌（由 L3 提供） | ❌ |
+| **F4m** | [f4m.py:309](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/f4m.py#L309-L427) | ❌ **绕过** | ✅ 分别调用 `_prepare_frag_download` 和 `_start_frag_download` | ✅ 循环内直接调用 | ⚠️ **没有分片级 RetryManager**（仅直播 404 特判） | ✅ `while fragments_list` |
+| **ISM** | [ism.py:236](file:///d:/fz/0601-2/solo-dogfeeding/code/86-yt-dlp/yt_dlp/downloader/ism.py#L236-L283) | ❌ **绕过** | ✅ `_prepare_and_start_frag_download` | ✅ 循环内直接调用 | ✅ 循环内自建 `RetryManager` | ✅ `for segment in segments` |
+
+#### HlsFD 的调用路径（最干净的通用路径）
+
+```
+HlsFD.real_download (hls.py:74)
+  │
+  ├─ 【协议特定】下载/解析 m3u8 manifest
+  │     ├─ 识别 #EXT-X-KEY, #EXT-X-BYTERANGE, #EXT-X-MAP 等标签
+  │     ├─ 跳过广告分片 (ANVATO-SEGMENT-INFO, UPLYNK-SEGMENT)
+  │     └─ 构造带字段的 fragments[]: {frag_index, url, decrypt_info, byte_range, media_sequence}
+  │
+  ├─ 【通用 L2】_prepare_and_start_frag_download(ctx, info_dict)
+  │     └─ 打开 .part, 读 .ytdl 恢复进度
+  │
+  └─ 【通用 L3】download_and_append_fragments(ctx, fragments, info_dict)
+        │     ← 或传入 pack_func=pack_fragment (WebVTT场景)
+        │
+        ├─ 【通用 L3 内部】线程池并发 + RetryManager
+        │     ├─ download_fragment() → _download_fragment (L1)
+        │     ├─ decrypt_fragment()   ← 【协议特定钩子】AES-128 解密
+        │     │                        (decrypt_info 是从 m3u8 解析出来挂在 fragment 上的)
+        │     └─ append_fragment() → _append_fragment (L1)
+        │
+        └─ 【通用 L2 内部】_finish_frag_download
+```
+
+**拼接边界**：`decrypt_info` 是 HLS 协议层解析出来挂到 `fragment` dict 上的，解密逻辑由通用 `decrypter()` 统一调用，但只有当 `fragment['decrypt_info']['METHOD'] == 'AES-128'` 时才生效——相当于通用层提供了解密"槽位"，协议层填充配置。
+
+#### DashSegmentsFD 的调用路径（多轨通用路径）
+
+```
+DashSegmentsFD.real_download (dash.py:17)
+  │
+  ├─ 【协议特定】遍历 requested_formats (音视频多轨)
+  │     ├─ _get_fragments() 解析 fmt['fragments']
+  │     │     └─ 组装 {frag_index, index, url, fragment_count}
+  │     └─ 每轨一个 (ctx, fragments, fmt) 三元组
+  │
+  ├─ 【通用 L2】每条轨道各自调用 _prepare_and_start_frag_download
+  │
+  └─ 【通用 L3】download_and_append_fragments_multiple(*args, is_fatal=lambda idx: idx == 0)
+        │
+        ├─ 【通用 L3 内部】每轨道创建 FTPE 线程池
+        │     └─ 每轨道进入 download_and_append_fragments → 与 HLS 相同的通用流程
+        │
+        └─ 【协议特定参数】is_fatal=lambda idx: idx == 0
+              ↳ 只有第 0 条轨道（视频）失败才算致命，音频轨道可以容忍缺失
+```
+
+**拼接边界**：DASH 的拼接边界比 HLS 更"干净"——它不使用 `decrypt_info`，分片内容本身是完整的 fMP4 segment（包含 moof+mdat），直接按顺序 append 即可。协议差异完全体现在：① 多轨结构上，② `fragments[]` 的字段来源上。
+
+#### F4mFD 的调用路径（绕过 L3，自建循环 + 无分片级重试）
+
+这是最容易踩坑的一个。它**没有调用 `download_and_append_fragments`**：
+
+```
+F4mFD.real_download (f4m.py:309)
+  │
+  ├─ 【协议特定】下载/解析 f4m XML manifest
+  │     ├─ FlvReader.read_bootstrap_info() 解析 abst/asrt/afrt box
+  │     ├─ build_fragments_list() → [(seg_i, frag_i), ...]
+  │     └─ 选择合适的 media (按 bitrate)
+  │
+  ├─ 【通用 L2】_prepare_frag_download(ctx)  ← 注意：单独调，不是 _prepare_and_start_
+  │
+  ├─ 【协议特定】写入 FLV header 和 metadata tag
+  │     write_flv_header(dest_stream)
+  │     write_metadata_tag(dest_stream, metadata)
+  │     ← 这就是为什么它必须拆开 _prepare 和 _start —— 中间要插东西！
+  │
+  ├─ 【通用 L2】_start_frag_download(ctx, info_dict)  ← 启动进度 hook
+  │
+  └─ 【协议特定自建循环】while fragments_list:
+        │
+        ├─ 【协议特定】构造 URL: base_url + "Seg%d-Frag%d" % (seg_i, frag_i)
+        │
+        ├─ 【通用 L1】_download_fragment(ctx, url, info_dict)
+        │     ← 注意：外面没有包 RetryManager！HTTPError 会直接抛出
+        │
+        ├─ 【通用 L1】_read_fragment(ctx) → 读取 .part-FragN 到内存
+        │
+        ├─ 【协议特定】FlvReader.read_box_info() 循环解析 box
+        │     └─ 找到 box_type == b'mdat' → 提取 payload
+        │     ← 这是 F4m 特有拼接边界：不是整个分片内容写入，
+        │        而是从 FLV box 中提取 mdat 后再写
+        │
+        ├─ 【通用 L1】_append_fragment(ctx, box_data)  ← 只写 mdat
+        │
+        ├─ 【协议特定异常分支】直播场景下：
+        │     except HTTPError as err:
+        │         if live and err.status in (404, 410):
+        │             fragments_list = []  # 静默跳过
+        │
+        └─ 【协议特定】直播刷新分片列表
+              _update_live_fragments() → 重新请求 bootstrap info
+```
+
+**关键差异——重试**：`F4mFD` 的 `_download_fragment` 调用是"裸"的，外层没有 `for retry in RetryManager(...)` 包裹。这意味着分片下载的重试完全依赖 HTTP 层 `HttpFD` 的 `retries` 参数，而**不是 `fragment_retries` 参数**。直播 404/410 则被特判吞掉，计入 `.ytdl` 进度但不会重试。
+
+**拼接边界**：FLV 格式要求文件头必须放在最前面，但 `_prepare_frag_download` 只是打开了 dest_stream，还没开始写任何内容。F4mFD 抓住这个"窗口期"写入 `FLV header + metadata tag`，然后才调用 `_start_frag_download`。之后每个分片的原始 FLV box 被解包，只提取 `mdat`（媒体数据）payload 通过通用 L1 追加。
+
+#### IsmFD 的调用路径（绕过 L3，自建循环 + 自有 RetryManager）
+
+```
+IsmFD.real_download (ism.py:236)
+  │
+  ├─ 【协议特定】info_dict['fragments'] 已由 extractor 准备好
+  │
+  ├─ 【通用 L2】_prepare_and_start_frag_download(ctx, info_dict)
+  │
+  └─ 【协议特定自建循环】for segment in segments:
+        │
+        ├─ 【协议特定 + 通用】IsmFD 自建 RetryManager:
+        │     retry_manager = RetryManager(
+        │         self.params.get('fragment_retries'),
+        │         self.report_retry,
+        │         frag_index=frag_index,
+        │         fatal=not skip_unavailable_fragments)
+        │
+        └─ for retry in retry_manager:
+              try:
+                  ├─ 【通用 L1】_download_fragment(ctx, url, info_dict)
+                  ├─ 【通用 L1】_read_fragment(ctx)
+                  │
+                  ├─ 【协议特定】首个分片处理：
+                  │     if not extra_state['ism_track_written']:
+                  │         tfhd_data = extract_box_data(frag_content, [b'moof', b'traf', b'tfhd'])
+                  │         track_id = u32.unpack(tfhd_data[4:8])[0]
+                  │         write_piff_header(dest_stream, ...)  ← 写 ftyp+moov+mvex
+                  │
+                  └─ 【通用 L1】_append_fragment(ctx, frag_content)
+              except HTTPError as err:
+                  retry.error = err
+                  continue
+
+   循环结束后：
+        └─ 【协议特定】retry_manager.error → 若 skip_unavailable_fragments 则跳过，否则失败
+```
+
+**关键差异——重试**：`IsmFD` 自行创建 `RetryManager`，参数与通用 L3 的完全一致（`fragment_retries`、`frag_index`、`fatal`），所以它的重试语义与 HLS/DASH 的 L3 提供的等价。但**并发**功能没有——它是纯串行 for 循环，`concurrent_fragment_downloads` 对 ISM 协议无效。
+
+**拼接边界**：与 F4m 类似，ISM 也需要一个"协议特定文件头"（PIFF/MP4 的 ftyp+moov）。但它的写入时机选择了另一种方式——不拆开 `_prepare_and_start_frag_download`，而是在循环第一次迭代、第一个分片下载完毕后，从第一个分片的内容中提取 `track_id`，动态生成 PIFF header 后直接写入 dest_stream（注意**不是通过 `_append_fragment`**，而是直接写），然后才开始正常的 `_append_fragment` 流程。
+
+```
+拼接时机对比：
+
+ F4mFD:  _prepare → 【write FLV header】 → _start → 循环(解box→取mdat→append)
+
+ IsmFD:  _prepare_and_start → 循环开始
+             ↳ frag[0] 下载完毕
+                 → 【extract tfhd → write PIFF header (直接写dest_stream)】
+                 → append frag[0] 原文
+             ↳ frag[N] 直接 append
+```
+
+### 7.3 拼接边界的四种模式总结
+
+从以上四个协议可以归纳出，"协议特定数据"写入目标文件的位置有四种模式：
+
+| 模式 | 代表协议 | 实现方式 | 是否经过 `_append_fragment` | .ytdl 一致性 |
+|------|---------|---------|---------------------------|-------------|
+| **A. 前序写入（在 _start 之前）** | F4m | `_prepare_frag_download` → 直接写 dest_stream → `_start_frag_download` | ❌ 直接写 | 写入时 .ytdl 的 fragment_index 仍是 0，一致 |
+| **B. 懒写入（首分片下载后）** | ISM | 首分片下载后直接写 dest_stream → 再 `_append_fragment` 首分片原文 | ❌ 头直接写 / ✅ 分片用 append | 头写入时 fragment_index=0，与首分片一起完成 |
+| **C. 通过 pack_func 逐分片变换** | HLS WebVTT | 传入 `pack_func` 参数，通用 L3 在 append 前调用 | ✅ 经 pack_func 包装后仍走 `_append_fragment` | 完美一致，`_append_fragment` 内部统一更新 .ytdl |
+| **D. 内容原样直接追加** | HLS TS / DASH fMP4 | 通用流程，不做任何变换 | ✅ | 完美一致 |
+
+**关键洞见**：当协议层需要"在第 1 个分片前写入协议特定 header"时，有两条路可选：
+- **F4m 路**：拆开 `_prepare_and_start_frag_download`，在中间插入 header 写入（要求 header 内容在下载前已知）
+- **Ism 路**：保持组合调用不变，在首分片回调中提取信息后写入（header 内容依赖首分片数据，如 ISM 的 track_id）
+
+无论走哪条路，只要 header 写入完成时 `fragment_index` 还没增加（即还没完成 `_append_fragment`），.ytdl 的断点续传语义就不会出错——下次重下时会从 fragment_index=0 重新走一遍，header 会被重写，但因为是以 `wb` 模式重新打开的，覆盖写入也不会有问题。
+
+### 7.4 重试路径的三种模式总结
+
+同样，分片级重试的实现也分三种：
+
+| 模式 | 代表协议 | 重试控制者 | 重试参数 | 跳过不可用分片 |
+|------|---------|-----------|---------|--------------|
+| **I. 通用 L3 内建 RetryManager** | HLS, DASH | `download_and_append_fragments` 内部 | `fragment_retries`（0/10） | ✅ 通过 `is_fatal` 参数控制 |
+| **II. 协议层自建 RetryManager** | ISM | `IsmFD.real_download` 循环内 | `fragment_retries`（同参数名） | ✅ `skip_unavailable_fragments` + `retry_manager.error` |
+| **III. 裸调用（无分片级 RetryManager）** | F4m | —— | —— （依赖 HTTP 层 retries） | ⚠️ 只有直播 404/410 特判跳过，其他 HTTPError 直接抛出 |
+
+**注意**：模式 III（F4m）是**语义不一致**的——对 F4m 协议设置 `fragment_retries=10` 不会生效，因为它根本没走包含 RetryManager 的代码路径。只有 HTTP 下载器内部的 `retries` 参数（`retries` 不是 `fragment_retries`）才对它生效。这是历史遗留差异，排查重试问题时需要特别注意。
