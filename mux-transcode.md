@@ -92,16 +92,20 @@ POSTPROCESS_WHEN = ('pre_process', 'after_filter', 'video', 'before_dl',
 
 在 YoutubeDL 初始化时，配置字典被实例化为后处理器对象：
 
-**代码来源：** [YoutubeDL.py:827-834](yt_dlp/YoutubeDL.py#L827-L834)
+**代码来源：** [YoutubeDL.py:827-837](yt_dlp/YoutubeDL.py#L827-L837)
 
 ```python
 for pp_def_raw in self.params.get('postprocessors', []):
     pp_def = dict(pp_def_raw)
-    when = pp_def.pop('when', 'post_process')  # 默认时机: post_process
+    when = pp_def.pop('when', 'post_process')
+    # Handle errors for ExecPP command validation
     try:
         self.add_post_processor(
-            get_postprocessor(pp_def.pop('key'))(self, **pp_def),  # 按名称查找类并实例化
+            get_postprocessor(pp_def.pop('key'))(self, **pp_def),
             when=when)
+    except UnsafeExecExpansionError as e:
+        self.report_error(e)
+        raise
 ```
 
 - `get_postprocessor(key)` → [postprocessor/__init__.py:51-52](yt_dlp/postprocessor/__init__.py#L51-L52)：从全局注册表查找 `key + 'PP'` 对应的类
@@ -328,17 +332,27 @@ def run_pp(self, pp, infodict):
 class PostProcessorMetaClass(type):
     @staticmethod
     def run_wrapper(func):
+        @functools.wraps(func)
         def run(self, info, *args, **kwargs):
-            # 执行前触发 started
-            self._hook_progress({'status': 'started', ...})
-            files_to_delete, info = func(self, info, *args, **kwargs)
-            # 执行后触发 finished
-            self._hook_progress({'status': 'finished', ...})
-            return files_to_delete, info
+            info_copy = self._copy_infodict(info)
+            self._hook_progress({'status': 'started'}, info_copy)
+            ret = func(self, info, *args, **kwargs)
+            if ret is not None:
+                _, info = ret
+            self._hook_progress({'status': 'finished'}, info_copy)
+            return ret
         return run
+
+    def __new__(cls, name, bases, attrs):
+        if 'run' in attrs:
+            attrs['run'] = cls.run_wrapper(attrs['run'])
+        return type.__new__(cls, name, bases, attrs)
 ```
 
-所有 PP 的 `run()` 方法被 `run_wrapper` 自动包装，触发进度钩子。
+所有 PP 子类只要定义了 `run()` 方法，元类 `__new__` 会在类创建时自动用 `run_wrapper` 包装它，在执行前后触发进度钩子（started / finished）。`run_wrapper` 内部还会：
+- 通过 `@functools.wraps(func)` 保留原函数签名与文档
+- 复制一份 info_dict（`info_copy`）传给钩子，避免钩子修改真实数据
+- 对返回值做空值安全检查（`if ret is not None`）
 
 **基类与接口：** [common.py:36-135](yt_dlp/postprocessor/common.py#L36-L135)
 - `PostProcessor` 基类定义：[common.py:36](yt_dlp/postprocessor/common.py#L36-L36)
