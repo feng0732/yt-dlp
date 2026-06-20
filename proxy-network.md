@@ -48,7 +48,40 @@ def proxies(self):
 
 返回的 dict 结构为 `{协议: 代理URL}`，key 可以是 `http`、`https`、`all`、`no`。
 
-### 1.4 地理验证代理（特殊代理源）
+### 1.4 Windows 代理读取修正（urllib 兼容层）
+
+当用户未指定 `--proxy` 时，`YoutubeDL.proxies` 调用 `urllib.request.getproxies()` 读取代理。yt-dlp 在 Windows 平台重写了这个函数以修复 Python 旧版本的已知 bug。
+
+兼容层位于 `yt_dlp/compat/urllib/request.py:L12-L34`：
+
+```python
+if os.name == 'nt':
+    def getproxies_registry_patched():
+        proxies = getproxies_registry()
+        if sys.version_info < (3, 10, 5):
+            for scheme in ('https', 'ftp'):
+                if scheme in proxies and proxies[scheme].startswith(f'{scheme}://'):
+                    proxies[scheme] = 'http' + proxies[scheme][len(scheme):]
+        return proxies
+
+    def getproxies():
+        return getproxies_environment() or getproxies_registry_patched()
+```
+
+**工作原理**：
+
+| 步骤 | 逻辑 |
+|------|------|
+| ① 作用域 | 仅 `os.name == 'nt'`（Windows 平台） |
+| ② 优先级 | 先读环境变量（`HTTP_PROXY` 等），有则直接返回；没有才读注册表 |
+| ③ 旧 Python 版本修复 | `< 3.10.5` 时，注册表读取的 `https://...` 和 `ftp://...` 代理 URL 被降级为 `http://...` |
+| ④ 根因 | 旧 Python（[cpython#86793](https://github.com/python/cpython/issues/86793)）在从 WinINET 注册表读代理时会**错误地根据协议类型 prepend scheme**：比如注册表中实际写的是 `proxy.example.com:8080`，urllib 会误加 `https://` 变成 `https://proxy.example.com:8080`，而代理服务器通常走 HTTP CONNECT 而非 HTTPS |
+| ⑤ ftp 协议兼容 | `ftp://` scheme 也被改成 `http://`，因为 urllib 不支持 ftp:// 协议的代理 URL |
+| ⑥ Python >= 3.10.5 | 官方已修复，yt-dlp 直接透传 `getproxies_registry()` 返回值，不做替换 |
+
+YoutubeDL 导入的是 `yt_dlp.utils.networking` → `yt_dlp.compat.urllib.request` → 这个重写后的 `getproxies()`，所以 `YoutubeDL.proxies` 属性在 Windows 上自动受益于此修复。
+
+### 1.5 地理验证代理（特殊代理源）
 
 extractor/common.py#L3971-L3976（`yt_dlp/extractor/common.py:L3971-L3976`） 中，`geo_verification_headers()` 把 `geo_verification_proxy` 写入请求头 `Ytdl-Request-Proxy`：
 
@@ -660,6 +693,98 @@ DenoJCP / BunJCP._get_env_options()
    Deno/Bun 进程继承环境变量
 ```
 
+#### 5.2.4 Deno/Bun 的 ejs:npm 脚本来源与缓存检测的代理路径
+
+`EJSBaseJCP._iter_script_sources` 的四种基础来源之外，Deno 和 Bun 两个子类额外追加了一个 `BUILTIN` 来源（`_deno_npm_source` / `_bun_npm_source`），用于加载依赖外部 NPM 包的专用库脚本。NPM 包下载和缓存检测都要走网络，因此必须正确传递代理。
+
+**Deno：`_deno_npm_source` + `_npm_packages_cached`**
+
+deno.py#L44-L73（`yt_dlp/extractor/youtube/jsc/_builtin/deno.py:L44-L73`）：
+
+```python
+def _iter_script_sources(self):
+    yield from super()._iter_script_sources()
+    yield ScriptSource.BUILTIN, self._deno_npm_source   # 追加到基础来源之后
+
+def _deno_npm_source(self, script_type, /):
+    if script_type != ScriptType.LIB:  # 只替换 LIB 脚本
+        return None
+    code = load_script(self.DENO_NPM_LIB_FILENAME, error_hook=error_hook)
+    if not code:
+        return None
+    if 'ejs:npm' not in self.ie.get_param('remote_components', []):
+        # 用户没开 ejs:npm，尝试检测缓存是否可用
+        self._NPM_PACKAGES_CACHED = self._npm_packages_cached(code)
+        if not self._NPM_PACKAGES_CACHED:
+            return self._skip_component('ejs:npm')
+    return Script(..., variant=DENO_NPM, source=BUILTIN, code=code)
+
+def _npm_packages_cached(self, stdin) -> bool:
+    try:
+        self._run_deno(stdin, [*self._DENO_BASE_OPTIONS, '--cached-only'])
+    except JsChallengeProviderError:
+        return False  # 抛异常说明包未缓存
+    return True
+```
+
+**Deno 的 NPM 缓存检测代理路径**：
+- `_npm_packages_cached()` 调用 `_run_deno()` → `_run_deno()` 构造命令 `deno run --cached-only -`，传入 `stdin`（含 NPM `import` 的脚本）
+- `Popen(env=self._get_env_options())` 把代理环境变量（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`）注入 Deno 进程
+- Deno 在 `--cached-only` 模式下会**只检查本地 DENO_DIR / npm cache**，若包存在则静默成功；若不存在会直接失败，不会联网下载
+- 缓存检测本身不需要网络，但同一个 Deno 进程仍会继承代理环境变量；当用户显式启用 `ejs:npm` 且运行时不再加 `--cached-only` 时，真正的 npm 下载才会用到这些代理环境变量
+
+**Deno 实际求解时的 NPM 下载代理路径**：
+- deno.py#L75-L87（`yt_dlp/extractor/youtube/jsc/_builtin/deno.py:L75-L87`） 中 `_run_js_runtime` 根据 variant 决定是否加 `--cached-only`：
+  - `variant == DENO_NPM` 且 `_NPM_PACKAGES_CACHED == True` → 加 `--cached-only`，不下载
+  - `variant == DENO_NPM` 且 `_NPM_PACKAGES_CACHED == False`（用户显式开了 `ejs:npm`）→ 不加 `--cached-only`，Deno 自动从 npm registry 下载包 → 通过环境变量代理
+  - 其他 variant → 加 `--no-npm` + `--cached-only`，完全不使用 NPM
+
+**Bun：`_bun_npm_source`**
+
+bun.py#L51-L78（`yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L51-L78`）：
+
+```python
+def _iter_script_sources(self):
+    yield from super()._iter_script_sources()
+    yield ScriptSource.BUILTIN, self._bun_npm_source
+
+def _bun_npm_source(self, script_type, /):
+    if script_type != ScriptType.LIB:
+        return None
+    if 'ejs:npm' not in self.ie.get_param('remote_components', []):
+        return self._skip_component('ejs:npm')   # Bun 无缓存检测能力，直接跳过
+    # 先检查代理 scheme 兼容性
+    if unsupported_scheme := self._check_env_proxies(self._get_env_options()):
+        self.logger.warning(f'Bun NPM downloads only support HTTP/HTTPS proxies; ...')
+        return None
+    code = load_script(self.BUN_NPM_LIB_FILENAME, error_hook=...)
+    return Script(..., variant=BUN_NPM, source=BUILTIN, code=code)
+```
+
+**Bun 的代理兼容性预检**：
+- 与 Deno 不同，Bun **没有**缓存检测能力（bun.py#L35-L36（`yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L35-L36`） 的注释指出 `--no-install` 反而会禁用缓存），所以必须显式启用 `--remote-components ejs:npm` 才会尝试
+- 在加载脚本**之前**就调用 `_check_env_proxies(self._get_env_options())` 预检：遍历 `HTTP_PROXY` 和 `HTTPS_PROXY`，解析 scheme，只要有一个不是 `http`/`https`（如 `socks5h`）就放弃并警告
+- 这是因为 Bun 的 npm autoinstall 有两个已知问题（bun.py#L37-L38（`yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L37-L38`））：
+  1. HTTP 代理下可能报 integrity error
+  2. 旧 Bun 版本的 HTTP 代理支持有限
+
+**Bun 实际求解时的 NPM 下载代理路径**：
+- bun.py#L116-L155（`yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L116-L155`）：
+  - `variant == BUN_NPM` → 加 `--install=fallback`，bun 自动从 npm registry 下载包 → 通过 `_get_env_options()` 设置的 `HTTP_PROXY`/`HTTPS_PROXY` 环境变量代理
+  - 其他 variant → 加 `--no-install`，不下载
+  - 另加 `--prefer-offline`，有缓存优先用缓存
+
+**Deno vs Bun 的 ejs:npm 代理路径对比**：
+
+| 维度 | Deno | Bun |
+|------|------|-----|
+| 缓存检测 | `--cached-only` 运行脚本检测，有完整能力 | ❌ 无（已知问题），必须显式开 `ejs:npm` |
+| 未开 `ejs:npm` 的行为 | 先检测缓存，缓存中就继续走 | 直接跳过 |
+| 代理兼容性预检 | ❌ 无（依赖 Deno 自身） | ✅ 加载脚本前就检查，不支持的 scheme 直接跳过 |
+| 支持的代理 scheme | Deno 自身支持（含 SOCKS） | 仅 `http`/`https` |
+| 运行时参数（ejs:npm 开启） | 无 `--cached-only`，自动下载 | `--install=fallback` + `--prefer-offline` |
+| 代理传递方式 | `_get_env_options()` → Popen env | 同左 |
+
 ### 5.3 JS 挑战求解脚本的四种加载源及代理路径
 
 JS 挑战求解脚本（yt.solver.lib.js / yt.solver.core.js）有 4 种加载源，按优先级依次尝试。不同来源的代理路径完全不同。
@@ -782,14 +907,27 @@ clean_proxies(req.proxies, req.headers)
 
 由于使用了 `_download_webpage_with_retries` → `_request_webpage` → `_create_request` → `YoutubeDL.urlopen` 的完整 extractor 下载链路，WEB 源下载会走 yt-dlp 的内置网络栈：全局 `--proxy` 与系统环境变量代理会生效；但这条 GitHub Release 请求本身没有注入 `geo_verification_headers()`，所以不会自动使用 `--geo-verification-proxy`。下载成功后代码存入本地 cache，下次直接走 CACHE 源不再需要网络。
 
-#### 5.3.6 脚本加载源的代理路径对比表
+#### 5.3.6 第五种来源：Deno/Bun 追加的 NPM 专用脚本（BUILTIN DENO_NPM / BUN_NPM）
+
+父类的四种来源之外，DenoJCP（`yt_dlp/extractor/youtube/jsc/_builtin/deno.py:L44-L47`） 和 BunJCP（`yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L51-L53`） 的 `_iter_script_sources()` 还会额外追加一个 `BUILTIN` 来源，用于加载依赖 NPM 包的专用库脚本（`yt.solver.deno.lib.js` / `yt.solver.bun.lib.js`）。
+
+这种来源的特点：
+- 仅替换 `LIB` 脚本（`script_type == ScriptType.LIB`），不影响 `CORE` 脚本
+- variant 是 `DENO_NPM` / `BUN_NPM`，source 是 `BUILTIN`（文件本身是 vendored 的，代码里没有网络请求）
+- 但脚本内容使用了 `npm:` 前缀的 ESM import，运行时 Deno/Bun 需要**从 npm registry 下载包**——这一步走外部进程的网络栈，通过 `_get_env_options()` 设置的 `HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY` 环境变量传递代理
+- Deno 在用户未开 `ejs:npm` 时会先做 `--cached-only` 缓存检测（代理也一并注入到检测进程）
+- Bun 在加载前先做代理 scheme 预检，只有 HTTP/HTTPS 代理才能继续，SOCKS 代理直接放弃并给警告
+- 详细流程见 [5.2.4 节 Deno/Bun 的 ejs:npm 脚本来源与缓存检测的代理路径](#524-denobun-的-ejsnpm-脚本来源与缓存检测的代理路径)
+
+#### 5.3.7 脚本加载源的代理路径对比表
 
 | 来源 | 网络请求 | 代理参与 | 代理来源 |
 |------|---------|---------|---------|
 | PYPACKAGE | ❌ | ❌ | — |
 | CACHE | ❌ | ❌ | — |
-| BUILTIN | ❌ | ❌ | — |
+| BUILTIN (UNMINIFIED) | ❌ | ❌ | — |
 | WEB | ✅ GitHub HTTPS | ✅ | 内置网络栈代理（全局 `--proxy`、系统环境变量；默认不含地理验证代理） |
+| BUILTIN (DENO_NPM/BUN_NPM) | ✅ npm registry HTTPS（运行时） | ✅ | 外部进程 env（`HTTP_PROXY`/`HTTPS_PROXY`/`NO_PROXY`，由 `_get_env_options()` 从 `YoutubeDL.proxies` 转换） |
 
 ### 5.4 PoToken 缓存键如何纳入代理信息
 
@@ -964,6 +1102,10 @@ ffmpeg 的代理注入方式最特殊：
   YoutubeDL.proxies (cached_property)            │
    ├── 有 --proxy → {'all': URL}                 │
    └── 无 --proxy → urllib.request.getproxies()  │
+                  (Windows 兼容层：               │
+                   ├── getproxies_environment()   │
+                   └── getproxies_registry()      │
+                        Py<3.10.5: https→http)     │
         │                                        │
         ▼                                        │
   build_request_director()                       │
@@ -1066,6 +1208,11 @@ ffmpeg 的代理注入方式最特殊：
   WEB (GitHub Release)  → _download_webpage_with_retries()
                             → YoutubeDL.urlopen() → 内置网络栈（全局/环境代理）
                             → 成功后存入 CACHE
+  BUILTIN (DENO_NPM/BUN_NPM)  →  vendor 读取 lib 脚本（无网络）
+     ├── Deno：未开 ejs:npm → deno run --cached-only 做缓存检测 → 命中后仍 cached-only
+     ├── Deno：开 ejs:npm 且缓存未命中 → deno run（无 --cached-only）→ npm 下载 → env 代理
+     └── Bun：必须开 ejs:npm → 先 _check_env_proxies 预检（仅 http/https）
+                              → bun run --install=fallback → npm 下载 → env 代理
 
   【PoToken 缓存键（代理信息纳入隔离）】
   PoTokenRequest
