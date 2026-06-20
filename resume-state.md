@@ -54,7 +54,7 @@ def ytdl_filename(self, filename):
 }
 ```
 
-- `current_fragment.index`：**当前正在下载**的片段索引（0-based）
+- `current_fragment.index`：**下一个待下载**的片段索引（0-based，详见后文"语义辨析"）
 - `fragment_count`：总片段数
 - `extra_state`：扩展状态（如 WebVTT 字幕的时间戳校准、去重窗口等）
 
@@ -346,7 +346,259 @@ def _download_fragment(self, ctx, frag_url, info_dict, headers=None, request_dat
 
 ---
 
-## 四、统一入口：FileDownloader.download() 的预检查
+## 四、Range 请求头与状态索引持久化的协作关系（深入分析）
+
+分段下载中存在**两层独立但协作的续传机制**：
+1. **片段级别**：用 `.ytdl` 中持久化的 `fragment_index` 决定从第几个片段开始
+2. **字节级别**：每个片段内部的 HTTP Range 请求决定从该片段的哪个字节开始
+
+两者并非简单并列，而是通过精确的调用时序互相衔接。
+
+### 4.1 第一层：Manifest 中的 byte_range 与 HTTP Range 头
+
+HLS m3u8 中可能包含 `#EXT-X-BYTERANGE` 标签，DASH manifest 中也可能用 `SegmentURL` + `mediaRange` 指定字节范围。这些信息在片段构造时被解析为 `fragment['byte_range']`。
+
+在 [hls.py](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/hls.py#L286-L292) 中解析 BYTERANGE：
+
+```python
+# hls.py L286-L292
+elif line.startswith('#EXT-X-BYTERANGE'):
+    splitted_byte_range = line[17:].split('@')
+    sub_range_start = int(splitted_byte_range[1]) if len(splitted_byte_range) == 2 else byte_range_offset
+    byte_range = {
+        'start': sub_range_start,
+        'end': sub_range_start + int(splitted_byte_range[0]),
+    }
+```
+
+随后在片段下载时，该 byte_range 被转化为 HTTP 请求头 [fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/fragment.py#L439-L448)：
+
+```python
+# fragment.py L439-L448
+def download_fragment(fragment, ctx):
+    ...
+    frag_index = ctx['fragment_index'] = fragment['frag_index']
+    headers = HTTPHeaderDict(info_dict.get('http_headers'))
+    byte_range = fragment.get('byte_range')
+    if byte_range:
+        headers['Range'] = 'bytes=%d-%d' % (byte_range['start'], byte_range['end'] - 1)
+```
+
+此时 `headers['Range']` 表示**该片段在远程媒体文件中的绝对字节区间**。
+
+### 4.2 第二层：单个片段文件内部的续传（HttpFD 级）
+
+`_download_fragment()` 创建片段临时文件 `<filename>.part-Frag<index>`，并将它交给 `HttpQuietDownloader`（即 HttpFD）。HttpFD 会**在传入的 Range 头基础上再叠加本地已下载字节偏移**。
+
+关键叠加逻辑在 [http.py](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/http.py#L56-L88)：
+
+```python
+# http.py L56-L88
+# 先解析 FragmentFD 传入的 byte_range（来自 manifest）
+req_start, req_end, _ = parse_http_range(headers.get('Range'))
+
+if self.params.get('continuedl', True):
+    if os.path.isfile(ctx.tmpfilename):
+        ctx.resume_len = os.path.getsize(ctx.tmpfilename)  # 该片段本地已下载字节数
+...
+
+if ctx.resume_len > 0:
+    range_start = ctx.resume_len
+    if req_start is not None:
+        # ★ 关键叠加：本地已下载字节 + manifest 指定的起始位置
+        range_start += req_start
+    ...
+elif req_start is not None:
+    range_start = req_start
+...
+request.headers['Range'] = f'bytes={int(range_start)}-{int_or_none(range_end) or ""}'
+```
+
+**叠加规则**：最终 HTTP Range = `bytes = (manifest 起始 + 本地已下载字节) - (manifest 结束)`
+
+举例：
+- manifest 指定片段为远程文件的 `bytes=5000-5999`（req_start=5000, req_end=5999）
+- 本地 `<name>.part-Frag3` 已存在，大小为 300 字节
+- 最终发出的请求 Range 为 `bytes=5300-5999`
+- 文件以 `ab` 追加模式打开，从第 300 字节继续写
+
+同时，`range_end` 也会被限制不超过 manifest 指定的结束位置：
+
+```python
+# http.py L95-L103
+if ctx.chunk_size:
+    chunk_aware_end = range_start + ctx.chunk_size - 1
+    range_end = chunk_aware_end if req_end is None else min(chunk_aware_end, req_end)
+elif req_end is not None:
+    range_end = req_end
+```
+
+### 4.3 fragment_index 的语义辨析："已完成"还是"下一个"？
+
+`.ytdl` 中 `current_fragment.index` 存储的到底是"已完成的最后一个片段索引"，还是"下一个待下载的片段索引"？
+
+答案是：**下一个待下载的片段索引**。证据来自两处：
+
+**证据 1：progress hook 中的自增时机**
+
+在 `_start_frag_download()` 注册的 `frag_progress_hook` 中 [fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/fragment.py#L270-L273)：
+
+```python
+# fragment.py L270-L273
+if s['status'] == 'finished':
+    state['fragment_index'] += 1
+    ctx['fragment_index'] = state['fragment_index']
+    progress.thread_reset()
+```
+
+`s['status'] == 'finished'` 是由 HttpFD 在单个片段文件下载完成时触发的（见 http.py L349-L356）。此时**片段文件已从 `.part-FragN` 重命名为正式片段文件名**，但尚未合并到最终 `.part` 文件中。
+
+**证据 2：恢复时的跳过判定使用 `<=`**
+
+HLS 和 DASH 中跳过已下载片段的条件是 `<=` [hls.py](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/hls.py#L212-L214)：
+
+```python
+# hls.py L212-L214
+frag_index += 1
+if frag_index <= ctx['fragment_index']:
+    continue   # 跳过已下载的片段
+```
+
+如果 `.ytdl` 中存储的是 `5`，说明片段 `1..5` 都已完成续传，下一次从片段 `6` 开始。
+
+### 4.4 完整调用时序：fragment_index 何时写入 .ytdl？
+
+以单线程（`concurrent_fragment_downloads=1`）为例，单个片段的完整生命周期如下：
+
+```
+download_and_append_fragments 循环
+  │
+  ├─ ① download_fragment(fragment, ctx)
+  │     │
+  │     ├─ ctx['fragment_index'] = fragment['frag_index']   // 设为当前片段（例 N）
+  │     ├─ byte_range → headers['Range']                    // manifest 级 Range
+  │     ├─ _download_fragment(ctx, ...)
+  │     │     │
+  │     │     ├─ 检测 FragN 临时文件大小 → frag_resume_len  // 片段级续传探测
+  │     │     └─ ctx['dl'].download(FragN, fragment_info_dict)   // 进入 HttpFD
+  │     │           │
+  │     │           ├─ 叠加 Range（manifest_start + frag_resume_len）
+  │     │           ├─ 下载片段数据
+  │     │           ├─ 完成后 try_rename(.part-FragN → FragN)
+  │     │           └─ _hook_progress({'status': 'finished'})
+  │     │                 │
+  │     │                 └─ ★ frag_progress_hook 被触发
+  │     │                       └─ ctx['fragment_index'] += 1   // 从 N 变为 N+1
+  │     │
+  │     └─ return   // 此时 ctx['fragment_index'] 已是 N+1
+  │
+  ├─ ② append_fragment(frag_content, frag_index, ctx)
+  │     │
+  │     └─ _append_fragment(ctx, pack_func(frag_content, frag_index))
+  │           │
+  │           ├─ ctx['dest_stream'].write(frag_content)     // 合并到最终 .part
+  │           ├─ ctx['dest_stream'].flush()                 // 落盘
+  │           ├─ if __do_ytdl_file:
+  │           │     └─ ★ _write_ytdl_file(ctx)              // 写入 ctx['fragment_index'] = N+1
+  │           ├─ if not keep_fragments:
+  │           │     └─ try_remove(FragN)                    // 删除单片段文件
+  │           └─ del ctx['fragment_filename_sanitized']
+  │
+  └─ 进入下一个片段循环
+```
+
+**关键观察**：
+- `ctx['fragment_index']` 在 progress hook 中从 `N` 自增为 `N+1`，发生在片段文件下载完成但**尚未合并到最终文件**之前
+- `_write_ytdl_file()` 在合并写入 + flush **之后**执行，此时写入的是 `N+1`
+- 这保证了：只要 `.ytdl` 中记录了 `M`，就意味着片段 `1..M-1` 已经被合并写入最终 `.part` 文件，恢复时可以安全跳过
+
+**并发模式（`max_workers > 1`）下的差异**：
+
+```python
+# fragment.py L487-L501
+if max_workers > 1:
+    def _download_fragment(fragment):
+        ctx_copy = ctx.copy()
+        download_fragment(fragment, ctx_copy)
+        return fragment, fragment['frag_index'], ctx_copy.get('fragment_filename_sanitized')
+
+    with tpe or concurrent.futures.ThreadPoolExecutor(max_workers) as pool:
+        try:
+            for fragment, frag_index, frag_filename in pool.map(_download_fragment, fragments):
+                ctx.update({
+                    'fragment_filename_sanitized': frag_filename,
+                    'fragment_index': frag_index,   # 用主线程返回的 frag_index 更新
+                })
+                if not append_fragment(...):
+                    return False
+```
+
+- 每个线程使用 `ctx.copy()`，避免并发修改主 ctx
+- 主线程从 `pool.map` 返回结果中取得 `frag_index`（即 `fragment['frag_index']`，**不是自增后的值**）
+- 但是！progress hook 中的自增仍然作用于全局 `state`/`ctx` 上
+- 最终 `_write_ytdl_file` 在主线程 `append_fragment` 中被调用，此时 `ctx['fragment_index']` 的值取决于 progress hook 已累计自增了多少
+
+### 4.5 恢复时：两层续传如何共同决定恢复位置
+
+完整恢复流程：
+
+```
+恢复启动
+  │
+  ├─ FragmentFD._prepare_frag_download()
+  │     ├─ 读 .part 文件大小 → resume_len（已完成片段字节数）
+  │     ├─ 读 .ytdl JSON → ctx['fragment_index'] = M
+  │     └─ 一致性校验通过
+  │
+  ├─ 构造 fragments 列表
+  │     └─ for frag_index in 1..total:
+  │           if frag_index <= M:   # M = ctx['fragment_index']
+  │               continue          # 跳过片段 1..M
+  │
+  └─ 从片段 M+1 开始逐个下载
+        │
+        ├─ ① 检测 <name>.part-Frag<M+1> 是否存在
+        │     ├─ 存在 → frag_resume_len = 文件大小（例：已下 200 字节）
+        │     └─ 不存在 → frag_resume_len = 0
+        │
+        ├─ ② 构造 Range
+        │     ├─ manifest byte_range：例 {start: 8000, end: 8999}
+        │     ├─ frag_resume_len = 200
+        │     └─ 最终请求 Range: bytes=8200-8999
+        │
+        ├─ ③ 下载剩余字节，追加写入 .part-Frag<M+1>
+        │
+        └─ ④ 下载完成 → progress hook 自增 fragment_index → 合并 → flush → 写 .ytdl
+```
+
+**如果在第 M+1 个片段下载中途中断**：
+- `.part` 文件大小仍等于片段 1..M 的总大小（因为当前片段尚未合并）
+- `.ytdl` 中 `fragment_index` 仍为 M（因为 `_write_ytdl_file` 还没被调用）
+- `<name>.part-Frag<M+1>` 可能存在，大小为已下载的部分字节
+- 下次恢复：`fragment_index = M`，跳过 1..M，从 M+1 开始；此时再检测 FragM+1 的临时文件，从第 frag_resume_len 字节继续
+
+**如果在 progress hook 自增之后、_write_ytdl_file 之前中断**（极端时序）：
+- 这种情况下 progress hook 已把 ctx['fragment_index'] 从 M 改为 M+1，但 `.ytdl` 还没写
+- 下次恢复读 `.ytdl` 仍得到 M
+- 会重新下载片段 M+1（即使上次其实已下载完成且合并 flush 成功了一部分——但因为 flush 成功和 _write_ytdl_file 之间窗口极小，实际中几乎不可能只成功前者而不执行后者；且两者在同一个 try-finally 块内）
+
+### 4.6 一致性校验的设计意图
+
+```python
+# fragment.py L194-L195
+is_corrupt = ctx.get('ytdl_corrupt') is True
+is_inconsistent = ctx['fragment_index'] > 0 and resume_len == 0
+```
+
+- `is_inconsistent`：`.ytdl` 声称已完成 N 个片段，但 `.part` 文件大小为 0
+  - 可能原因：`.part` 被手动删除，但 `.ytdl` 还在；或极端异常导致文件系统不一致
+  - 处理：两个状态都清零，从头开始
+- `is_corrupt`：`.ytdl` JSON 解析失败
+  - 处理：同样清零重下，避免损坏的索引导致跳过不完整的片段
+
+---
+
+## 五、统一入口：FileDownloader.download() 的预检查
 
 所有下载器在进入 `real_download()` 之前，都会经过 [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/common.py#L430-L482) 的前置判定：
 
@@ -375,7 +627,7 @@ def download(self, filename, info_dict, subtitle=False):
 
 ---
 
-## 五、可恢复判定流程图（综合）
+## 六、可恢复判定流程图（综合）
 
 ```
 启动下载
@@ -400,27 +652,28 @@ def download(self, filename, info_dict, subtitle=False):
         │   │
         │   └─ ④ 传输中断重试 → 重新读取磁盘文件大小作为 resume_len
         │
-        └─ FragmentFD 路径（HLS/DASH 等分段）
+        └─ FragmentFD 路径（HLS/DASH 等分段）——两层续传协作
             │
-            ├─ ① 探测 .part 文件大小 → resume_len（已完成片段字节数）
+            ├─ 【第一层：片段级】
+            │   ├─ ① 探测 .part 文件大小 → resume_len（已完成片段字节数）
+            │   ├─ ② 读取 .ytdl JSON → ctx['fragment_index'] = M
+            │   ├─ ③ 一致性校验（.ytdl 损坏？index 与文件大小矛盾？）
+            │   │   ├─ 不通过 → ❌ 清零重下
+            │   │   └─ 通过 → ✅
+            │   └─ ④ 跳过所有 frag_index <= M 的片段（1..M 已完成）
             │
-            ├─ ② 读取 .ytdl JSON → fragment_index, extra_state
-            │
-            ├─ ③ 一致性校验
-            │   ├─ .ytdl 损坏 → ❌ 清零重下
-            │   ├─ fragment_index > 0 但 .part 大小=0 → ❌ 清零重下
-            │   └─ 一致 → ✅ 进入续传
-            │
-            ├─ ④ 跳过所有 frag_index <= ctx['fragment_index'] 的片段
-            │
-            ├─ ⑤ 每个片段下载时，片段文件本身也走 HttpFD 续传逻辑
-            │
-            └─ ⑥ 每完成一个片段 → flush .part + 写 .ytdl 更新 fragment_index
+            └─ 【第二层：字节级】针对每个待下载片段 N（从 M+1 开始）
+                ├─ ① 探测 <name>.part-Frag<N> 临时文件 → frag_resume_len
+                ├─ ② 解析 manifest byte_range（req_start, req_end）
+                ├─ ③ 叠加：最终 Range = bytes=(req_start + frag_resume_len)-req_end
+                ├─ ④ 下载片段；完成后 progress hook 自增 fragment_index
+                ├─ ⑤ 合并片段内容到 .part + flush
+                └─ ⑥ 写 .ytdl 持久化最新 fragment_index（=下一个待下载）
 ```
 
 ---
 
-## 六、关键参数总览
+## 七、关键参数总览
 
 | 参数 | 位置 | 默认 | 作用 |
 |---|---|---|---|
@@ -435,7 +688,7 @@ def download(self, filename, info_dict, subtitle=False):
 
 ---
 
-## 七、关键文件索引
+## 八、关键文件索引
 
 | 文件 | 主要职责 |
 |---|---|
