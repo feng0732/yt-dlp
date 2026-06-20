@@ -492,8 +492,10 @@ yt-dlp 所有"输出文件"都通过一个统一的字典 `files_to_move` 组织
     YoutubeDL.process_info L3361: files_to_move = {}
 
 ② 字幕写入
-    _write_subtitles 返回 [(sub_filename, sub_filename_final), ...]
-    files_to_move.update(dict(sub_files))  # L3389
+    _write_subtitles(info_dict, temp_filename)  # L3386
+    → 返回 [(sub_filename, sub_filename_final), ...]
+    → files_to_move.update(dict(sub_files))  # L3389
+    → 此时字幕文件已写入磁盘，filepath 已设置
 
 ③ 缩略图/描述/infojson 等写入
     _write_thumbnails / _write_description / _write_info_json
@@ -504,16 +506,23 @@ yt-dlp 所有"输出文件"都通过一个统一的字典 `files_to_move` 组织
       → info['__files_to_move'] = files_to_move  (pre_process L3830)
       → 运行所有 when='before_dl' 的 PP
           · FFmpegSubtitlesConvertorPP 在此阶段执行：
+              - 读取 info['requested_subtitles'] 中的 filepath（已在 ② 中写入）
               - 以新文件路径替换旧文件路径的映射
               - 返回 files_to_delete（原始字幕文件）
               - run_pp 根据 keepvideo 决定删除 or 保留
       → 返回 (new_info, 更新后的 __files_to_move)
     files_to_move ← 返回值
 
+    ⚠️ 重要：字幕转换发生在字幕写入之后、视频下载之前
+    - 字幕文件已在 ② 中写入磁盘并注册到 files_to_move
+    - convert-subs PP 在 ④ 中读取已写入的字幕文件，转换后更新映射
+    - 视频在 ⑤ 中才开始下载
+
 ⑤ 视频下载
-    下载 temp_filename，主视频文件本身加入 files_to_move：
+    self.dl(temp_filename, info_dict)  # L3526 或 L3579
+    主视频文件本身加入 files_to_move：
       · 合并下载时（如 video+audio），各碎片文件同样注册
-      · L3568-L3572 files_to_move[file] = None for file in downloaded  # None=用默认方式生成最终路径
+      · L3572 files_to_move[file] = None for file in downloaded  # None=用默认方式生成最终路径
 
 ⑥ post_process 阶段 PP（含字幕嵌入）
     post_process(dl_filename, info_dict, files_to_move)  # L3657
@@ -521,8 +530,8 @@ yt-dlp 所有"输出文件"都通过一个统一的字典 `files_to_move` 组织
       → 运行所有 when='post_process' 的 PP
           · FFmpegEmbedSubtitlePP 在此阶段执行：
               - 读取 info['requested_subtitles'] 中的 filepath 并嵌入视频
-              - 返回 files_to_delete（字幕文件），run_pp 中同样按 keepvideo 删除/保留
-              - 注意：嵌入 PP 不会修改字幕文件的映射，但会删除被嵌入的字幕文件
+              - 返回 files_to_delete 或 []（取决于 already_have_subtitle）
+              - run_pp 中按 keepvideo 删除/保留（如果 files_to_delete 非空）
       → 运行 MoveFilesAfterDownloadPP（见 5.2）
       → 运行所有 when='after_move' 的 PP
 ```
@@ -561,15 +570,18 @@ def run(self, info):
     return [], info
 ```
 
-### 5.3 字幕文件在移动链中的四种结局
+### 5.3 字幕文件在移动链中的结局
 
 | 场景 | 处理方式 | 代码位置 |
 |---|---|---|
 | 只 `--write-subs` | 字幕文件正常 `files_to_move`，被 MoveFilesAfterDownloadPP 搬到 finaldir | [YoutubeDL L3386-3389](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3386-L3389) |
 | `--write-subs --convert-subs FORMAT`（普通格式/dfxp 转非 srt） | 转码后新格式字幕替换旧文件映射注册，旧格式被 run_pp 删除（带 `-k` 则保留并一起搬，旧文件保留原正确最终路径） | [ffmpeg.py L1009-1010](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) + [YoutubeDL L3798-L3819](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3819) |
 | `--write-subs --convert-subs srt`（dfxp→srt 终点）⚠️ **设计缺陷** | dfxp 原文件被删除，srt 文件未注册到 `__files_to_move`，**不会被移动到最终目录，留在临时目录** | [ffmpeg.py L995-L996](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L995-L996) `continue` 跳过注册 |
-| `--embed-subs` 且未保留 | 字幕嵌入后被 FFmpegEmbedSubtitlePP 列为 files_to_delete，由 run_pp 删除，因此不会出现在最终目录 | [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
-| `--embed-subs --write-subs` | 嵌入时 `already_have_subtitle=True`，因此不在 files_to_delete 中，继续留在 files_to_move 随视频一起搬移 | [__init__.py L674-679](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L679) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
+| `--embed-subs`（单独使用） | 自动开启 `writesubtitles=True`（L682），字幕被下载和嵌入；但 `already_have_subtitle=False`（L679 在 L682 之前计算），嵌入后字幕文件被删除 | [__init__.py L674-L682](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L682) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
+| `--embed-subs --write-subs` | `already_have_subtitle=True`，嵌入后字幕文件保留在 `__files_to_move` 中，随视频一起搬移 | [__init__.py L679](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L679) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
+| `--embed-subs --write-auto-subs` | 不触发 L682 自动开启 writesubtitles；`already_have_subtitle=False`；嵌入后字幕文件被删除 | [__init__.py L681](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L681) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
+| `--embed-subs --write-subs --write-auto-subs` | `already_have_subtitle=True`，嵌入后所有字幕文件保留（不区分普通/自动字幕） | [__init__.py L679](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L679) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
+| `--embed-subs --no-keep-subs` | `keep_subs=False`，`already_have_subtitle=False`；L682 不触发；嵌入后字幕文件被删除 | [__init__.py L675](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L675) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
 
 ---
 
@@ -577,18 +589,71 @@ def run(self, info):
 
 ### 6.1 触发条件
 
-通过 `--embed-subs` 选项触发，在 [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L679) 中注册：
+通过 `--embed-subs` 选项触发，在 [__init__.py L674-L682](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L682) 中注册：
 
 ```python
 if opts.embedsubtitles:
     keep_subs = 'no-keep-subs' not in opts.compat_opts
     yield {
         'key': 'FFmpegEmbedSubtitle',
+        # already_have_subtitle = True prevents the file from being deleted after embedding
         'already_have_subtitle': opts.writesubtitles and keep_subs,
     }
+    if not opts.writeautomaticsub and keep_subs:
+        opts.writesubtitles = True
 ```
 
-### 6.2 FFmpegEmbedSubtitlePP
+**`already_have_subtitle` 的计算时机与自动开启字幕写入**：
+
+这段代码的执行顺序至关重要——L679 在 L682 之前，两者之间有**因果关系**：
+
+1. **L679**：先计算 `already_have_subtitle = opts.writesubtitles and keep_subs`，此时 `opts.writesubtitles` 是**用户原始设定**
+2. **L682**：然后条件性地将 `opts.writesubtitles = True`，这是**自动开启**，确保 `--embed-subs` 单独使用时也能下载到字幕
+
+这意味着：即使用户只写了 `--embed-subs` 而没写 `--write-subs`，`writesubtitles` 也会被自动设为 True，后续 `_write_subtitles` 会正常下载字幕；但 `already_have_subtitle` 仍为 False，因此嵌入后字幕文件会被删除。
+
+**L682 的触发条件**：`not opts.writeautomaticsub and keep_subs`
+- 如果用户指定了 `--write-auto-subs`，则不自动开启 `writesubtitles`
+- 如果用户指定了 `--no-keep-subs`（`keep_subs=False`），也不自动开启
+
+### 6.2 嵌入后字幕文件的保留与删除规则
+
+[FFmpegEmbedSubtitlePP.run()](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L581-L659) 在 L658 决定嵌入后字幕文件的命运：
+
+```python
+files_to_delete = [] if self._already_have_subtitle else sub_filenames
+```
+
+**核心规则**：`already_have_subtitle` 为 True 时返回空列表（保留），为 False 时返回所有嵌入字幕文件路径（待删除）。
+
+**普通字幕 vs 自动字幕**：`sub_filenames` 包含**所有**被嵌入的字幕文件路径，不区分来源。`already_have_subtitle` 也不区分字幕来源——它是一个整体开关：
+- True → 所有嵌入字幕文件保留
+- False → 所有嵌入字幕文件删除
+
+因此，不存在"普通字幕保留但自动字幕删除"或反之的情况。
+
+**参数组合与保留/删除结果**：
+
+| 用户参数 | `writesubtitles` (PP注册时) | `already_have_ subtitle` | `writesubtitles` (L682后) | 嵌入后行为 | 说明 |
+|---|---|---|---|---|---|
+| `--embed-subs` | False | False | True | ❌ 删除所有 | 自动开启 writesubtitles 确保下载，但嵌入后删除 |
+| `--embed-subs --write-subs` | True | True | True (不变) | ✅ 保留所有 | 用户明确要求写字幕，嵌入后保留 |
+| `--embed-subs --write-auto-subs` | False | False | False (L681条件不满足) | ❌ 删除所有 | 仅下载自动字幕，嵌入后删除 |
+| `--embed-subs --write-subs --write-auto-subs` | True | True | True (不变) | ✅ 保留所有 | 普通和自动字幕都下载，嵌入后都保留 |
+| `--embed-subs --no-keep-subs` | False | False | False (L681条件不满足) | ❌ 删除所有 | `--no-keep-subs` 阻止自动开启写入和保留 |
+
+**`--embed-subs` 单独使用的隐式行为**：
+
+1. `opts.writesubtitles` 被自动设为 True（L682）
+2. `process_subtitles` 中 `writesubtitles=True` → 普通字幕被纳入 `requested_subtitles`
+3. `_write_subtitles` 下载并写入字幕文件
+4. 嵌入 PP 执行后，`already_have_subtitle=False` → `files_to_delete = sub_filenames`
+5. `run_pp` 删除字幕文件，并从 `__files_to_move` 中移除
+6. 最终字幕文件不存在于输出目录中
+
+这种设计确保了"只嵌入不保留"的使用场景——用户想要字幕嵌入视频内部，不需要额外保留字幕文件。
+
+### 6.3 FFmpegEmbedSubtitlePP
 
 [FFmpegEmbedSubtitlePP](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L581-L659) 将字幕轨嵌入视频容器：
 
@@ -612,7 +677,7 @@ ffmpeg -i video.mp4 -i sub1.vtt -i sub2.srt \
        -c copy output.temp.mp4
 ```
 
-`already_have_subtitle` 参数控制嵌入后是否删除字幕文件：若用户同时指定了 `--write-subs`，则保留字幕文件；否则嵌入后删除。
+`already_have_subtitle` 参数控制嵌入后是否删除字幕文件——详见 §6.2。
 
 ---
 
@@ -662,10 +727,12 @@ ffmpeg -i video.mp4 -i sub1.vtt -i sub2.srt \
 │   → 更新 sub_info 的 ext/data/filepath                          │
 │   → __files_to_move[new_file] = final_path（替换映射）          │
 │   → 返回 files_to_delete → run_pp 按 keepvideo 删除/保留        │
+│   ⚠️ 注意：此阶段在字幕写入(3)之后、视频下载(5)之前              │
 └───────────────────────────┬─────────────────────────────────────┘
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │ 5. 视频下载 + 碎片文件加入 files_to_move                        │
+│   self.dl(temp_filename, info_dict)  # L3526/L3579              │
 └───────────────────────────┬─────────────────────────────────────┘
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -674,6 +741,8 @@ ffmpeg -i video.mp4 -i sub1.vtt -i sub2.srt \
 │   ├─ 检查字幕格式兼容性 (webm仅vtt, json不可嵌入)               │
 │   └─ ffmpeg -map 嵌入字幕轨 + 设置语言 metadata                 │
 │   → 嵌入后根据 already_have_subtitle 决定是否删除字幕文件       │
+│   → already_have_subtitle = writesubtitles & keep_subs (§6.2)   │
+│   → 不区分普通字幕/自动字幕，统一保留或删除                      │
 └───────────────────────────┬─────────────────────────────────────┘
                             ▼
 ┌─────────────────────────────────────────────────────────────────┐
@@ -710,14 +779,16 @@ ffmpeg -i video.mp4 -i sub1.vtt -i sub2.srt \
 | dfxp→srt 终点跳过注册（设计缺陷） | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L995-L996) | L995-L996 |
 | 转码字幕注册到__files_to_move | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) | L1009-1010 |
 | FFmpegEmbedSubtitlePP | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L581-L659) | L581-L659 |
+| 嵌入后字幕保留/删除判定（already_have_subtitle） | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) | L658 |
+| embed-subs PP 注册 + 自动开启 writesubtitles | [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L682) | L674-L682 |
 | _delete_downloaded_files（删除文件+从映射移除） | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3774-L3783) | L3774-L3783 |
 | run_pp: files_to_delete 删除/保留逻辑（keepvideo） | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3819) | L3798-L3819 |
 | MoveFilesAfterDownloadPP 空值默认路径处理 | [movefilesafterdownload.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py#L28-L31) | L28-L31 |
 | pre_process / post_process 生命周期 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3828-L3846) | L3828-3846 |
 | MoveFilesAfterDownloadPP | [movefilesafterdownload.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py#L11-L53) | L11-53 |
-| 后处理器注册 | [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L644-L679) | L644-679 |
+| convert-subs PP 注册（when='before_dl'） | [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L644-L649) | L644-L649 |
 | YouTube _SUBTITLE_FORMATS | [youtube/_video.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/youtube/_video.py#L142) | L142 |
 | YouTube process_language | [youtube/_video.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/youtube/_video.py#L4199-L4211) | L4199-4211 |
 | MEDIA_EXTENSIONS.subtitles | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/utils/_utils.py#L5097) | L5097 |
 | CLI 字幕选项定义 | [options.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/options.py#L971-L1002) | L971-1002 |
-| files_to_move 初始化+字幕注册 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3361-L3389) | L3361-3389 |
+| files_to_move 初始化+字幕注册（字幕写入→before_dl→视频下载） | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3361-L3449) | L3361-L3449 |
