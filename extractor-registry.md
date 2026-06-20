@@ -310,67 +310,297 @@ def suitable(cls, url):
 
 **用户重排序**：通过 `--allowed-extractors` 选项可以完全自定义提取器顺序。
 
-## 5. 接力机制（Relay / Embedding）
+## 5. 接力机制：URL 二次分派的完整路径
 
-当 GenericIE 匹配到一个通用网页时，它会尝试从网页中提取嵌入的视频，这就是"接力"机制。
+"接力"是指一个提取器无法直接处理 URL 时，将其转换为另一种形式（通常是 `url_result`），交由 YoutubeDL 重新分派给更合适的提取器。这个机制贯穿了整个提取流程，是理解 yt-dlp 架构的关键。
 
-### 5.1 GenericIE 的嵌入提取流程
+### 5.1 url_result：接力的载体
 
-**文件**: [yt_dlp/extractor/generic.py](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/extractor/generic.py#L986-L1015)
+**文件**: [yt_dlp/extractor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/extractor/common.py#L1277-L1295)
 
 ```python
-def _extract_embeds(self, url, webpage, *, urlh=None, info_dict={}):
-    url, smuggled_data = unsmuggle_url(url, {})
-    embeds = []
-    for ie in self._downloader._ies.values():
-        if ie.ie_key() in smuggled_data.get('block_ies', []):
-            continue
-        gen = ie.extract_from_webpage(self._downloader, url, webpage)
-        current_embeds = []
-        try:
-            while True:
-                current_embeds.append(next(gen))
-        except self.StopExtraction:
-            self.report_detected(f'{ie.IE_NAME} exclusive embed', len(current_embeds),
-                                 embeds and 'discarding other embeds')
-            return current_embeds
-        except StopIteration:
-            self.report_detected(f'{ie.IE_NAME} embed', len(current_embeds))
-            embeds.extend(current_embeds)
-    return embeds
+@staticmethod
+def url_result(url, ie=None, video_id=None, video_title=None, *, url_transparent=False, **kwargs):
+    """Returns a URL that points to a page that should be processed"""
+    if ie is not None:
+        kwargs['ie_key'] = ie if isinstance(ie, str) else ie.ie_key()
+    if video_id is not None:
+        kwargs['id'] = video_id
+    if video_title is not None:
+        kwargs['title'] = video_title
+    return {
+        **kwargs,
+        '_type': 'url_transparent' if url_transparent else 'url',
+        'url': url,
+    }
 ```
 
-### 5.2 提取器的嵌入提取方法
+**返回值结构**：
+- `_type`: 有两种类型 —— `'url'`（纯转发）和 `'url_transparent'`（保留元数据）
+- `url`: 需要被重新处理的目标 URL
+- `ie_key`（可选）：指定处理该 URL 的提取器名称，跳过 URL 匹配阶段
+- 其他字段：作为 `extra_info` 传递给下一个提取器
 
-**文件**: [yt_dlp/extractor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/extractor/common.py#L4082-L4111)
+### 5.2 完整接力路径：从提取到二次分派
+
+下面沿着完整代码路径追踪一个 URL 是如何被二次分派的：
+
+#### 第一阶段：初始提取
+
+**入口**: [YoutubeDL.extract_info()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1671-L1719)
+
+```
+用户输入 URL
+    │
+    ▼
+extract_info(url)
+    │
+    ├─► 遍历 self._ies，找到第一个 suitable(url) 的提取器
+    │
+    ▼
+__extract_info(url, ie_instance, ...)    ← 传入的是实例（通过 get_info_extractor 创建）
+    │
+    ├─► ie.extract(url)
+    │     │
+    │     ├─► ie.initialize()     ← 登录、初始化等
+    │     └─► ie._real_extract(url)
+    │           │
+    │           └─► 返回值可能是：
+    │                 ├─► {'_type': 'video', ...}        ← 最终结果
+    │                 ├─► {'_type': 'url', 'url': ...}   ← 需要接力
+    │                 └─► {'_type': 'url_transparent', ...} ← 透明接力
+    │
+    ├─► add_default_extra_info(ie_result, ie, url)
+    │
+    └─► process_ie_result(ie_result, ...)
+```
+
+#### 第二阶段：二次分派（核心）
+
+**入口**: [YoutubeDL.process_ie_result()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1904-L2036)
+
+```python
+def process_ie_result(self, ie_result, download=True, extra_info=None):
+    result_type = ie_result.get('_type', 'video')
+
+    if result_type in ('url', 'url_transparent'):
+        # 规范化 URL
+        ie_result['url'] = sanitize_url(ie_result['url'], ...)
+
+        # 检查是否扁平化提取（不深入解析）
+        extract_flat = self.params.get('extract_flat', False)
+        if (...extract_flat...):
+            return ie_result  # 不继续接力
+
+    if result_type == 'video':
+        # 最终视频结果，处理下载等
+        ie_result = self.process_video_result(ie_result, download=download)
+        return ie_result
+
+    elif result_type == 'url':
+        # ===== 纯接力：重新调用 extract_info =====
+        return self.extract_info(
+            ie_result['url'], download,
+            ie_key=ie_result.get('ie_key'),   # 可指定提取器
+            extra_info=extra_info)            # 透传额外信息
+
+    elif result_type == 'url_transparent':
+        # ===== 透明接力：先提取，再合并元数据 =====
+        info = self.extract_info(
+            ie_result['url'], ie_key=ie_result.get('ie_key'),
+            extra_info=extra_info, download=False, process=False)
+
+        # 合并 embedding 页面的元数据到提取结果
+        # 豁免字段：_type, url, ie_key, id, extractor 等
+        new_result = info.copy()
+        new_result.update(filter_dict(ie_result, ...))
+
+        # 如果内部结果还是 url 类型，转为 url_transparent 以继续传递元数据
+        if new_result.get('_type') == 'url':
+            new_result['_type'] = 'url_transparent'
+
+        # 递归处理合并后的结果
+        return self.process_ie_result(new_result, download=download, extra_info=extra_info)
+```
+
+**两种接力方式对比**：
+
+| 特性 | `_type='url'` | `_type='url_transparent'` |
+|------|--------------|--------------------------|
+| 代码位置 | [YoutubeDL.py#L1958-L1964](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1958-L1964) | [YoutubeDL.py#L1965-L1995](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L1965-L1995) |
+| 元数据来源 | 新提取器自己获取 | **保留外层页面**的 title/description 等 |
+| 递归深度 | 可能多级 | 合并后递归，最多两级合并 |
+| 典型场景 | 搜索结果 → 实际视频 | 博客页面嵌入 YouTube 视频 |
+
+#### 第三阶段：重新匹配提取器
+
+当 `process_ie_result` 调用 `self.extract_info(ie_result['url'], ie_key=...)` 时，流程回到 `extract_info` 的开头：
+
+```python
+# extract_info 中的关键逻辑
+if ie_key:
+    # 如果指定了 ie_key，直接使用该提取器（跳过遍历匹配）
+    ies = {ie_key: self._ies[ie_key]} if ie_key in self._ies else {}
+else:
+    # 否则重新遍历所有提取器，按优先级匹配
+    ies = self._ies
+```
+
+这意味着：
+- 如果 `url_result` 指定了 `ie_key`，直接跳转到目标提取器
+- 如果没有指定，则从头按优先级重新匹配（可能匹配到同一个 GenericIE，此时需要 block_ies 防循环）
+
+### 5.3 嵌入视频识别：GenericIE 的接力流程
+
+GenericIE 是"接力之王"，它本身只处理最通用的情况（直链视频），大部分工作都是识别嵌入的视频然后分派出去。
+
+**入口**: [GenericIE._real_extract()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/extractor/generic.py#L763)
+
+```
+GenericIE._real_extract(url)
+    │
+    ├─► 协议补全（//xxx → https://xxx）
+    │
+    ├─► URL 规范化（无协议 → default_search 如 ytsearch:）
+    │     └─► return self.url_result('ytsearch:' + query)  ← 第一次接力
+    │
+    ├─► HTTP 请求获取网页内容
+    │
+    ├─► 检测重定向
+    │     └─► return self.url_result(new_url)  ← 第二次接力（重定向后重试）
+    │
+    ├─► 检测直链视频（Content-Type: video/mp4 等）
+    │     └─► 直接返回 formats（不接力）
+    │
+    ├─► 检测 M3U/HLS/DASH 等 manifest
+    │     └─► 直接返回 formats
+    │
+    └─► 解析 HTML 网页
+          │
+          └─► _extract_embeds(url, webpage)  ← 核心嵌入识别
+                │
+                ├─► 遍历 self._downloader._ies.values()
+                │
+                ├─► 跳过 block_ies 中的提取器
+                │
+                ├─► 调用 ie.extract_from_webpage(ydl, url, webpage)
+                │     │
+                │     └─► 每个提取器用自己的 _EMBED_REGEX 在 HTML 中查找
+                │           │
+                │           └─► yield cls.url_result(embed_url, cls)  ← 生成接力结果
+                │
+                ├─► 如果提取器抛出 StopExtraction → 独占返回（不再遍历后续）
+                │
+                └─► 返回所有找到的 embeds
+```
+
+#### 提取器的嵌入识别方法详解
+
+**文件**: [yt_dlp/extractor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/extractor/common.py#L4082-L4114)
 
 ```python
 @classmethod
 def extract_from_webpage(cls, ydl, url, webpage):
+    # 关键判断：如果 _extract_from_webpage 是绑定方法（即定义在类上的实例方法），
+    # 则需要实例化提取器（需要实例状态，如 _downloader）
+    # 否则（默认实现是 classmethod），可以直接用类调用
     ie = (cls if isinstance(cls._extract_from_webpage, types.MethodType)
           else ydl.get_info_extractor(cls.ie_key()))
+
     for info in ie._extract_from_webpage(url, webpage) or []:
         ydl.add_default_extra_info(info, ie, None)
         yield info
 
 @classmethod
 def _extract_from_webpage(cls, url, webpage):
-    for embed_url in orderedSet(
-            cls._extract_embed_urls(url, webpage) or [], lazy=True):
+    # 默认实现：用 _EMBED_REGEX 找嵌入 URL，然后转成 url_result
+    for embed_url in orderedSet(cls._extract_embed_urls(url, webpage) or [], lazy=True):
         yield cls.url_result(embed_url, None if cls._VALID_URL is False else cls)
-
-@classmethod
-def _extract_embed_urls(cls, url, webpage):
-    if '_EMBED_URL_RE' not in cls.__dict__:
-        cls._EMBED_URL_RE = tuple(map(re.compile, cls._EMBED_REGEX))
-    for regex in cls._EMBED_URL_RE:
-        for mobj in regex.finditer(webpage):
-            embed_url = urllib.parse.urljoin(url, unescapeHTML(mobj.group('url')))
-            if cls._VALID_URL is False or cls.suitable(embed_url):
-                yield embed_url
 ```
 
-### 5.3 独占提取权（StopExtraction）
+**这里的关键设计**：
+- `_extract_from_webpage` 允许是 classmethod 或实例方法
+- 如果是实例方法 → 需要通过 `ydl.get_info_extractor()` 获取实例（触发实例化和缓存）
+- 默认是 classmethod → 零成本，无需实例化即可在 HTML 中扫描
+
+### 5.4 实例缓存机制：_ies 与 _ies_instances
+
+**文件**: [YoutubeDL.__init__()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L638-L639)
+
+```python
+self._ies = {}           # 存储提取器类或实例，key 是 ie_key（小写）
+self._ies_instances = {} # 仅存储已实例化的提取器，key 是 ie_key
+```
+
+#### 实例缓存的工作流程
+
+```
+add_info_extractor(ie)
+    │
+    ├─► ie_key = ie.ie_key()          # 如 'youtube'
+    │
+    ├─► self._ies[ie_key] = ie        # 总是存入（类或实例都可以）
+    │
+    └─► if not isinstance(ie, type):  # 如果是实例
+          └─► self._ies_instances[ie_key] = ie   # 缓存实例
+```
+
+```
+get_info_extractor(ie_key)
+    │
+    ├─► ie = self._ies_instances.get(ie_key)   # 先查缓存
+    │
+    ├─► if ie is None:
+    │     │
+    │     ├─► ie = get_info_extractor(ie_key)()  # 从全局提取类，然后实例化
+    │     │                                        # 这里会触发懒加载的 real_class 加载
+    │     │
+    │     └─► self.add_info_extractor(ie)       # 加入缓存
+    │
+    └─► return ie   # 返回缓存的实例
+```
+
+**文件**: [YoutubeDL.add_info_extractor() 和 get_info_extractor()](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/YoutubeDL.py#L904-L922)
+
+```python
+def add_info_extractor(self, ie):
+    ie_key = ie.ie_key()
+    self._ies[ie_key] = ie
+    if not isinstance(ie, type):
+        self._ies_instances[ie_key] = ie
+        ie.set_downloader(self)
+
+def get_info_extractor(self, ie_key):
+    ie = self._ies_instances.get(ie_key)
+    if ie is None:
+        ie = get_info_extractor(ie_key)()   # 全局 get_info_extractor 返回类
+        self.add_info_extractor(ie)         # 类() → 实例化
+    return ie
+```
+
+#### 实例缓存与接力的关系
+
+实例缓存与接力机制紧密配合：
+
+1. **匹配阶段不需要实例**：`suitable()` 是 classmethod，遍历 `self._ies` 时即使存储的是类（未实例化）也能调用 `ie.suitable(url)`。这与懒加载完美配合——匹配阶段完全不需要导入真实模块。
+
+2. **真正提取时才实例化**：在 `extract_info` 找到匹配提取器后，调用 `self.get_info_extractor(key)` 才会：
+   - 从懒加载代理类加载真实提取器类
+   - 实例化提取器（调用 `__new__` 触发真实模块导入）
+   - 缓存到 `_ies_instances`
+   - 设置 `ie.set_downloader(self)` 绑定 YoutubeDL
+
+3. **嵌入识别按需实例化**：在 `extract_from_webpage` 中：
+   ```python
+   ie = (cls if isinstance(cls._extract_from_webpage, types.MethodType)
+         else ydl.get_info_extractor(cls.ie_key()))
+   ```
+   - 如果提取器重写了 `_extract_from_webpage` 为实例方法 → 实例化（如需要访问 `self._downloader`）
+   - 默认实现是 classmethod → 不需要实例化，零成本扫描
+
+4. **播放列表场景的实例复用**：播放列表中的每个条目通过 `process_ie_result` → `extract_info` 分派时，`get_info_extractor` 直接返回缓存实例，避免了重复的初始化（登录、geo bypass 等）。
+
+### 5.5 独占提取权（StopExtraction）
 
 **文件**: [yt_dlp/extractor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/extractor/common.py#L4113-L4114)
 
@@ -384,7 +614,20 @@ class StopExtraction(Exception):
 - 后续提取器不会再处理该网页
 - 适用于无法仅通过 URL 匹配的场景（如 Invidious、PeerTube 等实例）
 
-### 5.4 循环阻止机制（block_ies）
+**使用示例**（GenericIE._extract_embeds 中）：
+
+```python
+try:
+    while True:
+        current_embeds.append(next(gen))
+except self.StopExtraction:
+    # 某个提取器声明独占权，立即返回它的结果，丢弃已收集的其他 embeds
+    return current_embeds
+except StopIteration:
+    embeds.extend(current_embeds)
+```
+
+### 5.6 循环阻止机制（block_ies）
 
 **文件**: [yt_dlp/extractor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/81-yt-dlp/yt_dlp/extractor/common.py#L4079-L4080)
 
@@ -393,7 +636,39 @@ return self._downloader.get_info_extractor('Generic')._extract_embeds(
     smuggle_url(url, {'block_ies': [self.ie_key()]}), *args, **kwargs)
 ```
 
-提取器可以通过 `smuggle_url` 将 `block_ies` 传递给 GenericIE，阻止特定提取器（通常是自己）处理嵌入的 URL，防止无限循环。
+**为什么需要 block_ies**：
+
+考虑这个场景：
+1. 用户输入一个通用博客 URL，GenericIE 匹配
+2. GenericIE 在网页中找到一个嵌入视频，返回 `url_result(embed_url, SomeExtractor)`
+3. `process_ie_result` 接力到 SomeExtractor
+4. SomeExtractor 处理后发现还需要找其他嵌入，又把 URL 丢回 GenericIE
+5. GenericIE 再次找到同一个嵌入 → **无限循环**
+
+**解决方案**：提取器调用 GenericIE 时，通过 `smuggle_url` 将自己的 `ie_key` 放入 `block_ies` 列表。GenericIE 的 `_extract_embeds` 会跳过这些提取器：
+
+```python
+# _extract_embeds 中的检查
+for ie in self._downloader._ies.values():
+    if ie.ie_key() in smuggled_data.get('block_ies', []):
+        continue   # 跳过被阻止的提取器，防止循环
+    # ... 正常处理
+```
+
+### 5.7 接力场景汇总
+
+下面是 yt-dlp 中常见的接力场景：
+
+| 场景 | 发起提取器 | 接力目标 | 接力类型 |
+|------|-----------|---------|---------|
+| 协议补全 | GenericIE | 补全 https 后重新匹配 | `url` |
+| 默认搜索 | GenericIE | YoutubeSearchIE 等 | `url` |
+| 重定向跟随 | GenericIE | 重定向后的 URL | `url` |
+| 博客嵌入视频 | GenericIE | YoutubeIE/BilibiliIE 等 | `url_transparent`（保留博客元数据） |
+| 搜索关键词 → 视频 | YoutubeSearchIE | YoutubeIE | `url` |
+| 播放列表条目 → 视频 | YoutubePlaylistIE | YoutubeIE | `url` |
+| 用户频道 → 视频列表 | YoutubeChannelIE | YoutubeTabIE | `url` |
+| 分享短链 → 真实 URL | 各种短链提取器 | 目标站点提取器 | `url` |
 
 ## 6. 插件覆盖机制
 
@@ -445,50 +720,135 @@ class MyYoutubeIE(YoutubeIE, plugin_name='myplugin'):
 
 ## 7. 总结
 
-### 7.1 优先级决策树
+### 7.1 完整流程决策树
 
 ```
 URL 输入
   │
-  ├─► 指定 ie_key? ──► 直接使用该提取器
+  ├─► 指定 ie_key? ──► 直接定位到 self._ies[ie_key]
   │
-  └─► 按顺序遍历 self._ies
+  └─► 按顺序遍历 self._ies (插件>YouTube>其他>GenericIE)
         │
-        ├─► 插件提取器 (优先级最高)
+        ├─► ie.suitable(url)? ──► 否 ──► 继续下一个
+        │      │
+        │      └─► 是 ──► 进入 __extract_info
         │
-        ├─► YouTube 系列提取器 (性能优化)
+        ▼
+  __extract_info(url, ie, ...)
         │
-        ├─► 其他内置提取器 (字母顺序)
-        │     │
-        │     ├─► suitable(url)? ──► 是 ──► 使用该提取器
-        │     │
-        │     └─► 否 ──► 继续下一个
+        ├─► 懒加载触发：get_info_extractor(key) 实例化提取器
+        │     ├─► 从 _ies_instances 缓存查找
+        │     ├─► 未命中 → 加载真实类(懒加载real_class) → 实例化 → 存入缓存
+        │     └─► ie.set_downloader(self) 绑定 YoutubeDL
         │
-        ├─► GenericIE (兜底, _VALID_URL = .*)
-        │     │
-        │     └─► 尝试从网页提取嵌入视频
-        │           ├─► 遍历所有提取器的 extract_from_webpage
-        │           ├─► 遇到 StopExtraction 则独占
-        │           └─► 返回所有找到的嵌入
+        ├─► ie.extract(url)
+        │     ├─► ie.initialize()  (登录、geo bypass等一次性操作)
+        │     └─► ie._real_extract(url)
+        │           │
+        │           ├─► 返回 {'_type':'video', ...}  ──► 最终结果
+        │           │
+        │           └─► 返回 {'_type':'url'/'url_transparent', 'url':..., 'ie_key':?...}
+        │                 │                                    │
+        │                 └─────────────┬────────────────────┘
+        │                               │
+        ▼                               ▼
+  process_ie_result(ie_result)    接力开始！
         │
-        └─► UnsupportedURLIE (报错)
+        ├─► _type == 'url'
+        │     └─► 递归调用 extract_info(url, ie_key=?, extra_info=...)
+        │           └─► 回到顶部，重新匹配提取器
+        │
+        ├─► _type == 'url_transparent'
+        │     ├─► extract_info(..., process=False) 先取原始结果
+        │     ├─► 合并外层页面元数据(title/description等)
+        │     └─► 递归 process_ie_result 继续处理
+        │
+        └─► _type == 'video'
+              └─► process_video_result → 下载/后处理
 ```
 
-### 7.2 关键设计要点
+### 7.2 接力机制与嵌入识别的协作图
 
-1. **顺序决定一切**：提取器列表的顺序是优先级的唯一依据
-2. **懒加载加速启动**：预生成懒加载代理类，避免启动时导入上千个模块
-3. **YouTube 优先**：硬编码的性能优化，体现了对主要使用场景的重视
-4. **灵活的扩展机制**：插件可以添加新提取器或覆盖现有提取器
-5. **通用兜底策略**：GenericIE + 嵌入提取机制确保最大兼容性
-6. **循环防止**：`block_ies` 机制防止提取器之间的无限循环
+```
+GenericIE._real_extract(blog_url)
+  │
+  ├─► HTTP GET blog_url → 获取 HTML
+  │
+  └─► _extract_embeds(url, webpage)
+        │
+        ├─► 遍历 self._ies (按优先级)
+        │     │
+        │     ├─► YoutubeIE.extract_from_webpage(ydl, url, html)
+        │     │     │
+        │     │     ├─► isinstance(_extract_from_webpage, MethodType)?
+        │     │     │     ├─► 否 (默认classmethod) → 直接用类调用，无需实例化
+        │     │     │     └─► 是 (自定义实例方法) → ydl.get_info_extractor() 触发实例化+缓存
+        │     │     │
+        │     │     └─► _extract_embed_urls → YoutubeIE._EMBED_REGEX 扫 HTML
+        │     │           └─► 找到 <iframe src="https://youtube.com/watch?v=xxx">
+        │     │                 └─► yield url_result('https://youtube.com/watch?v=xxx', YoutubeIE)
+        │     │
+        │     ├─► BilibiliIE.extract_from_webpage(...) → 同上，扫 B站嵌入
+        │     │
+        │     └─► 其他提取器...
+        │
+        ├─► 检测 StopExtraction？── 是 ──► 立即返回该提取器的结果（独占）
+        │
+        └─► 收集所有 embeds → 返回 playlist 或单个结果
+              │
+              └─► 每个 embed 都是 {'_type':'url_transparent', 'url':..., 'ie_key':'Youtube'}
+                    │
+                    ▼
+              process_ie_result 接力 → extract_info → YoutubeIE._real_extract(...)
+```
 
-### 7.3 开发者注意事项
+### 7.3 关键设计要点
+
+1. **顺序决定一切**：提取器列表的顺序是优先级的唯一依据。插件前置、YouTube 系列次之、GenericIE 最后兜底。
+
+2. **懒加载加速启动**：预生成懒加载代理类，预存 `_VALID_URL`、`suitable()` 等匹配所需属性/方法。匹配阶段完全不需要导入真实模块，实例化时才触发加载。
+
+3. **匹配与提取分离**：
+   - 匹配阶段（`suitable`）：classmethod，零成本，不实例化，可使用懒加载代理
+   - 提取阶段（`_real_extract`）：实例方法，需要真实实例，触发懒加载和实例缓存
+
+4. **两级缓存设计**：
+   - `_ies`：存储所有提取器（类或实例均可），保持优先级顺序，用于遍历匹配
+   - `_ies_instances`：仅存储已实例化的提取器，避免重复初始化（登录、geo bypass 等）
+
+5. **灵活的接力机制**：
+   - `url` 类型：纯净转发，适用于搜索→视频、短链→真实URL
+   - `url_transparent` 类型：保留外层元数据，适用于嵌入视频场景
+   - 可指定 `ie_key` 跳过重新匹配，直接定位目标提取器
+
+6. **按需实例化**：嵌入识别时，只有重写了 `_extract_from_webpage` 为实例方法的提取器才需要实例化，默认实现（classmethod）零成本扫描。
+
+7. **通用兜底策略**：GenericIE + 嵌入提取机制确保最大兼容性。直链视频直接返回，HTML 页面遍历所有提取器找嵌入。
+
+8. **循环防止**：`block_ies` + `smuggle_url` 机制防止提取器之间的无限递归调用。
+
+9. **独占提取权**：`StopExtraction` 异常允许特定提取器（如 Invidious/PeerTube 实例）声明对网页的独占处理权。
+
+10. **插件覆盖机制**：通过 `__init_subclass__` + `__wrapped__` 实现对现有提取器的热插拔式覆盖。
+
+### 7.4 开发者注意事项
 
 1. 新增提取器时，只需在 `_extractors.py` 中导入即可，无需手动注册
+
 2. 如果提取器需要优先匹配，可以考虑：
    - 放到 youtube 模块中（不推荐，除非确实是 YouTube 相关）
    - 作为插件发布（插件自动前置）
    - 建议用户通过 `--allowed-extractors` 调整顺序
+
 3. 重写 `suitable()` 方法时，确保不依赖其他提取器，否则懒加载会失效
-4. 嵌入提取器如果需要独占处理权，抛出 `StopExtraction` 异常
+
+4. 嵌入提取相关：
+   - 定义 `_EMBED_REGEX` 列表，每个正则必须包含 `(?P<url>...)` 命名组
+   - 如果嵌入识别需要访问 `self._downloader`（实例状态），重写 `_extract_from_webpage` 为实例方法
+   - 如果需要独占处理网页，抛出 `StopExtraction` 异常
+   - 如果提取器需要调用 GenericIE 继续查找，务必加上 `block_ies=[self.ie_key()]` 防循环
+
+5. 返回 `url_result` 时：
+   - 纯转发场景用默认 `_type='url'`
+   - 需要保留当前页面元数据（如 title、description）用 `url_transparent=True`
+   - 明确知道目标提取器时，务必传 `ie` 参数，避免重新遍历匹配的开销
