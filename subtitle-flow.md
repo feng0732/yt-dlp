@@ -73,7 +73,11 @@ def _get_subtitles(self, *args, **kwargs):
 4. 若 URI 指向 `.m3u8`，按 RFC 8216 §3.1 推断 ext 为 `vtt`，并标记 `protocol: 'm3u8_native'`。
 5. 按 `LANGUAGE` 键值存入 `subtitles` 字典。
 
-**DASH MPD 字幕发现**：在 [_parse_mpd_formats_and_subtitles](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2840-L2870) 中，`content_type == 'text'` 的 Representation 被归入 `period['subtitles']`，最终按语言合并。
+**DASH MPD 字幕发现**：在 [_parse_mpd_formats_and_subtitles](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2840-L3210) 中，存在两个 `content_type == 'text'` 分支：
+- **第一个 text 分支（L3035-L3040）**：创建字幕格式对象 `f`，写入 `ext` 字段（通过 `mimetype2ext(mime_type)` 从 MIME 类型映射扩展名），同时设置 `manifest_url`、`filesize` 等属性。**这是扩展名真正写入的分支**。
+- **第二个 text 分支（L3208-L3209）**：将已创建好的字幕格式对象 `f` 追加到 `period_entry['subtitles'][lang or 'und']` 列表中。这是分类归属分支，不写入扩展名。
+
+最终所有 period 的字幕按语言合并。
 
 #### 1.2.3 不关心字幕的便捷方法
 
@@ -176,7 +180,7 @@ def determine_ext(url, default_ext='unknown_video'):
 
 | 格式 | ext 设置方式 | 代码位置 |
 |---|---|---|
-| DASH MPD | `mimetype2ext(mime_type)` 从 MIME 类型映射 | [common.py L2989](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2989) |
+| DASH MPD | 第一个 text 分支中 `mimetype2ext(mime_type)` 从 MIME 类型映射 | [common.py L3035-L3040](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3035-L3040) |
 | ISM | 硬编码 `'ismt'` | [common.py L3304](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3304) |
 | HTML5 `<track>` | 未设置 ext，依赖 YoutubeDL L2908 全局推断 | [common.py L3469-L3471](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3469-L3471) |
 
@@ -321,18 +325,40 @@ info['__files_to_move'][new_file] = replace_extension(
 
 映射表含义：`key` 是临时目录中存在的源文件，`value` 是移动后的目标路径（value 为 `''` 或 `None` 表示默认根据 key 的文件名组合 `finaldir`）。
 
-**② 旧文件回收逻辑**（run_pp L3798-L3818 + L3782）：
+**② 旧文件回收逻辑**（run_pp L3798-L3819 + _delete_downloaded_files L3774-L3783）：
 
 ```python
 files_to_delete, infodict = pp.run(infodict)
-for filename in files_to_delete:
-    if filename in info.get('__files_to_move', {}):  # L3782：从移动映射中删除
-        del info['__files_to_move'][filename]
-if self.params.get('keepvideo', False):              # -k 参数
+if self.params.get('keepvideo', False):
     for f in files_to_delete:
-        infodict['__files_to_move'].setdefault(f, '') # 保留文件 → 也搬去最终目录
+        infodict['__files_to_move'].setdefault(f, '')  # 保留 → 确保在移动映射中
 else:
-    self._delete_downloaded_files(*files_to_delete)   # 正常删除
+    self._delete_downloaded_files(
+        *files_to_delete, info=infodict, ...)
+    # _delete_downloaded_files 内部：
+    #   1. os.remove(filename)  删除磁盘文件
+    #   2. del info['__files_to_move'][filename]  从移动映射中删除
+```
+
+**执行顺序**：先判断 `keepvideo`，然后二选一执行。从 `__files_to_move` 中删除键的操作**只在 `keepvideo=False` 时发生（在 `_delete_downloaded_files` 内部）。
+
+**③ keepvideo 参数下转码前字幕如何进入最终移动结果**：
+
+转码前的字幕文件（如 dfxp、vtt 等）在 `_write_subtitles` 阶段就已经被注册到 `__files_to_move` 中，带有**正确的最终路径**（如 `final/video.en.dfxp`）。`keepvideo` 参数决定了它们的去留：
+
+| keepvideo 值 | 行为 | 转码前字幕的最终命运 |
+|---|---|---|
+| `False`（默认） | 调用 `_delete_downloaded_files`：<br>1. 删除磁盘上的旧文件<br>2. 从 `__files_to_move` 中删除旧文件键 | ❌ 既不保留在映射中，也不保留在磁盘 |
+| `True`（-k 参数） | 对 `files_to_delete` 中每个文件调用 `setdefault(f, '')`：<br>1. 不删除磁盘文件<br>2. 若键已存在（转码前字幕），**保持原有正确最终路径不变<br>3. 若键不存在（中间格式文件），插入新键值为 `''` | ✅ 保留在映射中，原有正确的最终路径保持不变，最终正常移动到最终目录 |
+
+**关键点**：`setdefault(f, '')` 的语义是"如果键不存在才设置值"。对于**转码前字幕**，它们本来就在 `__files_to_move` 中且有正确的最终路径，所以 `setdefault` 什么也不改变——旧文件保留其正确的最终路径。
+
+对于**中间格式文件**（如 dfxp→srt→vtt 流程中的 srt 文件），它们本来不在 `__files_to_move` 中，`setdefault(f, '')` 会将其添加进去，值为空字符串。
+
+MoveFilesAfterDownloadPP 中空值的处理方式（L29-L31）：
+```python
+if not newfile:
+    newfile = make_newfilename(oldfile)  # = os.path.join(finaldir, os.path.basename(oldfile))
 ```
 
 ---
@@ -367,7 +393,13 @@ L996: continue  → 直接跳过 L1000-1010！
 ```
 
 **后续处理**：
-- `sub_filenames = ['tmp/video.en.dfxp']` → run_pp 中**删除 dfxp 文件**，同时**从 __files_to_move 删除 key `tmp/video.en.dfxp`**
+- `sub_filenames = ['tmp/video.en.dfxp']` → 作为 `files_to_delete` 返回给 `run_pp`
+- **默认模式（keepvideo=False）**：
+  - `_delete_downloaded_files` 删除 dfxp 磁盘文件
+  - 同时从 `__files_to_move` 中删除 `tmp/video.en.dfxp` 键
+- **保留模式（keepvideo=True）**：
+  - 不删除 dfxp 文件
+  - `setdefault('tmp/video.en.dfxp', '')` —— 键已存在且有正确最终路径，**保持不变**
 - **srt 文件 `tmp/video.en.srt`**：既不在 `files_to_delete` 中，也不在 `__files_to_move` 中，**最终留在临时目录，不会被移动到最终目录**！
 
 > **代码缺陷**：dfxp→srt 且目标就是 srt 时，srt 文件永远不会被移动到最终目录。如需修复，需在 `continue` 前补充注册 srt 文件到 `__files_to_move`。
@@ -415,11 +447,21 @@ sub_filenames = ['tmp/video.en.dfxp', 'tmp/video.en.srt']
 ```
 
 **后续处理**：
-1. run_pp 处理 `files_to_delete = ['tmp/video.en.dfxp', 'tmp/video.en.srt']`
-2. 从 `__files_to_move` 删除 `tmp/video.en.dfxp`（srt 不在其中，跳过）
-3. 默认模式：**删除 dfxp 和 srt 文件**
-4. 最终 `__files_to_move = {'tmp/video.en.vtt': 'final/video.en.vtt'}`
-5. MoveFilesAfterDownloadPP 正常移动 vtt 到最终目录 ✓
+1. `files_to_delete = ['tmp/video.en.dfxp', 'tmp/video.en.srt']` 返回给 `run_pp`
+2. **默认模式（keepvideo=False）**：
+   - `_delete_downloaded_files` 删除 dfxp 和 srt 磁盘文件
+   - 从 `__files_to_move` 中删除 `tmp/video.en.dfxp`（srt 不在其中，跳过）
+   - 最终 `__files_to_move = {'tmp/video.en.vtt': 'final/video.en.vtt'}`
+3. **保留模式（keepvideo=True）**：
+   - 不删除任何文件
+   - 对 dfxp：`setdefault` 不改变，保留原有正确最终路径 `final/video.en.dfxp`
+   - 对 srt：`setdefault` 新增，值为 `''`（默认路径）
+   - 最终 `__files_to_move = {
+       'tmp/video.en.dfxp': 'final/video.en.dfxp',
+       'tmp/video.en.srt': '',
+       'tmp/video.en.vtt': 'final/video.en.vtt'
+     }`
+4. MoveFilesAfterDownloadPP 移动所有映射中的文件到最终目录 ✓
 
 ---
 
@@ -429,8 +471,13 @@ sub_filenames = ['tmp/video.en.dfxp', 'tmp/video.en.srt']
 - old_file 加入 `sub_filenames` 待删除
 - ffmpeg 转换生成 new_file
 - L1009-L1010 注册 new_file 到移动映射
-- run_pp 删除 old_file 并从映射移除
-- new_file 正常移动
+- **默认模式（keepvideo=False）**：
+  - `_delete_downloaded_files` 删除 old_file，并从映射移除
+  - new_file 正常移动
+- **保留模式（keepvideo=True）**：
+  - 不删除 old_file
+  - `setdefault` 不改变 old_file 的原有正确最终路径
+  - new_file 和 old_file 都会被移动到最终目录
 
 ---
 
@@ -519,7 +566,7 @@ def run(self, info):
 | 场景 | 处理方式 | 代码位置 |
 |---|---|---|
 | 只 `--write-subs` | 字幕文件正常 `files_to_move`，被 MoveFilesAfterDownloadPP 搬到 finaldir | [YoutubeDL L3386-3389](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3386-L3389) |
-| `--write-subs --convert-subs FORMAT`（普通格式/dfxp 转非 srt） | 转码后新格式字幕替换旧文件映射注册，旧格式被 run_pp 删除（带 `-k` 则保留并一起搬） | [ffmpeg.py L1009-1010](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) + [YoutubeDL L3798-L3818](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3818) |
+| `--write-subs --convert-subs FORMAT`（普通格式/dfxp 转非 srt） | 转码后新格式字幕替换旧文件映射注册，旧格式被 run_pp 删除（带 `-k` 则保留并一起搬，旧文件保留原正确最终路径） | [ffmpeg.py L1009-1010](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) + [YoutubeDL L3798-L3819](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3819) |
 | `--write-subs --convert-subs srt`（dfxp→srt 终点）⚠️ **设计缺陷** | dfxp 原文件被删除，srt 文件未注册到 `__files_to_move`，**不会被移动到最终目录，留在临时目录** | [ffmpeg.py L995-L996](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L995-L996) `continue` 跳过注册 |
 | `--embed-subs` 且未保留 | 字幕嵌入后被 FFmpegEmbedSubtitlePP 列为 files_to_delete，由 run_pp 删除，因此不会出现在最终目录 | [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
 | `--embed-subs --write-subs` | 嵌入时 `already_have_subtitle=True`，因此不在 files_to_delete 中，继续留在 files_to_move 随视频一起搬移 | [__init__.py L674-679](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L674-L679) + [ffmpeg.py L658](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L658) |
@@ -648,7 +695,8 @@ ffmpeg -i video.mp4 -i sub1.vtt -i sub2.srt \
 | M3U8 字幕解析（含 determine_ext 调用） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2284-L2311) | L2284-2311 |
 | SMIL textstream 字幕解析（含 determine_ext 调用） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2730-L2742) | L2730-L2742 |
 | DASH MPD 字幕解析 | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3202-L3209) | L3202-L3209 |
-| DASH 字幕 ext 设置（mimetype2ext，不用 determine_ext） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2989) | L2989 |
+| DASH 字幕 ext 设置（第一个 text 分支，mimetype2ext） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3035-L3040) | L3035-L3040 |
+| DASH content_type 判断辅助（mimetype2ext 检查） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L2989-L2990) | L2989-L2990 |
 | ISM 字幕 ext 硬编码（不用 determine_ext） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3304) | L3304 |
 | HTML5 track 字幕解析（未设置 ext，依赖全局推断） | [common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/extractor/common.py#L3461-L3471) | L3461-L3471 |
 | determine_ext 推断扩展名 | [_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/utils/_utils.py#L1310-L1320) | L1310-1320 |
@@ -662,8 +710,9 @@ ffmpeg -i video.mp4 -i sub1.vtt -i sub2.srt \
 | dfxp→srt 终点跳过注册（设计缺陷） | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L995-L996) | L995-L996 |
 | 转码字幕注册到__files_to_move | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L1009-L1010) | L1009-1010 |
 | FFmpegEmbedSubtitlePP | [ffmpeg.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L581-L659) | L581-L659 |
-| run_pp: 从__files_to_move删除待删除文件键 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3782-L3785) | L3782-L3785 |
-| run_pp: files_to_delete 删除/保留逻辑 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3818) | L3798-L3818 |
+| _delete_downloaded_files（删除文件+从映射移除） | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3774-L3783) | L3774-L3783 |
+| run_pp: files_to_delete 删除/保留逻辑（keepvideo） | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3798-L3819) | L3798-L3819 |
+| MoveFilesAfterDownloadPP 空值默认路径处理 | [movefilesafterdownload.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py#L28-L31) | L28-L31 |
 | pre_process / post_process 生命周期 | [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/YoutubeDL.py#L3828-L3846) | L3828-3846 |
 | MoveFilesAfterDownloadPP | [movefilesafterdownload.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/postprocessor/movefilesafterdownload.py#L11-L53) | L11-53 |
 | 后处理器注册 | [__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/91-yt-dlp/yt_dlp/__init__.py#L644-L679) | L644-679 |
