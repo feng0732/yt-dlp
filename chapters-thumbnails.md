@@ -57,7 +57,7 @@ def _sanitize_thumbnails(self, info_dict):
 
 ### 2.2 章节元数据收集
 
-**入口：** InfoExtractor 提取 → `process_video_result` 修正 → 后处理器 `_fixup_chapters` 补全 → **SponsorBlockPP after_filter 阶段注入**
+**正确的时间顺序：** InfoExtractor 提取 → `process_video_result` 首尾补全 → **SponsorBlockPP after_filter 阶段注入** → 实际下载 → **post_process 阶段各 PP 独立调用 `_fixup_chapters`**
 
 #### 章节数据结构：
 ```python
@@ -71,18 +71,20 @@ chapters = [
 ]
 ```
 
-#### 收集与修正流程：
+#### 收集与修正流程（按真实执行先后）：
 
-1. **Extractor 返回**：各站点提取器返回 `chapters` 列表
-2. **自动补全首尾** — `yt_dlp/YoutubeDL.py#L2868-L2874`：
+1. **Extractor 返回**（下载前）：各站点提取器返回 `chapters` 列表
+2. **自动补全首尾 & 中间间隙** — `yt_dlp/YoutubeDL.py#L2868-L2880`（下载前，`process_video_result` 开头）：
    - 若第一章无 `start_time=0`，自动插入起始章节
-   - 遍历检查 `start_time`/`end_time` 连续性
-3. **SponsorBlock 分段注入（after_filter 阶段）**：
-   - 由 `SponsorBlockPP` 在 **after_filter** 阶段调用 SponsorBlock API
-   - 结果存于独立字段 `info['sponsorblock_chapters']`（**不直接写入 chapters**）
+   - 遍历三元组 `(prev, current, next_)` 补全缺失的 `start_time/end_time/title`
+   - **此时 `info['chapters']` 已就绪（原站章节，尚未介入 SponsorBlock）**
+3. **SponsorBlock 分段注入（after_filter 阶段）** — `yt_dlp/YoutubeDL.py#L3040`（下载前，格式选择之前）：
+   - `SponsorBlockPP` 调用 SponsorBlock API
+   - 结果存于 **独立字段** `info['sponsorblock_chapters']`（**不修改 `chapters`**）
    - 源码：`yt_dlp/postprocessor/sponsorblock.py#L39-L47`
-4. **后处理阶段补全** — `_fixup_chapters()`：`yt_dlp/postprocessor/ffmpeg.py#L298-L301`
-   - 若最后一章缺失 `end_time`，通过 ffprobe 读取实际视频时长填充
+4. **后处理阶段按需补全 `end_time`** — `_fixup_chapters()`：`yt_dlp/postprocessor/ffmpeg.py#L298-L301`（下载后，3 个 PP 各自独立调用）
+   - 若最后一章缺 `end_time`，用 ffprobe 读视频实际时长填充
+   - 调用位置：`ModifyChaptersPP.run()` 首行 L26 / `FFmpegMetadataPP.run()` L679 / `FFmpegSplitChaptersPP.run()` L1044
 
 ---
 
@@ -220,7 +222,8 @@ def get_postprocessors(opts):
         if not opts.writethumbnail:
             opts.writethumbnail = True
 
-    # 6. 按章节分割视频（最后：因会产生多个输出文件，后续 PP 无法再处理）
+    # 6. 按章节分割视频（章节相关 PP 中最后；
+    #    XAttrMetadataPP 和 ExecPP 仍在其后，两者不改媒体内容，作用于原始文件路径）
     if opts.split_chapters:
         yield {'key': 'FFmpegSplitChapters', 'force_keyframes': ...}
 ```
@@ -339,12 +342,15 @@ process_video_result()
              └─ post_process()
                   ├─ run_all_pps('post_process')
                   │   ├─ __postprocessors（MergerPP, Fixup*PP 等）
-                  │   ├─ ModifyChaptersPP          ← 先切割视频
-                  │   ├─ FFmpegMetadataPP          ← 再嵌入章节+元数据
+                  │   ├─ ModifyChaptersPP          ← 先切割视频（两字段尚未合并 → 首行先补全 → 再合并+重排）
+                  │   ├─ FFmpegMetadataPP          ← 再嵌入章节+元数据（首行补全已合并chapters）
                   │   ├─ EmbedThumbnailPP          ← 再嵌入缩略图
-                  │   └─ FFmpegSplitChaptersPP     ← 最后按章节分割（多文件输出）
+                  │   ├─ FFmpegSplitChaptersPP     ← 章节相关 PP 最后一个（首行补全）
+                  │   ├─ XAttrMetadataPP           ← ★ 仍在 post_process 中，作用于原始文件
+                  │   └─ ExecPP(when=post_process) ← ★ 若用户指定，在 post_process 末尾
                   ├─ MoveFilesAfterDownloadPP
                   └─ run_all_pps('after_move')
+                       └─ ExecPP(when=after_move)  ← 默认阶段（--exec 无 WHEN 前缀时在此）
 
 所有视频下载完成后：
     └─ run_all_pps('after_video', info)  # when='after_video'
@@ -407,17 +413,26 @@ POSTPROCESS_WHEN = ('pre_process', 'after_filter', 'video', 'before_dl',
 ④ post_process() — 下载后章节修改（读+写 chapters 和 sponsorblock_chapters）
    │
    │  ModifyChaptersPP.run() — yt_dlp/postprocessor/modify_chapters.py#L25-L75
-   │  ├─ _fixup_chapters(info)       ← 第1次调用：补全 end_time（基于 ffprobe）
-   │  ├─ 读取 info['chapters'] + info['sponsorblock_chapters']
-   │  ├─ 合并两段数据 → 重写 info['chapters'] 和 info['duration']
+   │  ├─ L26  _fixup_chapters(info)              ← 第1次调用：最先执行，此时两字段完全独立，
+   │  │                                            sponsorblock_chapters 尚未合并进 chapters
+   │  ├─ L28  _mark_chapters_to_remove(
+   │  │         deepcopy(info['chapters']),        ← 分别深拷贝两独立列表
+   │  │         deepcopy(info['sponsorblock_chapters']))
+   │  │         · 正则匹配标记 chapters 中的 remove
+   │  │         · 分类匹配标记 sponsor_chapters 中的 remove
+   │  │         · 手动时间段追加到 sponsor_chapters 末尾
+   │  ├─ L38  _remove_marked_arrange_sponsors(chapters + sponsor_chapters)
+   │  │     ← ★ 此处才把两段数据合并（+ 拼接），进行重叠处理与时间轴重排
+   │  ├─ 重写 info['chapters'] 和 info['duration'] ← 合并结果写回 chapters，sponsorblock_chapters 字段仍保留
    │  └─ 实际用 ffmpeg 切割视频文件
    │
    │  FFmpegMetadataPP.run() — yt_dlp/postprocessor/ffmpeg.py#L678-L709
-   │  ├─ _fixup_chapters(info)       ← 第2次调用：再次补全（ModifyChapters 已更新 chapters）
+   │  ├─ L679 _fixup_chapters(info)              ← 第2次调用：此时 chapters 已是 ModifyChapters 合并后的版本
+   │  │                                            （若用户未配置 ModifyChapters，则 chapters 仍是原站版本）
    │  └─ 将 info['chapters'] 写入 .meta 文件 → ffmpeg 嵌入
    │
    │  FFmpegSplitChaptersPP.run() — yt_dlp/postprocessor/ffmpeg.py#L1043-L1059
-   │  ├─ _fixup_chapters(info)       ← 第3次调用：再次补全
+   │  ├─ L1044 _fixup_chapters(info)             ← 第3次调用：chapters 状态同 FFmpegMetadataPP
    │  └─ 按 info['chapters'] 分割视频 → 产生多个文件
 ```
 
@@ -438,15 +453,17 @@ POSTPROCESS_WHEN = ('pre_process', 'after_filter', 'video', 'before_dl',
 
 ### 5.3 `_fixup_chapters` 的三次调用与语义差异
 
-`_fixup_chapters` 定义于 `yt_dlp/postprocessor/ffmpeg.py#L298-L301`，逻辑统一：若最后一章缺 `end_time`，用 ffprobe 读取视频文件实际时长填充。但在三个 PP 中的调用语义不同：
+`_fixup_chapters` 定义于 `yt_dlp/postprocessor/ffmpeg.py#L298-L301`，逻辑统一：若最后一章缺 `end_time`，用 ffprobe 读取 `info['filepath']` 视频实际时长填充。但在三个 PP 中的调用时机、此时 `chapters` 的状态各不相同：
 
-| 调用位置 | 代码行 | 此时 info['chapters'] 的状态 | 补全的目的 |
-|---------|-------|--------------------------|----------|
-| `ModifyChaptersPP.run()` | `modify_chapters.py#L26` | 可能已被 SponsorBlock 合并、但最后一章 end_time 可能为 None | 确保切割前时间轴完整，否则 `_make_concat_opts` 会算错 inpoint/outpoint |
-| `FFmpegMetadataPP.run()` | `ffmpeg.py#L679` | ModifyChaptersPP 已重写 chapters，但若 ModifyChapters 未执行（用户未配置移除），end_time 仍可能缺失 | 确保写入 .meta 文件的章节范围覆盖完整视频 |
-| `FFmpegSplitChaptersPP.run()` | `ffmpeg.py#L1044` | 同上，或 ModifyChapters 后已补全 | 防御性补全：确保分割时每章有完整时间范围 |
+| 调用位置 | 代码行 | 调用时 info['chapters'] 的真实状态 | 补全的目的 |
+|---------|-------|--------------------------------|----------|
+| `ModifyChaptersPP.run()` 首行 | `modify_chapters.py#L26` | **chapters 与 sponsorblock_chapters 仍为两独立字段，尚未合并**。chapters 为原站章节（经 process_video_result 首尾补全），SponsorBlock 分段仍在另一个字段 | 补全后才能正确算出 `_make_concat_opts` 的 inpoint/outpoint，也为后续合并算法提供完整时间边界 |
+| `FFmpegMetadataPP.run()` 首行 | `ffmpeg.py#L679` | 若 ModifyChaptersPP 已执行 →  chapters 已是 **合并重排后的最终版本**；若未执行（用户未配移除/mark） → chapters 仍为原站章节 | 确保写入 `.meta` 文件的章节时间范围覆盖完整视频，避免最后一章无 end_time 导致 ffmpeg `-map_metadata` 报错 |
+| `FFmpegSplitChaptersPP.run()` 首行 | `ffmpeg.py#L1044` | 同上（取决于 ModifyChaptersPP 是否执行） | 防御性补全：确保分割时每章有完整的 `[start, end]`，避免 `-ss` 和 `-t` 参数异常 |
 
-**为什么需要多次调用**：`_fixup_chapters` 是幂等操作，多次调用无副作用。不同 PP 的执行是条件组合的（用户可能只开 `--embed-chapters` 而不配 `--remove-chapters`），每个 PP 必须独立保证数据的完整性。
+**为什么需要多次调用**：`_fixup_chapters` 是幂等操作，多次调用无副作用。各 PP 的执行是**条件组合**的（用户可能只开 `--embed-chapters` 不配 `--remove-chapters`，或只开 `--split-chapters` 不配前两者），所以每个 PP 必须独立保证自身数据的完整性，不能假设前面的 PP 已做过补全。
+
+**注意补全对象**：`_fixup_chapters` **只操作 `info['chapters']`**，不读不写 `info['sponsorblock_chapters']`。SponsorBlock 分段的 end_time 若缺失，是在 SponsorBlockPP 中通过 API 返回保证的——SponsorBlock API 总会返回精确的 startTime 和 endTime。
 
 ### 5.4 SponsorBlock 分段进入 info_dict 的精确时机
 
@@ -526,8 +543,12 @@ process_video_result() 完整调用链（yt_dlp/YoutubeDL.py）
    切割视频时需同步切割字幕时间轴，字幕必须已在容器内 — `yt_dlp/postprocessor/modify_chapters.py#L112-L123`。
    因此 `FFmpegEmbedSubtitlePP` 的 yield 在 ModifyChaptersPP 之前。
 
-3. **FFmpegSplitChaptersPP 须最后执行**
-   分割会生成多个独立文件，一旦分割，后续 PP 无法再对整部视频操作。故放在 post_process 队列末尾。
+3. **FFmpegSplitChaptersPP 是章节相关 PP 的最后一个，但非 post_process 队列末尾**
+   分割会生成多个独立文件，分割后若再执行章节/元数据修改类 PP 只能作用于原始未分割文件。
+   所以它排在章节相关 PP 的末尾；但 **XAttrMetadataPP 和 ExecPP(when=post_process) 仍在其后 yield**
+   （XAttrMetadataPP 只写扩展属性不修改媒体内容，ExecPP 执行外部命令，两者不重新编码，
+   故即使在分割之后执行仍"有效"——但作用于原始完整文件，而非章节片段）。
+   源码证据：`yt_dlp/__init__.py#L716-L736`，SplitChapters 在 L716-720，XAttr 在 L722-723，Exec 在 L731-736。
 
 4. **EmbedThumbnailPP 与格式的隐式协作**
    当输出格式为 webm 且用户启用了缩略图嵌入时，系统自动降级为 mkv（因为 webm 容器不支持嵌入缩略图）— `yt_dlp/YoutubeDL.py#L3485-L3492`：
@@ -634,13 +655,14 @@ title=Introduction
 
 ```
 run()
- ├─ _fixup_chapters()                           # 补全章节 end_time
- ├─ _mark_chapters_to_remove(chapters,          # 按正则标记普通章节
- │                           sponsor_chapters)  # 按 category 标记 SponsorBlock 分段
+ ├─ L26 _fixup_chapters()                        # 补全 chapters end_time（两字段尚未合并！）
+ ├─ L28 _mark_chapters_to_remove(
+ │         deepcopy(chapters),                   # 深拷贝 chapters，按正则标 remove
+ │         deepcopy(sponsor_chapters))           # 深拷贝 sponsorblock_chapters，按分类标 remove
  │     ├─ 同时登记 self._ranges_to_remove（手动时间段）为 remove 条目
  │     └─ ⚠️ remove_sponsor_segments 已排除 NON_SKIPPABLE_CATEGORIES
  │
- ├─ _remove_marked_arrange_sponsors(chapters + sponsor_chapters)
+ ├─ L38 _remove_marked_arrange_sponsors(chapters + sponsor_chapters)  ★ 此处才合并
  │    └─ 构建最小堆 heapq（按 start_time 排序）处理 8 种重叠情形：
  │        - (cut, cut) 相邻移除范围合并
  │        - (cut, normal/sponsor) 切割后者的开头
@@ -682,7 +704,7 @@ run()
 | `--embed-thumbnail` | EmbedThumbnailPP（**自动开启 writethumbnail**） | post_process |
 | `--write-thumbnail` | process_info 中 `_write_thumbnails()` | 视频下载前 |
 | `--convert-thumbnails FORMAT` | FFmpegThumbnailsConvertorPP | before_dl |
-| `--split-chapters` | FFmpegSplitChaptersPP | post_process（队列末尾） |
+| `--split-chapters` | FFmpegSplitChaptersPP | post_process（章节相关 PP 中最后；XAttrMetadataPP 和 ExecPP 仍在其后） |
 | `--remove-chapters REGEX\|*xx-yy` | ModifyChaptersPP（正则匹配标题 或 时间段） | post_process |
 | `--download-sections REGEX\|*xx-yy\|*from-url` | `download_range_func` 回调展开为多段下载 | process_video_result 中 |
 | `--sponsorblock-mark CATS` | SponsorBlockPP（获取分段）+ ModifyChaptersPP（合并为章节） | after_filter → post_process |
