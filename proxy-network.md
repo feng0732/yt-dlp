@@ -462,6 +462,286 @@ networking/_helper.py#L190-L199（`yt_dlp/networking/_helper.py:L190-L199`） �
 
 ---
 
+## 五、外部网络请求的代理路径
+
+前面的章节覆盖了 yt-dlp 内置网络栈（Request → RequestDirector → RequestHandler）的代理路径。但项目中有三类组件**绕过内置网络栈**，需要独立的代理传递机制：YouTube PoToken 提供者、外部 JS 运行时（Deno/Bun）、外部下载器（ffmpeg/aria2c 等）。
+
+### 5.1 YouTube PoToken 提供者的代理路径
+
+PoToken 是 YouTube 要求的反机器人令牌。获取过程可能需要外部 HTTP 请求（访问 YouTube 或第三方服务），代理必须传进去。
+
+#### 5.1.1 代理注入入口：`_fetch_po_token`
+
+`yt_dlp/extractor/youtube/_video.py:L2849-L2901` 构造 `PoTokenRequest` 时注入代理：
+
+```python
+def _fetch_po_token(self, client, **kwargs):
+    proxies = self._downloader.proxies.copy()
+    clean_proxies(proxies, headers)
+
+    pot_request = PoTokenRequest(
+        ...
+        request_proxy=(
+            select_proxy('https://www.youtube.com', proxies)
+            or select_proxy(f'https://{innertube_host}', proxies)
+        ),
+        ...
+    )
+```
+
+**关键逻辑**：
+1. 从 `self._downloader.proxies`（即 `YoutubeDL.proxies`）取全局代理 dict
+2. `clean_proxies(proxies, headers)` 清洗（与 `YoutubeDL.urlopen` 中一致）
+3. 用 `select_proxy('https://www.youtube.com', proxies)` 选出 YouTube 主站代理
+4. 若主站没有匹配的代理，fallback 到 innertube host 的代理
+5. **结果是一个字符串（代理 URL）或 None**，存入 `PoTokenRequest.request_proxy`
+
+#### 5.1.2 `PoTokenRequest` 中的代理字段
+
+pot/provider.py#L46-L74（`yt_dlp/extractor/youtube/pot/provider.py:L46-L74`） 的 `PoTokenRequest` dataclass 包含完整的网络参数：
+
+```python
+@dataclasses.dataclass
+class PoTokenRequest:
+    request_proxy: str | None = None
+    request_headers: HTTPHeaderDict = dataclasses.field(default_factory=HTTPHeaderDict)
+    request_timeout: float | None = None
+    request_source_address: str | None = None
+    request_verify_tls: bool = True
+```
+
+注意 `request_proxy` 是**单个字符串**而非 dict，因为它只服务于 YouTube 相关的请求。
+
+#### 5.1.3 Provider 校验代理 scheme
+
+pot/provider.py#L164-L174（`yt_dlp/extractor/youtube/pot/provider.py:L164-L174`） 中，`__validate_external_request_features` 检查 `request_proxy` 的 scheme 是否在该 Provider 声明的 `_SUPPORTED_EXTERNAL_REQUEST_FEATURES` 中：
+
+```python
+if request.request_proxy:
+    scheme = urllib.parse.urlparse(request.request_proxy).scheme
+    if scheme.lower() not in self._supported_proxy_schemes:
+        raise PoTokenProviderRejectedRequest(...)
+```
+
+`_supported_proxy_schemes` 由 `_SUPPORTED_EXTERNAL_REQUEST_FEATURES` 映射而来（pot/provider.py#L149-L162（`yt_dlp/extractor/youtube/pot/provider.py:L149-L162`）），只有声明了 `PROXY_SCHEME_HTTP` 等特性的 Provider 才能使用对应协议的代理。不发起外部请求的 Provider 设 `_SUPPORTED_EXTERNAL_REQUEST_FEATURES = None` 跳过检查。
+
+#### 5.1.4 `_request_webpage` 把代理传回内置网络栈
+
+pot/provider.py#L203-L231（`yt_dlp/extractor/youtube/pot/provider.py:L203-L231`） 是 PoToken Provider 使用内置网络栈的入口：
+
+```python
+def _request_webpage(self, request, pot_request=None, note=None, **kwargs):
+    req = request.copy()
+    if pot_request is not None:
+        req.headers = HTTPHeaderDict(pot_request.request_headers, req.headers)
+        req.proxies = req.proxies or ({'all': pot_request.request_proxy} if pot_request.request_proxy else {})
+        if pot_request.request_cookiejar is not None:
+            req.extensions['cookiejar'] = req.extensions.get('cookiejar', pot_request.request_cookiejar)
+    return self.ie._downloader.urlopen(req)
+```
+
+**代理转换**：`pot_request.request_proxy`（字符串）→ `req.proxies = {'all': URL}`，然后走 `YoutubeDL.urlopen(req)` 的正常流程（`clean_proxies` 会再次清洗，但此时 headers 中已无 `Ytdl-Request-Proxy`，所以不会覆盖）。
+
+如果 Provider 不用内置网络栈而是自建外部连接（如调用外部服务），则需自行处理代理，此时 `_SUPPORTED_EXTERNAL_REQUEST_FEATURES` 的校验就至关重要。
+
+#### 5.1.5 PoToken 代理路径总图
+
+```
+YoutubeDL.proxies {'all': URL_A}
+        │
+        ▼
+_fetch_po_token()
+   ├── proxies = self._downloader.proxies.copy()
+   ├── clean_proxies(proxies, headers)
+   └── request_proxy = select_proxy('https://www.youtube.com', proxies)  → URL_A
+        │
+        ▼
+PoTokenRequest(request_proxy='URL_A')
+        │
+        ├──► __validate_external_request_features()   校验 scheme
+        │
+        ├──► Provider 使用 _request_webpage()        → req.proxies = {'all': 'URL_A'}
+        │         │                                     → YoutubeDL.urlopen(req)
+        │         └──► 内置网络栈走代理 URL_A
+        │
+        └──► Provider 自建外部连接                    → 自行使用 request_proxy
+```
+
+### 5.2 外部 JS 运行时（Deno / Bun）的代理路径
+
+Deno 和 Bun 是 yt-dlp 用来执行 JavaScript 挑战求解器的外部进程。它们需要代理来下载 NPM 包或访问远程脚本。代理通过**进程环境变量**注入。
+
+#### 5.2.1 Deno：`_get_env_options`
+
+deno.py#L89-L99（`yt_dlp/extractor/youtube/jsc/_builtin/deno.py:L89-L99`）：
+
+```python
+def _get_env_options(self) -> dict[str, str]:
+    options = os.environ.copy()
+    request_proxies = self.ie._downloader.proxies.copy()
+    clean_proxies(request_proxies, HTTPHeaderDict())
+    if 'all' in request_proxies and request_proxies['all'] is not None:
+        options['HTTP_PROXY'] = options['HTTPS_PROXY'] = request_proxies['all']
+    for key, env in (('http', 'HTTP_PROXY'), ('https', 'HTTPS_PROXY'), ('no', 'NO_PROXY')):
+        if key in request_proxies and request_proxies[key] is not None:
+            options[env] = request_proxies[key]
+    return options
+```
+
+**转换逻辑**：
+1. `self.ie._downloader.proxies` → 取全局代理 dict（`YoutubeDL.proxies`）
+2. `clean_proxies(request_proxies, HTTPHeaderDict())` → 清洗（header 为空，所以 `Ytdl-Request-Proxy` 不会被提取）
+3. `'all'` key → 同时设 `HTTP_PROXY` + `HTTPS_PROXY`
+4. 按 scheme 分配 → `'http'` → `HTTP_PROXY`、`'https'` → `HTTPS_PROXY`、`'no'` → `NO_PROXY`（可覆盖 `'all'` 的设置）
+5. 环境变量 dict 传给 `Popen(env=...)`，Deno 进程会自动读取
+
+#### 5.2.2 Bun：`_get_env_options` + 代理兼容性检查
+
+bun.py#L91-L114（`yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L91-L114`）：
+
+```python
+def _get_env_options(self) -> dict[str, str]:
+    options = os.environ.copy()
+    request_proxies = self.ie._downloader.proxies.copy()
+    clean_proxies(request_proxies, HTTPHeaderDict())
+    if request_proxies.get('all') is not None:
+        options['HTTP_PROXY'] = options['HTTPS_PROXY'] = request_proxies['all']
+    for key, env in (('http', 'HTTP_PROXY'), ('https', 'HTTPS_PROXY')):
+        val = request_proxies.get(key)
+        if val is not None:
+            options[env] = val
+    if self.ie.get_param('nocheckcertificate'):
+        options['NODE_TLS_REJECT_UNAUTHORIZED'] = '0'
+    options['BUN_RUNTIME_TRANSPILER_CACHE_PATH'] = '0'
+    return options
+```
+
+**与 Deno 的差异**：
+- **没有 `'no'` → `NO_PROXY` 的转换**：Bun 不处理 NO_PROXY
+- **新增 TLS 跳过**：`nocheckcertificate` → `NODE_TLS_REJECT_UNAUTHORIZED=0`
+- **新增缓存禁用**：`BUN_RUNTIME_TRANSPILER_CACHE_PATH=0`
+
+Bun 还有一层额外的代理兼容性检查 `yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L80-L89`：
+
+```python
+SUPPORTED_PROXY_SCHEMES = ['http', 'https']
+
+def _check_env_proxies(self, env):
+    for key in ('HTTP_PROXY', 'HTTPS_PROXY'):
+        proxy = env.get(key)
+        if not proxy:
+            continue
+        scheme = urllib.parse.urlparse(proxy).scheme.lower()
+        if scheme not in self.SUPPORTED_PROXY_SCHEMES:
+            return scheme  # 返回不支持的 scheme
+    return None
+```
+
+如果检测到 SOCKS 等不支持的代理 scheme，Bun 会跳过 NPM 远程下载并给出警告（bun.py#L62-L67（`yt_dlp/extractor/youtube/jsc/_builtin/bun.py:L62-L67`））。这是因为 Bun 的 NPM 包下载器仅支持 HTTP/HTTPS 代理。
+
+#### 5.2.3 JS 运行时代理路径总图
+
+```
+YoutubeDL.proxies {'all': URL_A, 'no': 'localhost'}
+        │
+        ▼
+DenoJCP / BunJCP._get_env_options()
+   ├── proxies = self.ie._downloader.proxies.copy()
+   ├── clean_proxies(proxies, HTTPHeaderDict())
+   │
+   ├── 'all' → HTTP_PROXY=URL_A, HTTPS_PROXY=URL_A
+   ├── 'http' → HTTP_PROXY (可覆盖 'all')
+   ├── 'https' → HTTPS_PROXY (可覆盖 'all')
+   ├── 'no' → NO_PROXY='localhost'  (仅 Deno)
+   │
+   └── Popen(cmd, env={HTTP_PROXY: ..., HTTPS_PROXY: ..., ...})
+         │
+         ▼
+   Deno/Bun 进程继承环境变量
+```
+
+### 5.3 外部下载器的代理路径
+
+外部下载器（ffmpeg、aria2c、curl、wget 等）是独立的系统进程，代理通过**命令行参数**或**环境变量**注入。
+
+#### 5.3.1 curl：`--proxy` 命令行参数
+
+external.py#L215-L249（`yt_dlp/downloader/external.py:L215-L249`） 的 `CurlFD._make_cmd`：
+
+```python
+cmd += self._option('--proxy', 'proxy')
+```
+
+`self._option('--proxy', 'proxy')` 读取 `self.params['proxy']`（即 `YoutubeDL.params['proxy']`，原始 `--proxy` 参数值），如果存在则生成 `['--proxy', '<URL>']`。curl 原生支持 HTTP/HTTPS/SOCKS 代理。
+
+#### 5.3.2 aria2c：`--all-proxy` 命令行参数
+
+external.py#L312-L348（`yt_dlp/downloader/external.py:L312-L348`） 的 `Aria2cFD._make_cmd`：
+
+```python
+cmd += self._option('--all-proxy', 'proxy')
+```
+
+同样读取 `self.params['proxy']`，生成 `['--all-proxy', '<URL>']`。aria2c 的 `--all-proxy` 对所有协议生效。
+
+#### 5.3.3 wget：`--execute http_proxy=...` 命令行参数
+
+external.py#L281-L301（`yt_dlp/downloader/external.py:L281-L301`） 的 `WgetFD._make_cmd`：
+
+```python
+proxy = self.params.get('proxy')
+if proxy:
+    for var in ('http_proxy', 'https_proxy'):
+        cmd += ['--execute', f'{var}={proxy}']
+```
+
+wget 没有统一的 `--proxy` 参数，而是通过 `--execute http_proxy=...` 和 `--execute https_proxy=...` 分别设置。同一代理值同时设给两者。
+
+#### 5.3.4 ffmpeg：环境变量注入
+
+external.py#L411-L428（`yt_dlp/downloader/external.py:L411-L428`） 的 `FFmpegFD._call_downloader`：
+
+```python
+env = None
+proxy = self.params.get('proxy')
+if proxy:
+    if not re.match(r'[\da-zA-Z]+://', proxy):
+        proxy = f'http://{proxy}'
+    if proxy.startswith('socks'):
+        self.report_warning(
+            f'{self.get_basename()} does not support SOCKS proxies. ...')
+    env = os.environ.copy()
+    env['HTTP_PROXY'] = proxy
+    env['http_proxy'] = proxy
+```
+
+ffmpeg 的代理注入方式最特殊：
+1. 从 `self.params.get('proxy')` 取原始 `--proxy` 参数
+2. 补全 scheme（无 scheme 时加 `http://`）
+3. **SOCKS 代理仅给出警告**，不会阻止执行但很可能失败
+4. 通过 `Popen(env=env)` 设置 `HTTP_PROXY` + `http_proxy` 环境变量
+5. 代码注释指出 ffmpeg 已支持 `-http_proxy` 选项，但版本检测尚未实现
+
+#### 5.3.5 HttpieFD / AxelFD：无显式代理注入
+
+- `yt_dlp/downloader/external.py:L351-L369`：`_make_cmd` 中不传任何代理参数
+- `yt_dlp/downloader/external.py:L262-L275`：同上
+
+#### 5.3.6 外部下载器代理来源差异
+
+| 下载器 | 代理来源 | 传递方式 | SOCKS 支持 |
+|-------|---------|---------|-----------|
+| curl | `params['proxy']`（原始值） | `--proxy URL` 命令行参数 | ✅ |
+| aria2c | `params['proxy']`（原始值） | `--all-proxy URL` 命令行参数 | ✅ |
+| wget | `params['proxy']`（原始值） | `--execute http_proxy=URL` 命令行参数 | ❌ |
+| ffmpeg | `params['proxy']`（原始值） | `HTTP_PROXY`/`http_proxy` 环境变量 | ❌（仅警告） |
+| httpie | 无显式注入 | 依赖工具自身行为 / 继承环境 | 取决于工具 |
+| axel | 无显式注入 | 依赖工具自身行为 / 继承环境 | 取决于工具 |
+
+**重要区别**：外部下载器显式注入代理时直接读取 `self.params.get('proxy')`，这是 `--proxy` 的**原始参数值**，**不经过** `YoutubeDL.proxies` 计算属性的 `urllib.request.getproxies()` fallback，也**不经过** `clean_proxies` 的 scheme 补全和兼容替换。如果用户没有设 `--proxy`，yt-dlp 不会主动为外部下载器生成代理参数；不过这些子进程默认继承当前环境，外部工具自身仍可能读取宿主环境里的 `HTTP_PROXY` / `HTTPS_PROXY`。
+
+---
+
 ## 流程总图
 
 ```
@@ -532,4 +812,49 @@ networking/_helper.py#L190-L199（`yt_dlp/networking/_helper.py:L190-L199`） �
   YoutubeDL.urlopen 二次处理
    ├── NoSupportingHandlers → 友好提示（缺依赖等）
    └── SSLError → 建议用 --legacy-server-connect
+
+
+  ═══════════════════════════════════════════
+  ║  以下为绕过内置网络栈的外部代理路径  ║
+  ═══════════════════════════════════════════
+
+  【PoToken 提供者】
+  YoutubeDL.proxies
+        │
+        ▼
+  _fetch_po_token()
+   ├── proxies.copy() + clean_proxies()
+   └── request_proxy = select_proxy('https://www.youtube.com', proxies)
+        │  字符串 URL 或 None
+        ▼
+  PoTokenRequest.request_proxy
+        │
+        ├──► _request_webpage()
+        │      → req.proxies = {'all': URL}
+        │      → YoutubeDL.urlopen(req) → 内置网络栈
+        │
+        └──► Provider 自建外部连接 → 自行消费 request_proxy
+
+  【Deno / Bun JS 运行时】
+  YoutubeDL.proxies
+        │
+        ▼
+  DenoJCP / BunJCP._get_env_options()
+   ├── proxies.copy() + clean_proxies()
+   ├── 'all' → HTTP_PROXY + HTTPS_PROXY
+   ├── 'http'/'https' → HTTP_PROXY/HTTPS_PROXY (覆盖 'all')
+   ├── 'no' → NO_PROXY (仅 Deno)
+   └── Popen(cmd, env={HTTP_PROXY: ..., ...})
+                │
+                ▼
+   外部进程通过环境变量使用代理
+
+  【外部下载器】
+  YoutubeDL.params['proxy']  ← 原始 --proxy 参数，不经 YoutubeDL.proxies
+        │
+        ├─► curl   → --proxy URL
+        ├─► aria2c → --all-proxy URL
+        ├─► wget   → --execute http_proxy=URL --execute https_proxy=URL
+        ├─► ffmpeg → env{HTTP_PROXY=URL, http_proxy=URL}
+        └─► httpie/axel → yt-dlp 无显式代理注入，是否使用代理取决于工具自身与继承环境
 ```
