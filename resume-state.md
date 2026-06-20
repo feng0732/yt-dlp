@@ -644,6 +644,183 @@ is_inconsistent = ctx['fragment_index'] > 0 and resume_len == 0
 
 **设计原则**：当"索引状态"与"实际字节"不一致时，始终以"实际字节"为准。
 
+### 4.7 HLS 初始化片段的跳过边界分析
+
+HLS 规范中 `#EXT-X-MAP` 标签定义了媒体初始化片段（通常是 fMP4 的 init 段）。它的跳过逻辑与普通媒体片段**不一致**，可能导致恢复时重复合并。
+
+#### 4.7.1 初始化片段与普通媒体片段的 frag_index 分配
+
+在 [hls.py L202-L263](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/hls.py#L202-L263) 中，`frag_index` 从 0 开始递增：
+
+| 片段类型 | 代码位置 | frag_index 赋值 | 是否有跳过判断 |
+|---|---|---|---|
+| 初始化片段 (#EXT-X-MAP) | L233-L263 | `frag_index += 1` → 1 | **无** |
+| 普通媒体片段 | L207-L227 | `frag_index += 1` → 2,3,4... | **有**（L213） |
+
+**初始化片段处理代码**（无跳过判断）：
+
+```python
+# hls.py L233-L263
+elif line.startswith('#EXT-X-MAP'):
+    if format_index is not None and discontinuity_count != format_index:
+        continue
+    if frag_index > 0:
+        self.report_error(
+            'Initialization fragment found after media fragments, unable to download')
+        return False
+    frag_index += 1           # frag_index 从 0 → 1
+    ...
+    fragments.append({
+        'frag_index': frag_index,  # = 1
+        'url': frag_url,
+        ...
+    })
+    # ↑ 没有 if frag_index <= ctx['fragment_index']: continue 判断！
+```
+
+**普通媒体片段处理代码**（有跳过判断）：
+
+```python
+# hls.py L207-L214
+if not line.startswith('#'):
+    ...
+    frag_index += 1                 # 从 1 → 2, 2 → 3...
+    if frag_index <= ctx['fragment_index']:
+        continue                    # ← 只有这里有跳过判断
+    fragments.append({
+        'frag_index': frag_index,   # = 2,3,4...
+        ...
+    })
+```
+
+#### 4.7.2 两种场景下的 frag_index 对比
+
+| 片段 | 有 #EXT-X-MAP | 无 #EXT-X-MAP |
+|---|---|---|
+| 初始化片段 | frag_index = 1 | - |
+| 媒体片段 1 | frag_index = 2 | frag_index = 1 |
+| 媒体片段 2 | frag_index = 3 | frag_index = 2 |
+| 媒体片段 3 | frag_index = 4 | frag_index = 3 |
+
+初始化片段的存在会让所有后续媒体片段的 `frag_index` 都 **+1**。
+
+#### 4.7.3 恢复时的跳过行为对比
+
+假设 `.ytdl` 中 `ctx['fragment_index'] = M = 3`（表示片段 1,2,3 已安全合并）：
+
+**场景 A：有 #EXT-X-MAP（frag_index 分配见上表）**
+- 初始化片段 frag_index=1：**无跳过判断** → 加入 fragments 列表
+- 媒体片段 1 frag_index=2：`2 <= 3` → 跳过 ✓
+- 媒体片段 2 frag_index=3：`3 <= 3` → 跳过 ✓
+- 媒体片段 3 frag_index=4：`4 > 3` → 加入
+
+**结果**：初始化片段被**重新加入**，会被重复下载和合并！
+
+**场景 B：无 #EXT-X-MAP**
+- 媒体片段 1 frag_index=1：`1 <= 3` → 跳过 ✓
+- 媒体片段 2 frag_index=2：`2 <= 3` → 跳过 ✓
+- 媒体片段 3 frag_index=3：`3 <= 3` → 跳过 ✓
+- 媒体片段 4 frag_index=4：`4 > 4` → 加入
+
+**结果**：所有已完成片段都正确跳过。
+
+#### 4.7.4 重复合并的完整流程（有缺陷的时序）
+
+恢复时 M=3，`.part` 文件已包含片段 1（初始化）+ 2 + 3 的数据：
+
+```
+恢复启动
+  │
+  ├─ .ytdl 中 M=3，ctx['fragment_index']=3，state['fragment_index']=3
+  │
+  ├─ 构造 fragments 列表
+  │   ├─ 初始化片段 frag_index=1：无跳过判断 → 加入
+  │   ├─ 媒体片段 1 frag_index=2：2 <= 3 → 跳过
+  │   ├─ 媒体片段 2 frag_index=3：3 <= 3 → 跳过
+  │   └─ 媒体片段 3 frag_index=4：4 > 3 → 加入
+  │
+  └─ download_and_append_fragments 处理
+       │
+       ├─ 处理初始化片段（frag_index=1）
+       │   ├─ L443: ctx['fragment_index'] = 1
+       │   ├─ 检测 Frag1 临时文件：已完整 → HttpFD 立即返回成功（不重复下载）
+       │   ├─ progress hook 触发：state.fragment_index = 3+1=4，ctx.fragment_index = 4
+       │   ├─ 合并：_append_fragment
+       │   │   ├─ ctx['dest_stream'].write(init_data)  // ★ 重复写入！open_mode='ab'
+       │   │   ├─ flush()
+       │   │   └─ _write_ytdl_file(ctx) → 写入 M=4  // ★ M 被错误更新！
+       │   └─ 此时 .part = init + 2 + 3 + init（损坏！）
+       │
+       └─ 处理媒体片段 3（frag_index=4）
+           ├─ L443: ctx['fragment_index'] = 4
+           ├─ 下载...
+           ├─ progress hook: state.fragment_index = 4+1=5，ctx.fragment_index = 5
+           ├─ 合并 → _write_ytdl_file → 写入 M=5
+           └─ 此时 M=5，但片段 4 尚未处理（如果再次中断恢复，M=5 会跳过它）
+```
+
+**缺陷 1：重复合并**
+- 初始化片段数据被再次写入 `.part` 文件（`open_mode='ab'`）
+- 对于 fMP4 格式，重复的 init 段会导致文件无法播放
+- 对于 MPEG-TS 格式，可能表现为播放开始处短暂卡顿
+
+**缺陷 2：M 被错误更新**
+- progress hook 自增的是全局 `state.fragment_index`（初始为 M=3）
+- 处理完初始化片段后，M 被更新为 4，但片段 2,3 并没有被重新合并
+- 若再次中断恢复，M=4 会跳过 frag_index<=4 的片段（包括媒体片段 1,2,3），但实际上它们在 `.part` 中是存在的——这次没问题
+- 但 M 实际上表示"最后一个已完成的片段索引"，此时 M=4 与实际合并进度（片段 1,2,3 已完成）**不一致**
+
+#### 4.7.5 DASH 的正确处理对比
+
+DASH 对所有片段（包括初始化片段）使用**统一的跳过判断** [dash.py L78-L82](file:///d:/fz/0601-2/solo-dogfeeding/code/87-yt-dlp/yt_dlp/downloader/dash.py#L78-L82)：
+
+```python
+# dash.py L78-L82
+frag_index = 0
+for i, fragment in enumerate(fragments):
+    frag_index += 1
+    if frag_index <= ctx['fragment_index']:
+        continue   # ← 所有片段统一处理，无例外
+```
+
+DASH 不存在初始化片段跳过判断缺失的问题。
+
+#### 4.7.6 extra_state 防重复机制参考
+
+其他分段下载器（ism.py、mhtml.py）使用 `extra_state` 记录特殊头部是否已写入，避免恢复时重复写入：
+
+```python
+# ism.py L247-L272
+extra_state = ctx.setdefault('extra_state', {
+    'ism_track_written': False,
+})
+...
+if not extra_state['ism_track_written']:
+    write_piff_header(ctx['dest_stream'], info_dict['_download_params'])
+    extra_state['ism_track_written'] = True
+```
+
+`extra_state` 会被持久化到 `.ytdl` 中，恢复后可以正确跳过已写入的特殊头部。但 HLS 中虽然设置了 `extra_state = ctx.setdefault('extra_state', {})`，却**没有用它记录初始化片段是否已写入**。
+
+#### 4.7.7 修复思路（潜在）
+
+为 HLS 初始化片段添加与普通媒体片段相同的跳过判断：
+
+```python
+# hls.py L233-L263（修改后）
+elif line.startswith('#EXT-X-MAP'):
+    if format_index is not None and discontinuity_count != format_index:
+        continue
+    if frag_index > 0:
+        self.report_error(...)
+        return False
+    frag_index += 1
+    if frag_index <= ctx['fragment_index']:  # ← 添加此行
+        continue                              # ← 添加此行
+    ...
+    fragments.append(...)
+```
+
 ---
 
 ## 五、统一入口：FileDownloader.download() 的预检查
