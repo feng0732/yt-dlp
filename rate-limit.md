@@ -378,11 +378,20 @@ elif speed:
 1. 抛出 `ThrottledDownload` → 被识别为 `ReExtractInfo` 类型
 2. YoutubeDL 会重新提取视频信息（重新向 YouTube/其他站点请求获取新的下载 URL）
 3. 用新 URL 重新开始下载 → 但新 URL 的 ratelimit 仍然是 50K，throttledratelimit 仍然是 100K
-4. **3 秒后再次误判**，形成循环：
+4. **3 秒后再次误判**，形成**无限循环**：
    ```
    下载 3s → 误判 ThrottledDownload → 重新提取 URL → 再下载 3s → 再次误判 ...
    ```
-5. 如果重试次数耗尽，最终下载失败
+5. **不受普通下载重试次数控制**（详见代码证据 §3.3），循环会一直持续直到被以下机制之一打断：
+   - 用户主动中断（Ctrl+C → DownloadCancelled 异常）
+   - 提取器报错（ExtractorError，如签名失效、IP 被封）
+   - 进程被杀 / 系统重启
+   - 播放列表场景下 `break_per_url=True` 捕获 DownloadCancelled
+
+> **前提同步**：以上循环成立的前提是 §3.5 的 7 个条件全部满足。特别地：
+> - 前提 2（throttledratelimit 非零）必须成立（用户显式设置了 `--throttled-rate`）
+> - 前提 5（3s 内不回升）必须成立（ratelimit 生效后 speed 永远 < throttledratelimit）
+> - 前提 7（不被其他异常打断）在循环初期成立，但反复重新提取可能触发网站反爬措施，最终被 ExtractorError 打断
 
 #### 为什么 FragmentFD 中每个分片独立受影响
 
@@ -443,7 +452,32 @@ for retry in RetryManager(self.params.get('retries'), self.report_retry):
 - `RetryDownload`、`NextFragment`、`SucceedDownload` 三个异常都是 **HttpFD 内部类**（定义在 [http.py#L66-L74](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L66-L74)），作用域仅限 HttpFD 内部
 - `ThrottledDownload` 是**全局异常类**，不在这三个内部类中
 - 所以 ThrottledDownload 走到裸 except，清理后**重新 raise**，向 HttpFD.real_download() 外部冒泡
-- `RetryManager` 计数不增加，不算做一次"重试"
+- **`RetryManager` 计数不增加，不算做一次"重试"**（`retries` 参数完全不影响后续流程）
+
+**代码证据：RetryManager 的工作原理** [_utils.py#L5242-L5277](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/_utils.py#L5242-L5277)：
+
+```python
+class RetryManager:
+    def __init__(self, _retries, _error_callback, **kwargs):
+        self.retries = _retries or 0  # 从 params['retries'] 来，默认通常为 10
+
+    def _should_retry(self):
+        return self._error is not NO_DEFAULT and self.attempt <= self.retries
+
+    def __iter__(self):
+        while self._should_retry():       # 循环条件依赖 attempt <= retries
+            self.error = NO_DEFAULT
+            self.attempt += 1             # 每次迭代 attempt 自增
+            yield self
+            if self.error:
+                self.error_callback(...)  # 只有设置了 error 才会回调
+```
+
+- 只有当 `except RetryDownload` 时设置 `retry.error = err`，才会消耗一次重试计数
+- `ThrottledDownload` 走到裸 except 直接 `raise`，**不会设置 `retry.error`**
+- 也不会执行 `continue` 进入下一次迭代（`raise` 直接跳出 for 循环）
+- 所以 `attempt` 不自增，`retries` 计数器**完全不被消耗**
+- 异常继续向上冒泡到装饰器，装饰器的 `while True` 是**独立的无限循环**，与 `retries` 参数无任何关联
 
 #### 第 3 层：FileDownloader.download() 不捕获
 
@@ -603,13 +637,14 @@ HttpFD.real_download() 内部
 | **抛出点** | `retry(e)` 函数内 [http.py#L237-L246](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L237-L246) | 节流检测代码块 [http.py#L323](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L323) |
 | **捕获位置** | RetryManager except 内 [http.py#L364](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L364) | 装饰器 @_handle_extraction_exceptions [YoutubeDL.py#L1729](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L1729) |
 | **冒泡层数** | HttpFD 内部就被捕获，不离开 real_download() | 穿越 6 层直到 YoutubeDL 装饰器 |
+| **重试次数控制** | ✅ 受 `params['retries']` 控制（默认 10 次），耗尽后停止 | ❌ **完全不受 `retries` 参数控制**，装饰器 `while True` 无限循环 |
 | **上下文保留** | 完整保留 | **全部丢失** |
 | &nbsp;&nbsp;· resume_len | ✅ 重新从磁盘读取 `.part` 大小 [http.py#L240-L245](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L240-L245) | ❌ 重新提取后从头下载 |
 | &nbsp;&nbsp;· start 时间戳 | ✅ 重置（重建连接） | ❌ 完全重建 |
 | &nbsp;&nbsp;· 下载 URL | ✅ 保持同一个 URL | ❌ 重新提取得到新 URL |
 | &nbsp;&nbsp;· info_dict 内容 | ✅ 完全不变 | ❌ 重新生成，可能不同 |
 | &nbsp;&nbsp;· throttle_start | ❌ 重置（走新的 download() 迭代） | ❌ 重置 |
-| **RetryManager 计数** | ✅ 计一次重试（retry.attempt 不变） | ❌ RetryManager 不计数，算"全新任务" |
+| **RetryManager 计数** | ✅ 计一次重试（`retry.attempt += 1`） | ❌ RetryManager 不计数，不算"重试" |
 | **HTTP 请求代价** | 1 次 HTTP Range 请求（断点续传） | N 次 HTTP 请求（重新提取的全过程 = 网页提取 + 格式选择 + 新的下载连接） |
 | **触发原因** | 5xx 错误、TransportError、连接超时等传输层问题 | 下载速度持续过低（应用层检测） |
 | **目标** | 从断点继续同一下载 | 切换 CDN 节点 / 获取新签名 URL |
@@ -642,7 +677,9 @@ except RetryDownload as err:
                     #    从断点继续下载
 ```
 
-**本质区别：RetryDownload 是"原地重试"，ThrottledDownload 是"推倒重来"。**
+**本质区别：RetryDownload 是"原地重试"（断点续传，受 retries 次数限制），ThrottledDownload 是"推倒重来"（重新提取，无限循环不受 retries 限制）。**
+
+> **前提同步**：只有低限速误判的 7 个前提（§3.5）全部成立时，才会触发这一无限循环。如果前提 2（throttledratelimit 非零）或前提 5（3s 不回升）不成立，就不会进入重新提取路径。
 
 ### 3.5 低限速误判成立的前提条件
 
@@ -745,6 +782,9 @@ elif speed:
 | 6. 循环足够密 | ✅ | ✅ | ✅ |
 | 7. 不被中断 | ✅ 一般情况 | ✅ 一般情况 | ✅ 一般情况 |
 | **误判？** | **否** | **是（必定）** | **是（大概率）** |
+| **是否会重试耗尽？** | — | ❌ **不会，不受 retries 参数控制**，装饰器 `while True` 无限循环 | ❌ 不会，同上 |
+
+> **重要结论**：低限速误判一旦触发（前提 1-7 全部成立），就会进入**不受 retries 参数控制的无限循环**。`params['retries']` 只控制普通下载重试（RetryDownload），对 ThrottledDownload 触发的重新提取路径完全无效。循环只能被 DownloadCancelled（Ctrl+C）、ExtractorError（提取失败）或进程终止打断。
 
 ---
 
@@ -906,9 +946,12 @@ if speed and speed < throttledratelimit:  # speed 为 None 时跳过
 | 6 | 并发分片限速 | [fragment.py#L167-L174](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py#L167-L174) | 总带宽 = ratelimit × N | 中 |
 | 7 | 采样率限制 | [progress.py#L70-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L70-L72) | 只影响展示刷新频率 | 低 |
 | 8 | 外部下载器 | [external.py#L62-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L62-L76) | throttledratelimit 完全失效 | 高 |
-| **9** | **阈值相对大小** | **参数配置层** | **ratelimit < throttledratelimit 必误判** | **最高** |
-| 10 | 1ms 内 speed=None | [common.py#L163](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L163) | 跳过检测，实际延迟触发 | 低 |
-| 11 | sleep 计入 elapsed | 循环时序 | 保证节流检测看到限速后真实速度 | 有利（降低误判） |
+| 9 | 阈值相对大小 | 参数配置层 | `ratelimit < throttledratelimit` 必误判<br>**前置条件**：throttledratelimit 非零、限速生效、3s 不回升 | **最高** |
+| 10 | 重试次数隔离 | 异常分层处理 | 重新提取路径完全不受 `retries` 参数控制<br>RetryManager 只处理 RetryDownload，ThrottledDownload 走装饰器无限循环 | **高** |
+| 11 | 1ms 内 speed=None | [common.py#L163](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L163) | 跳过检测，实际延迟触发 | 低 |
+| 12 | sleep 计入 elapsed | 循环时序 | 保证节流检测看到限速后真实速度 | 有利（降低误判） |
+
+> **误判触发链总结**：控制点 9（阈值相对大小）是触发源，需同时满足 §3.5 的 7 个前提。一旦触发，控制点 10（重试次数隔离）决定了后果——不是重试耗尽，而是无限循环直到被外部机制打断。
 
 ---
 
