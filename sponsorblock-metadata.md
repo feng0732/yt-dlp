@@ -118,6 +118,48 @@ def post_process(self, filename, info, files_to_move=None):
 self._pps = {k: [] for k in POSTPROCESS_WHEN}
 ```
 
+### 2.4 各阶段实际调用顺序
+
+各阶段在 [YoutubeDL.py](yt_dlp/YoutubeDL.py) 中的实际调用时机和顺序：
+
+| 阶段 | 调用位置 | 触发时机 |
+|-----|---------|---------|
+| `pre_process` | [process_video_result](yt_dlp/YoutubeDL.py#L3034-L3034) | 提取器返回 info 后，格式筛选前 |
+| `after_filter` | [process_video_result](yt_dlp/YoutubeDL.py#L3040-L3040) | 格式筛选通过后，格式选择前 |
+| `video` | [process_video_result](yt_dlp/YoutubeDL.py#L3354-L3354) | 格式选择后，文件名准备前 |
+| `before_dl` | [process_video_result](yt_dlp/YoutubeDL.py#L3449-L3449) | 实际下载前 |
+| `post_process` | [post_process](yt_dlp/YoutubeDL.py#L3843-L3843) | 下载完成后 |
+| `after_move` | [post_process](yt_dlp/YoutubeDL.py#L3846-L3846) | 文件移动到最终目录后 |
+| `after_video` | process_video_result | 所有格式处理完成后 |
+| `playlist` | process_ie_result | 播放列表处理完成后 |
+
+**关键调用链（单视频）：**
+
+```
+提取器返回 info_dict
+    ↓
+pre_process(info_dict)   # 阶段 1
+    ↓
+_match_entry() 筛选
+    ↓
+post_extract(info_dict)
+    ↓
+pre_process(info_dict, 'after_filter')   # 阶段 2
+    ↓
+格式选择、文件名准备
+    ↓
+pre_process(info_dict, 'video')   # 阶段 3
+    ↓
+pre_process(info_dict, 'before_dl')   # 阶段 4
+    ↓
+下载视频文件
+    ↓
+post_process(filename, info_dict)
+    ├─ run_all_pps('post_process')   # 阶段 5
+    ├─ run_pp(MoveFilesAfterDownloadPP)
+    └─ run_all_pps('after_move')   # 阶段 6
+```
+
 ---
 
 ## 3. 选项触发链路：从 CLI 到后处理器
@@ -543,7 +585,186 @@ def replacer(self, field, search, replace):
     return f
 ```
 
-### 8.2 执行
+### 8.2 执行阶段与顺序关系
+
+#### 8.2.1 执行阶段配置
+
+MetadataParserPP 的执行阶段由 `--parse-metadata` 和 `--replace-in-metadata` 的 `[WHEN:]` 前缀决定，定义在 [yt_dlp/options.py](yt_dlp/options.py#L1729-L1739)：
+
+```python
+# --parse-metadata [WHEN:]FROM:TO
+# --replace-in-metadata [WHEN:]FIELDS REGEX REPLACE
+**when_prefix('pre_process')**  # 默认阶段为 pre_process
+```
+
+`when_prefix()` 函数（[yt_dlp/options.py](yt_dlp/options.py#L298-L308)）允许用户指定任意 `POSTPROCESS_WHEN` 阶段：
+
+```python
+def when_prefix(default):
+    return {
+        'allowed_keys': '|'.join(map(re.escape, POSTPROCESS_WHEN)),
+        'default_key': default,  # 'pre_process'
+        # ...
+    }
+```
+
+在 [yt_dlp/__init__.py](yt_dlp/__init__.py#L630-L635) 的 `get_postprocessors()` 中，按用户指定的阶段生成：
+
+```python
+for when, actions in opts.parse_metadata.items():
+    yield {
+        'key': 'MetadataParser',
+        'actions': actions,
+        'when': when,  # 用户指定的阶段
+    }
+```
+
+#### 8.2.2 与 SponsorBlockPP 的顺序关系
+
+SponsorBlockPP 固定在 `after_filter` 阶段运行，而 MetadataParserPP 的阶段由用户指定，因此有以下几种情况：
+
+| MetadataParserPP 阶段 | 与 SponsorBlockPP 的顺序 | 说明 |
+|----------------------|------------------------|------|
+| `pre_process`（默认） | **MetadataParserPP 在前** | 先改写元数据，再获取 SponsorBlock 片段 |
+| `after_filter` | **同阶段，MetadataParserPP 在前** | 同阶段按添加顺序，MetadataParserPP 先被 yield |
+| `video` / `before_dl` | **SponsorBlockPP 在前** | 先获取片段，再改写元数据 |
+| `post_process` / `after_move` | **SponsorBlockPP 在前** | 先获取片段，下载后再改写元数据 |
+
+**同阶段顺序原因**：在 `get_postprocessors()` 中，MetadataParserPP（第 630 行）的 yield 位于 SponsorBlockPP（第 636 行）之前，因此同阶段时 MetadataParserPP 先执行。
+
+#### 8.2.3 各阶段效果对比
+
+| 阶段 | 可改写的 info 字段 | 对 SponsorBlock 的影响 |
+|-----|-------------------|----------------------|
+| `pre_process` | `title`, `artist`, `description`, `uploader` 等原始字段 | 改写发生在 SponsorBlockPP **之前**，SponsorBlock API 调用不依赖这些字段 |
+| `after_filter` | 同上 + 筛选后的字段 | 改写后，ModifyChaptersPP 才能看到修改后的值 |
+| `before_dl` | 同上 + 格式选择后的字段 | 改写发生在 SponsorBlockPP **之后**，ModifyChaptersPP 之前 |
+| `post_process` | 同上 + `filepath`, `duration` 等下载后字段 | 改写发生在 ModifyChaptersPP **之后**，FFmpegMetadataPP 之前 |
+
+### 8.3 元数据改写对章节标题的影响
+
+#### 8.3.1 SponsorBlock 章节标题的生成机制
+
+SponsorBlock 章节标题由 ModifyChaptersPP 的 `_remove_tiny_rename_sponsors()` 生成（[yt_dlp/postprocessor/modify_chapters.py](yt_dlp/postprocessor/modify_chapters.py#L294-L304)）：
+
+```python
+cats = c.pop('_categories', None)
+if cats:
+    category, _, _, category_name = min(cats, key=lambda c: c[2] - c[1])
+    c.update({
+        'category': category,
+        'categories': orderedSet(x[0] for x in cats),
+        'name': category_name,
+        'category_names': orderedSet(x[3] for x in cats),
+    })
+    # 使用 sponsorblock_chapter_title 模板生成标题
+    c['title'] = self._downloader.evaluate_outtmpl(
+        self._sponsorblock_chapter_title, c.copy())
+```
+
+默认模板 `DEFAULT_SPONSORBLOCK_CHAPTER_TITLE`（[yt_dlp/postprocessor/modify_chapters.py](yt_dlp/postprocessor/modify_chapters.py#L11-L11)）：
+
+```python
+DEFAULT_SPONSORBLOCK_CHAPTER_TITLE = '[SponsorBlock]: %(category_names)l'
+```
+
+#### 8.3.2 模板可用字段
+
+**SponsorBlock 章节标题模板仅使用章节自身的字段**，不使用 `info` 字典中的通用元数据字段：
+
+| 可用字段 | 来源 | 说明 |
+|---------|------|------|
+| `start_time` | 章节 | 章节起始时间 |
+| `end_time` | 章节 | 章节结束时间 |
+| `category` | 章节 | 主要类别（时长最短的） |
+| `categories` | 章节 | 所有类别列表 |
+| `name` | 章节 | 主要类别名称 |
+| `category_names` | 章节 | 所有类别名称列表 |
+
+**不使用** `info['title']`、`info['artist']`、`info['uploader']` 等通用元数据字段。
+
+#### 8.3.3 结论：改写通用元数据不影响 SponsorBlock 章节标题
+
+因为：
+1. SponsorBlock 章节标题模板只引用章节自身的 `_categories` 数据
+2. 模板求值时传入的是 `c.copy()`（章节对象的拷贝），不是整个 `info` 字典
+3. `category_names` 来自 SponsorBlock API 返回的类别名称，与视频标题无关
+
+**示例**：
+```bash
+# 即使这样改写 title，SponsorBlock 章节标题仍为 "[SponsorBlock]: Sponsor"
+yt-dlp --parse-metadata "title:'%(title)s [无广告]'" \
+       --sponsorblock-mark sponsor \
+       URL
+```
+
+### 8.4 元数据改写对文件元数据的影响
+
+FFmpegMetadataPP 的 `_get_metadata_opts()`（[yt_dlp/postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py#L728-L795)）使用修改后的 `info` 字段生成文件元数据。
+
+#### 8.4.1 字段优先级机制
+
+```python
+def add(meta_list, info_list=None):
+    value = next((
+        info[key] for key in [f'{meta_prefix}_', *variadic(info_list or meta_list)]
+        if info.get(key) is not None), None)
+```
+
+查找顺序（以 `title` 为例）：
+1. `info['meta_title']` — 自定义元数据字段（最高优先级）
+2. `info['title']` — 主字段
+3. `info['track']` — 别名字段
+
+#### 8.4.2 改写不同字段的效果
+
+| 改写目标 | 命令示例 | 对文件元数据的影响 |
+|---------|---------|------------------|
+| **标题** | `--parse-metadata "title:'新标题'"` | 修改文件的 `title` 元数据 |
+| **作者** | `--parse-metadata "artist:'新作者'"` | 修改文件的 `artist` 元数据 |
+| **自定义字段** | `--parse-metadata "meta_comment:'自定义备注'"` | 添加自定义 `comment` 元数据 |
+| **替换标题内容** | `--replace-in-metadata title "原版" "修复版"` | 正则替换后写入 `title` |
+
+#### 8.4.3 自定义元数据字段的处理
+
+通过 `meta_<key>` 或 `meta<i>_<key>` 语法可以添加自定义元数据（[yt_dlp/postprocessor/ffmpeg.py](yt_dlp/postprocessor/ffmpeg.py#L765-L769)）：
+
+```python
+meta_regex = rf'{re.escape(meta_prefix)}(?P<i>\d+)?_(?P<key>.+)'
+for key, value in info.items():
+    mobj = re.fullmatch(meta_regex, key)
+    if value is not None and mobj:
+        # meta_xxx → 全局元数据
+        # meta<i>_xxx → 第 i 个流的元数据
+        metadata[mobj.group('i') or 'common'][mobj.group('key')] = value.replace('\0', '')
+```
+
+**示例**：
+```bash
+# 添加自定义 comment 元数据
+yt-dlp --parse-metadata "meta_comment:'下载自 YouTube'" \
+       --embed-metadata URL
+```
+
+#### 8.4.4 执行顺序对文件元数据的影响
+
+MetadataParserPP 必须在 **`post_process` 阶段或更早** 运行才能影响文件元数据，因为：
+- FFmpegMetadataPP 在 `post_process` 阶段运行
+- 如果 MetadataParserPP 在 `after_move` 阶段运行，FFmpegMetadataPP 已经执行完毕，改写不会写入文件
+
+**正确顺序**（`post_process` 阶段内）：
+```
+post_process 链:
+    ...
+    ModifyChaptersPP → 改写 info['chapters']
+    ...
+    MetadataParserPP → 改写 info['title'], info['artist'] 等
+    ...
+    FFmpegMetadataPP → 使用修改后的 info 写入文件元数据
+    ...
+```
+
+### 8.5 执行
 
 `run()` 方法依次执行所有 action，仅修改 `info` 字典，不触碰文件：
 
@@ -632,51 +853,61 @@ title=[SponsorBlock]: Sponsor
 
 ```
 用户选项: --sponsorblock-mark all --sponsorblock-remove sponsor,intro
+          --parse-metadata "title:'%(title)s [无广告]'"
           |
           v
 validate_options() [yt_dlp/__init__.py]
   ├─ sponsorblock_query = mark | remove
-  └─ addchapters = True (因 sponsorblock_mark 为真且 addchapters is None)
+  ├─ addchapters = True (因 sponsorblock_mark 为真且 addchapters is None)
+  └─ parse_metadata = { 'pre_process': [ (INTERPRET, ...) ] }
           |
           v
 get_postprocessors()
+  ├─ MetadataParserPP (when=pre_process, actions=解析 title)
   ├─ SponsorBlockPP (when=after_filter, categories=all)
   ├─ ModifyChaptersPP (when=post_process, remove_sponsor_segments={sponsor,intro})
   └─ FFmpegMetadataPP (when=post_process, add_chapters=True, add_metadata=False)
           |
           v
-YouTube 提取器 → info dict
+YouTube 提取器 → info dict { title: '原视频标题', artist: '上传者', ... }
+          |
+          v
+pre_process 阶段: MetadataParserPP.run(info)   ← 改写通用元数据
+  └─ info['title'] = '原视频标题 [无广告]'    （不影响 SponsorBlock 章节标题）
+          |
+          v
+_match_entry() 筛选
           |
           v
 after_filter 阶段: SponsorBlockPP.run(info)
   ├─ API: GET /api/skipSegments/{hash_prefix}
   ├─ 过滤 duration_filter()
   ├─ 转换 to_chapter()
-  └─ info['sponsorblock_chapters'] = [...]  ← 数据契约
+  └─ info['sponsorblock_chapters'] = [ { start, end, category, _categories, ... }, ... ]  ← 数据契约
           |
           v
 下载视频文件 → info['filepath']
           |
           v
-post_process 阶段: ModifyChaptersPP.run(info)
+post_process 阶段: ModifyChaptersPP.run(info)   ← 章节标题仅使用 _categories
   ├─ _mark_chapters_to_remove()
   │     ├─ chapters: 按正则打 remove=True
   │     └─ sponsor_chapters: 按类别打 remove=True (sponsor, intro)
   ├─ _remove_marked_arrange_sponsors()
   │     ├─ 最小堆处理 8 种重叠
   │     ├─ 计算 cuts[] 和 new_chapters[]
-  │     └─ info['chapters'] = new_chapters   ← 改写
+  │     └─ info['chapters'] = new_chapters   ← 改写，章节标题由 _categories 生成
   ├─ remove_chapters() 调用 ffmpeg concat 剪切视频
   └─ info['duration'] 更新
           |
           v
 post_process 阶段: FFmpegMetadataPP.run(info)
-  ├─ _get_chapter_opts(info['chapters']) → *.meta
-  ├─ _get_metadata_opts(info) → -metadata 选项 (若 add_metadata=True)
+  ├─ _get_chapter_opts(info['chapters']) → *.meta    ← 使用修改后的章节
+  ├─ _get_metadata_opts(info) → -metadata title='原视频标题 [无广告]', artist='上传者'
   └─ ffmpeg 重混，章节和元数据嵌入文件
           |
           v
-输出文件（章节已嵌入，广告片段已剪切）
+输出文件（章节已嵌入，广告片段已剪切，标题已修改）
 ```
 
 ---
@@ -697,8 +928,16 @@ post_process 阶段: FFmpegMetadataPP.run(info)
 
 7. **仅删除不嵌入**：只使用 `--sponsorblock-remove` 时，视频会被剪切但章节不会嵌入文件；只有 `--sponsorblock-mark` 才会自动触发 `addchapters = True`。
 
-8. **内部字段约定**：
-   - `c['_categories']` — SponsorBlock 章节的原始类别列表（用于合并后追踪）
-   - `c['remove']` — 标记该时间段需要被剪切
-   - `c['cut_idx']` — 指向第一个落在该章节内的 cut 的索引
-   - `c['_was_cut']` — 标记该章节是由切割产生的微小片段
+8. **MetadataParserPP 执行阶段灵活性**：可通过 `[WHEN:]` 前缀指定任意 `POSTPROCESS_WHEN` 阶段，默认 `pre_process`；与 SponsorBlockPP 的顺序取决于阶段配置。
+
+9. **通用元数据与章节标题解耦**：改写 `info['title']`、`info['artist']` 等通用元数据 **不会影响** SponsorBlock 章节标题，因为章节标题模板仅使用章节自身的 `_categories` 数据，求值时传入 `c.copy()` 而非整个 `info` 字典。
+
+10. **文件元数据改写时机**：MetadataParserPP 必须在 `post_process` 阶段或更早运行才能影响文件元数据；`after_move` 阶段运行时 FFmpegMetadataPP 已执行完毕，改写不会写入文件。
+
+11. **字段优先级机制**：FFmpegMetadataPP 采用 `meta_<key>` > 主字段 > 别名字段的三级优先级；自定义元数据通过 `meta_<key>`（全局）或 `meta<i>_<key>`（指定流）语法添加。
+
+12. **内部字段约定**：
+    - `c['_categories']` — SponsorBlock 章节的原始类别列表（用于合并后追踪）
+    - `c['remove']` — 标记该时间段需要被剪切
+    - `c['cut_idx']` — 指向第一个落在该章节内的 cut 的索引
+    - `c['_was_cut']` — 标记该章节是由切割产生的微小片段
