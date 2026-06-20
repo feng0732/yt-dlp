@@ -2,22 +2,71 @@
 
 ## 一、整体架构概览
 
-yt-dlp 的插件系统采用 **命名空间包（Namespace Package） + Meta Path Finder** 的设计模式，核心文件为 `yt_dlp/plugins.py`。系统支持三种插件类型的扩展点：`extractor`（提取器）、`postprocessor`（后处理器），以及 `extractor` 的 override（覆盖）模式。
+yt-dlp 的插件系统采用 **命名空间包（Namespace Package） + Meta Path Finder** 的设计模式，核心文件为 `yt_dlp/plugins.py`。系统支持两种插件类型：`extractor`（提取器）和 `postprocessor`（后处理器），每种类型又分为 **常规插件** 和 **override 插件** 两种形态。
 
 插件加载的三个核心阶段：
 1. **发现路径**：确定从哪些目录搜索插件
 2. **模块载入**：通过自定义的 import hook 加载插件模块
-3. **扩展点接入**：将插件类注册到对应的全局注册表中
+3. **扩展点接入**：常规插件注册到全局注册表，override 插件通过 `__init_subclass__` 直接替换目标类
 
 ---
 
 ## 二、发现路径机制
 
-### 2.1 插件目录来源
+### 2.1 路径层级与仓库相对路径
 
-插件搜索路径由 `plugin_dirs` 全局变量控制，默认值为 `['default']`。路径发现逻辑集中在 [plugins.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/plugins.py) 的 `default_plugin_paths()` 函数（第 81-106 行）。
+插件的目录结构与 Python 命名空间包的模块路径是严格对应的。整体有三层目录结构：
 
-当 `plugin_dirs` 中包含 `'default'` 时，会从以下位置搜索插件：
+```
+plugin_container_dir/           ← plugin_dirs 中的容器目录
+  └── some_plugin/              ← 每个子目录是一个插件包根
+        └── yt_dlp_plugins/     ← 命名空间包顶层
+              ├── extractor/    ← 按插件类型分子目录
+              │     └── foo.py
+              └── postprocessor/
+                    └── bar.py
+```
+
+**模块路径映射关系：**
+
+| 文件系统路径 | Python 模块路径 |
+|-------------|----------------|
+| `yt_dlp_plugins/extractor/foo.py` | `yt_dlp_plugins.extractor.foo` |
+| `yt_dlp_plugins/postprocessor/bar.py` | `yt_dlp_plugins.postprocessor.bar` |
+
+命名空间包的特点是 **不需要 `__init__.py`**，`yt_dlp_plugins` 和 `yt_dlp_plugins.extractor` 都是命名空间包，可以由多个物理目录共同组成。
+
+### 2.2 插件目录来源：plugin_dirs
+
+插件搜索路径由 `plugin_dirs` 全局变量（在 [globals.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/globals.py#L24) 中定义）控制，默认值为 `['default']`。
+
+`plugin_dirs` 存储的是"**插件容器目录**"的列表。每个容器目录下可以有多个插件子目录，每个子目录是一个独立的插件包根。
+
+**处理逻辑在 `PluginFinder.search_locations()` 方法**（[plugins.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/plugins.py#L130-L146) 第 130-146 行）：
+
+```python
+def search_locations(self, fullname):
+    candidate_locations = itertools.chain.from_iterable(
+        default_plugin_paths() if candidate == 'default' else candidate_plugin_paths(candidate)
+        for candidate in plugin_dirs.value
+    )
+    parts = Path(*fullname.split('.'))
+    for path in orderedSet(candidate_locations, lazy=True):
+        candidate = path / parts
+        # ... 检查目录或 zip 文件是否存在
+        yield candidate
+```
+
+**工作流程：**
+1. 遍历 `plugin_dirs.value` 中的每个容器目录
+2. 如果是 `'default'`，调用 `default_plugin_paths()` 获取所有默认的插件包根目录
+3. 如果是自定义目录，调用 `candidate_plugin_paths()` 列出其下所有子目录（即插件包根）
+4. 将模块全名（如 `yt_dlp_plugins.extractor`）转为路径片段
+5. 在每个插件包根目录后拼接路径片段，检查是否存在
+
+### 2.3 默认搜索路径
+
+当 `plugin_dirs` 包含 `'default'` 时，通过 `default_plugin_paths()` 函数（第 81-106 行）从多层位置搜索插件：
 
 ```python
 def default_plugin_paths():
@@ -31,15 +80,17 @@ def default_plugin_paths():
 
 **三层搜索路径：**
 
-| 路径类型 | 搜索位置 | 说明 |
-|---------|---------|------|
-| 配置目录 plugins 文件夹 | `get_user_config_dirs('yt-dlp')` + `get_system_config_dirs('yt-dlp')` 下的 `plugins` 子目录 | 用户级和系统级 yt-dlp 配置目录 |
-| yt-dlp-plugins 文件夹 | 可执行文件所在目录、用户根目录、系统配置目录下的 `yt-dlp-plugins` 子目录 | 兼容旧版插件布局 |
-| PYTHONPATH | `sys.path` 中的所有目录 | 标准 Python 模块搜索路径 |
+| 路径类型 | 容器目录位置 | 说明 |
+|---------|-------------|------|
+| yt-dlp 配置目录下的 plugins | `get_user_config_dirs('yt-dlp')/plugins/*` + `get_system_config_dirs('yt-dlp')/plugins/*` | 用户级和系统级 yt-dlp 配置目录，每个子目录是一个插件包根 |
+| yt-dlp-plugins 文件夹 | `{可执行文件目录}/yt-dlp-plugins/*` + `{用户目录}/yt-dlp-plugins/*` + `{系统配置目录}/yt-dlp-plugins/*` | 兼容旧版插件布局 |
+| PYTHONPATH | `sys.path` 中的所有目录 | 标准 Python 模块搜索路径，**直接作为插件包根**（不遍历子目录） |
 
-### 2.2 自定义插件目录
+> **注意**：前两类路径会遍历容器目录下的所有子目录作为插件包根，而 PYTHONPATH 路径本身就是插件包根（不进入下一层）。
 
-除了 `'default'`，`plugin_dirs` 中可以添加自定义目录。通过 `candidate_plugin_paths()` 函数（第 109-113 行）处理：
+### 2.4 自定义插件目录
+
+除了 `'default'`，`plugin_dirs` 中可以添加自定义容器目录。通过 `candidate_plugin_paths()` 函数（第 109-113 行）处理：
 
 ```python
 def candidate_plugin_paths(candidate):
@@ -49,9 +100,11 @@ def candidate_plugin_paths(candidate):
     yield from candidate_path.iterdir()
 ```
 
-### 2.3 Zip 文件支持
+自定义目录的处理方式与配置目录相同：遍历目录下的所有子目录，每个子目录作为一个插件包根。
 
-插件不仅可以是目录，还支持 `.zip`、`.egg`、`.whl` 格式的压缩包。在 `PluginFinder.search_locations()` 方法（第 130-146 行）中处理：
+### 2.5 Zip 文件支持
+
+插件不仅可以是目录，还支持 `.zip`、`.egg`、`.whl` 格式的压缩包。在 `search_locations()` 中处理（第 142-144 行）：
 
 ```python
 elif path.suffix in ('.zip', '.egg', '.whl') and path.is_file():
@@ -60,25 +113,6 @@ elif path.suffix in ('.zip', '.egg', '.whl') and path.is_file():
 ```
 
 `dirs_in_zip()` 函数（第 68-78 行）使用 `@functools.cache` 缓存 zip 文件内的目录列表，避免重复解析。
-
-### 2.4 路径发现入口：PluginFinder.search_locations
-
-[PluginFinder](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/plugins.py#L116-L165) 类的 `search_locations()` 方法是路径发现的核心：
-
-```python
-def search_locations(self, fullname):
-    candidate_locations = itertools.chain.from_iterable(
-        default_plugin_paths() if candidate == 'default' else candidate_plugin_paths(candidate)
-        for candidate in plugin_dirs.value
-    )
-    parts = Path(*fullname.split('.'))
-    for path in orderedSet(candidate_locations, lazy=True):
-        candidate = path / parts
-        # ... 检查目录或 zip 文件
-        yield candidate
-```
-
-该方法将模块全名（如 `yt_dlp_plugins.extractor`）转换为路径片段，然后在所有候选位置中查找匹配的目录或 zip 内路径。
 
 ---
 
@@ -113,6 +147,7 @@ def find_spec(self, fullname, path=None, target=None):
 
     search_locations = list(map(str, self.search_locations(fullname)))
     if not search_locations:
+        # Prevent using built-in meta finders for searching plugins.
         raise ModuleNotFoundError(fullname)
 
     spec = importlib.machinery.ModuleSpec(fullname, PluginLoader(), is_package=True)
@@ -159,17 +194,21 @@ def load_plugins(plugin_spec: PluginSpec):
             sys.modules[module_name] = module
             spec.loader.exec_module(module)
         except Exception:
-            write_string(f'Error while importing module {module_name!r}\n{traceback.format_exc(limit=-1)}')
+            write_string(
+                f'Error while importing module {module_name!r}\n{traceback.format_exc(limit=-1)}',
+            )
             continue
         regular_classes.update(get_regular_classes(module, module_name, suffix))
 ```
 
 **加载流程：**
 1. 通过 `iter_modules()` 遍历命名空间包下的所有子模块
-2. 跳过以下划线 `_` 开头的模块（私有模块）
+2. 跳过模块名中**任何一段**以下划线 `_` 开头的模块（如 `_ignore.py` 或 `foo._bar`）
 3. 使用 `importlib.util.module_from_spec()` + `spec.loader.exec_module()` 手动加载模块
 4. 将模块加入 `sys.modules` 缓存
-5. 提取模块中符合命名规范的类
+5. 提取模块中符合命名规范的**常规插件类**
+
+> **重要**：`spec.loader.exec_module(module)` 执行时，模块内的所有类定义都会被执行。对于 override 插件类，`__init_subclass__` 钩子会在此时被触发，override 效果在这一步就已经生效了（详见第四章）。
 
 ### 3.5 iter_modules 辅助函数
 
@@ -191,6 +230,8 @@ def iter_modules(subpackage):
 
 ```python
 # Compat: old plugin system using __init__.py
+# Note: plugins imported this way do not show up in directories()
+# nor are considered part of the yt_dlp_plugins namespace package
 if 'default' in plugin_dirs.value:
     with contextlib.suppress(FileNotFoundError):
         spec = importlib.util.spec_from_file_location(
@@ -218,11 +259,11 @@ if 'default' in plugin_dirs.value:
 class PluginSpec:
     module_name: str      # 子包名，如 'extractor', 'postprocessor'
     suffix: str           # 类名后缀，如 'IE', 'PP'
-    destination: Indirect # 主注册表（包含内置 + 插件）
-    plugin_destination: Indirect  # 仅插件的注册表
+    destination: Indirect # 主注册表（包含内置 + 常规插件）
+    plugin_destination: Indirect  # 仅常规插件的注册表
 ```
 
-`Indirect` 类（在 [globals.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/globals.py) 第 10-15 行）是一个简单的间接引用包装器，用于实现全局可变状态：
+`Indirect` 类（在 [globals.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/globals.py#L10-L15) 第 10-15 行）是一个简单的间接引用包装器，用于实现全局可变状态：
 
 ```python
 class Indirect:
@@ -245,12 +286,13 @@ register_plugin_spec(PluginSpec(
 
 postprocessor 的注册类似，在 [postprocessor/__init__.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/postprocessor/__init__.py#L55-L60) 中。
 
-### 4.3 类发现规则
+### 4.3 常规插件：类发现规则
 
-`get_regular_classes()` 函数（第 182-191 行）定义了插件类的发现规则：
+`get_regular_classes()` 函数（第 182-191 行）定义了**常规插件类**的发现规则：
 
 ```python
 def get_regular_classes(module, module_name, suffix):
+    # Find standard public plugin classes (not overrides)
     return inspect.getmembers(module, lambda obj: (
         inspect.isclass(obj)
         and obj.__name__.endswith(suffix)
@@ -261,17 +303,22 @@ def get_regular_classes(module, module_name, suffix):
     ))
 ```
 
-**类必须满足以下条件才会被注册为普通插件：**
-1. 是一个类
-2. 类名以指定后缀结尾（如 `IE` 或 `PP`）
-3. 类定义在当前模块内（不是导入的）
-4. 类名不以 `_` 开头
-5. 如果模块定义了 `__all__`，类名必须在其中
-6. 没有 `PLUGIN_NAME` 属性（即不是 override 插件）
+**类必须同时满足以下条件才会被注册为常规插件：**
 
-### 4.4 注册到全局表
+| 条件 | 说明 |
+|-----|------|
+| 是一个类 | `inspect.isclass(obj)` |
+| 类名以指定后缀结尾 | 如 `IE` 或 `PP` |
+| 类定义在当前模块内 | `obj.__module__.startswith(module_name)`，排除导入的类 |
+| 类名不以 `_` 开头 | 私有类不注册 |
+| 如果模块有 `__all__`，类名必须在其中 | 控制导出接口 |
+| 没有 `PLUGIN_NAME` 属性 | **排除 override 插件** |
 
-加载完成后，在 `load_plugins()` 函数末尾（第 229-232 行）将类注册到全局：
+> **关键理解**：override 插件类有 `PLUGIN_NAME` 属性（由 `__init_subclass__` 设置），因此**不会被 `get_regular_classes()` 收集**，也不会出现在 `plugin_ies` 或 `extractors` 注册表中。
+
+### 4.4 常规插件：注册到全局表
+
+加载完成后，在 `load_plugins()` 函数末尾（第 229-232 行）将常规插件类注册到全局：
 
 ```python
 # Add the classes into the global plugin lookup for that type
@@ -281,15 +328,15 @@ plugin_spec.destination.value = merge_dicts(regular_classes, plugin_spec.destina
 ```
 
 **关键点：**
-- `plugin_destination` 只保存插件类（用于调试、列表展示等）
-- `destination` 保存所有类（内置 + 插件），使用 `merge_dicts` 将插件类**前置**
+- `plugin_destination`（如 `plugin_ies`）只保存**常规插件类**（不包含 override 插件）
+- `destination`（如 `extractors`）保存所有类（内置 + 常规插件），使用 `merge_dicts` 将插件类**前置**
 - 插件类优先级高于内置类（同名时插件覆盖内置）
 
-### 4.5 Override 插件机制
+### 4.5 Override 插件：类替换机制
 
-除了普通插件，系统还支持 **override 插件**，用于增强或修改已有的 extractor 类。这通过 `__init_subclass__` 钩子实现。
+除了常规插件，系统还支持 **override 插件**，用于增强或修改已有的 extractor 类。这通过 `InfoExtractor.__init_subclass__` 钩子实现。
 
-在 [extractor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/extractor/common.py#L4122-L4137) 中：
+**核心代码在 [extractor/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/97-yt-dlp/yt_dlp/extractor/common.py#L4122-L4137) 第 4122-4137 行：**
 
 ```python
 @classmethod
@@ -311,16 +358,20 @@ def __init_subclass__(cls, *, plugin_name=None, **kwargs):
     return super().__init_subclass__(**kwargs)
 ```
 
+**生效时机**：override 插件在 **模块加载阶段**（`spec.loader.exec_module(module)` 执行时）就已生效。当类定义被 Python 解释器执行时，`__init_subclass__` 钩子会自动调用。
+
 **工作原理：**
 1. 定义插件类时，在基类列表中指定 `plugin_name='xxx'` 关键字参数
-2. Python 调用 `__init_subclass__` 钩子
-3. 找到被覆盖的父类（MRO 中的下一个类）
-4. 将原始类替换为插件类（通过修改模块属性）
-5. 保存原始类到 `__wrapped__` 属性（装饰器模式）
-6. 更新 IE_NAME（如 `generic+override`）
-7. 记录到 `plugin_ies_overrides` 全局表中
+2. Python 自动调用 `__init_subclass__` 钩子
+3. 通过 MRO 找到被覆盖的父类（MRO 中当前类的下一个类）
+4. 沿 `__wrapped__` 链找到最原始的被包装类
+5. 去重检查：如果同名插件已注册过则跳过（防止重复包装）
+6. 保存原始类到 `__wrapped__` 属性（装饰器模式）
+7. 设置 `PLUGIN_NAME`、保留 `ie_key`、更新 `IE_NAME`（如 `generic+override`）
+8. **直接替换模块中的原始类**：`setattr(sys.modules[super_class.__module__], super_class.__name__, cls)`
+9. 记录到 `plugin_ies_overrides` 全局表中
 
-**示例**（来自测试用例）：
+**示例**（来自测试用例 `override.py`）：
 
 ```python
 from yt_dlp.extractor.generic import GenericIE
@@ -329,9 +380,26 @@ class OverrideGenericIE(GenericIE, plugin_name='override'):
     TEST_FIELD = 'override'
 ```
 
-这会将 `GenericIE` 替换为 `OverrideGenericIE`，同时保留原始类在 `__wrapped__` 中。
+这会将 `yt_dlp.extractor.generic` 模块中的 `GenericIE` 替换为 `OverrideGenericIE`，同时保留原始类在 `__wrapped__` 中。
 
-### 4.6 批量加载
+**下划线类名的 override 插件**：
+
+`_UnderscoreOverrideGenericIE`（类名以下划线开头）不会被 `get_regular_classes()` 收集为常规插件，但它的 override 效果**仍然生效**。因为类定义本身在模块加载时会执行，`__init_subclass__` 钩子不受类名是否带下划线的影响。
+
+### 4.6 常规插件 vs Override 插件对比
+
+| 维度 | 常规插件 | Override 插件 |
+|-----|---------|--------------|
+| **作用** | 新增提取器/后处理器 | 修改或增强已有的提取器类 |
+| **基类** | `InfoExtractor` / `PostProcessor` | 具体的 extractor 类（如 `GenericIE`） |
+| **标识方式** | 类名后缀（`IE` / `PP`） | `plugin_name='xxx'` 关键字参数 |
+| **生效时机** | 加载后注册到注册表 | 模块加载时通过 `__init_subclass__` 立即生效 |
+| **注册位置** | `plugin_ies` / `plugin_pps` + `extractors` / `postprocessors` | `plugin_ies_overrides` |
+| **是否进入 `get_regular_classes`** | 是 | 否（有 `PLUGIN_NAME` 属性，被排除） |
+| **类名下划线开头的影响** | 不被注册为常规插件 | 不影响 override 效果（类定义仍执行） |
+| **使用方式** | 按 URL 匹配自动调用 | 透明替换原类，调用方无感知 |
+
+### 4.7 批量加载
 
 `load_all_plugins()` 函数（第 237-240 行）用于加载所有已注册类型的插件：
 
@@ -385,7 +453,7 @@ if not all_plugins_loaded.value:
 | 变量 | 作用 |
 |-----|------|
 | `YTDLP_NO_PLUGINS` | 设置后禁用所有插件 |
-| `plugin_dirs` 全局变量 | 控制插件搜索路径，默认 `['default']` |
+| `plugin_dirs` 全局变量 | 控制插件容器目录列表，默认 `['default']` |
 
 ---
 
@@ -393,8 +461,10 @@ if not all_plugins_loaded.value:
 
 yt-dlp 插件系统的设计巧妙地结合了 Python 标准的 import hook 机制和命名空间包概念：
 
-1. **发现路径**：多层级搜索（配置目录 + 可执行文件目录 + PYTHONPATH），支持 zip 包
+1. **发现路径**：多层级搜索（配置目录 + 可执行文件目录 + PYTHONPATH），支持 zip 包，通过 `plugin_dirs` 控制容器目录
 2. **模块载入**：通过自定义 `MetaPathFinder` 创建虚拟命名空间包，让标准 import 机制处理子模块加载
-3. **扩展点接入**：通过 `PluginSpec` 注册扩展点，按命名约定自动发现插件类，并支持 override 模式增强现有类
+3. **扩展点接入**：
+   - **常规插件**：按命名约定自动发现，注册到全局注册表，优先级高于内置
+   - **Override 插件**：通过 `__init_subclass__` 钩子在模块加载时直接替换目标类，采用装饰器模式支持多层包装
 
 这种设计既保持了 Pythonic 的导入方式，又提供了灵活的插件扩展能力，同时通过全局注册表实现了插件与核心代码的解耦。
