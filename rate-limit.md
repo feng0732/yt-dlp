@@ -2,71 +2,566 @@
 
 ## 概述
 
-yt-dlp 的下载限速机制控制点分布在多个模块中，三个核心机制紧密协作：
+yt-dlp 的下载限速控制点分散在多个模块中，核心是两个阈值和一套反馈系统的协作：
 
-1. **全局限速（ratelimit）**：通过 sleep 控制单连接下载速度
-2. **单任务节流检测（throttledratelimit）**：检测服务器端限流，触发重定向
-3. **进度反馈系统**：计算速度/ETA，为前两者提供数据支撑，同时向用户展示进度
+1. **ratelimit（上限阈值）**：主动限速，通过 sleep 控制单连接不超过该速度
+2. **throttledratelimit（下限阈值）**：被动检测，速度持续低于该值视为被服务器限流
+3. **进度反馈系统**：计算并展示速度/ETA
 
-本文详细梳理三者的关联、具体实现及可能的误判控制点。
+**关键原则**：进度反馈系统（ProgressCalculator、report_progress）**只负责展示**，真正参与控制决策（限速和节流检测）的速度值全部在下载循环内部即时计算，不依赖展示层的数据。
 
 ---
 
-## 一、限速、节流与进度的关联全景
+## 一、两个阈值的语义与代码定位
 
-### 1.1 核心协作链路
+### 1.1 语义对照表
+
+| 参数 | 语义 | 方向 | 触发动作 |
+|------|------|------|----------|
+| `ratelimit` | 最大允许速度（**上限**） | `speed > ratelimit` → sleep | 主动减速，保护带宽 |
+| `throttledratelimit` | 判定限流的最小速度（**下限**） | `speed < throttledratelimit` 持续 3s → 重定向 | 被动检测，切换 CDN |
+
+### 1.2 代码定位
+
+**ratelimit 参数定义：**
+- CLI：[options.py#L1016-L1018](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/options.py#L1016-L1018) → `-r` / `--limit-rate`
+- 文档：[common.py#L51](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L51)
+- 实现：[common.py#L201-L215](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L201-L215) → `slow_down()`
+- 调用：[http.py#L281](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L281)
+
+**throttledratelimit 参数定义：**
+- CLI：[options.py#L1020-L1022](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/options.py#L1020-L1022) → `--throttled-rate`
+- 文档：[common.py#L52](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L52)
+- 异常：[_utils.py#L1130-L1135](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/_utils.py#L1130-L1135) → `ThrottledDownload`
+- 检测：[http.py#L315-L325](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L315-L325)
+
+---
+
+## 二、控制决策用的速度值 vs 展示用的速度值
+
+### 2.1 核心结论：完全分离的两套速度计算
+
+这是理解整个系统最关键的一点：
+
+```
+下载循环内部（控制决策层）          进度反馈系统（展示层）
+═══════════════════════════        ════════════════════════
+                                        ┌──────────────────┐
+┌──────────────────────────┐            │ FragmentFD 专用:  │
+│  1. slow_down() 内部:    │            │ ProgressCalculator│
+│     speed_local = bytes /│            │   (滑动窗口 3s)   │
+│     elapsed              │            │   + SmoothValue   │
+│     ↓                    │            │   (指数平滑)      │
+│  是否需要 sleep?         │            └────────┬─────────┘
+└──────────────────────────┘                     │
+                        │                        │
+┌──────────────────────────┐                     ▼
+│  2. calc_speed()         │            _hook_progress()
+│     speed_ctrl = bytes /│             │
+│     elapsed              │             ├─→ report_progress() 格式化显示
+│     ↓                    │             │     (纯展示，无决策)
+│  传给 throttledratelimit │             │
+│  检测 + _hook_progress   │             └─→ 用户自定义 progress hooks
+└──────────────────────────┘                    (观察者模式)
+```
+
+### 2.2 控制决策层：三处速度计算
+
+下载循环位置：[http.py#L248-L326](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L248-L326)
+
+**控制决策使用的 3 个速度值：**
+
+#### （1）slow_down 内部计算 — 用于限速决策
+
+位置：[common.py#L201-L215](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L201-L215)
+
+```python
+def slow_down(self, start_time, now, byte_counter):
+    rate_limit = self.params.get('ratelimit')
+    if rate_limit is None or byte_counter == 0:
+        return
+    if now is None:
+        now = time.time()          # now=None 时自己取时间
+    elapsed = now - start_time
+    if elapsed <= 0.0:
+        return
+    speed = float(byte_counter) / elapsed   # ← 第 1 套独立计算
+    if speed > rate_limit:
+        sleep_time = float(byte_counter) / rate_limit - elapsed
+        if sleep_time > 0:
+            time.sleep(sleep_time)
+```
+
+**关键特征：**
+- **独立计算**，不依赖任何外部变量
+- 输入参数和 `calc_speed()` 相同，但实现位置不同
+- **第一次循环**时 `now=None`，内部会自己调用 `time.time()`
+
+#### （2）calc_speed() 返回值 — 用于节流检测和展示
+
+位置：[common.py#L160-L165](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L160-L165)
+
+```python
+@staticmethod
+def calc_speed(start, now, bytes):
+    dif = now - start
+    if bytes == 0 or dif < 0.001:
+        return None
+    return float(bytes) / dif
+```
+
+调用位置：[http.py#L294](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L294)
+```python
+speed = self.calc_speed(start, now, byte_counter - ctx.resume_len)
+```
+
+**这个 `speed` 变量被两处使用：**
+1. **节流检测（控制决策）**：[http.py#L315](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L315) → `if speed and speed < throttledratelimit`
+2. **进度钩子（展示）**：[http.py#L307](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L307) → 放入 `_hook_progress` 的 status 字典
+
+#### （3）best_block_size 内部计算 — 用于调整读取块大小
+
+位置：[common.py#L181-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L181-L192)
+
+```python
+@staticmethod
+def best_block_size(elapsed_time, bytes):
+    # ...
+    rate = bytes / elapsed_time   # ← 第 3 套独立计算
+    # 用 rate 决定下一次 read 的块大小
+```
+
+**这个 `rate` 只用于动态调整块大小，不参与限速或节流决策。**
+
+### 2.3 展示层：纯观察者模式
+
+#### report_progress() — 只格式化，不做决策
+
+位置：[common.py#L342-L404](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L342-L404)
+
+```python
+def report_progress(self, s):
+    # finished 状态时，重新计算一个速度用于展示
+    if s['status'] == 'finished':
+        speed = try_call(lambda: s['total_bytes'] / s['elapsed'])  # ← 仅展示
+        s.update({
+            'speed': speed,
+            '_speed_str': self.format_speed(speed).strip(),
+            ...
+        })
+        self._report_progress_status(s, ...)   # 格式化+打印
+
+    if s['status'] != 'downloading':
+        return
+
+    # progress_delta 只限制输出频率，不影响速度计算
+    if update_delta := self.params.get('progress_delta'):
+        with self._progress_delta_lock:
+            if time.monotonic() < self._progress_delta_time:
+                return              # 跳过多余的展示
+            self._progress_delta_time += update_delta
+
+    # 格式化 percent、speed_str、eta_str → 纯字符串操作
+    s.update({
+        '_eta_str': self.format_eta(s.get('eta')).strip(),
+        '_speed_str': self.format_speed(s.get('speed')),
+        '_percent_str': self.format_percent(progress),
+        ...
+    })
+    self._report_progress_status(s, msg_template)  # 最终输出
+```
+
+**关键证据：report_progress 中所有计算只修改 `s['_xxx_str']` 等格式化字段，从不反向影响循环内的控制变量。**
+
+#### 进度钩子链路
+
+位置：[YoutubeDL.py#L3304-L3318](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py#L3304-L3318)
+
+```python
+fd = get_suitable_downloader(info, params, ...)(self, params)
+if not test:
+    for ph in self._progress_hooks:     # 用户通过 API 注册的钩子
+        fd.add_progress_hook(ph)
+
+# FileDownloader.__init__ 中自带的钩子：
+self.add_progress_hook(self.report_progress)  # 内置，第 1 个调用
+```
+
+钩子调用位置：[common.py#L488-L500](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L488-L500)
+```python
+def _hook_progress(self, status, info_dict):
+    status['info_dict'] = info_dict
+    for ph in self._progress_hooks:
+        ph(status)              # 按注册顺序依次调用
+```
+
+**结论：所有 progress hooks 都是观察者，无法修改循环内的 `speed`、`byte_counter` 等变量，只能读取 status 字典。**
+
+### 2.4 FragmentFD 特殊情况：两套速度并行
+
+在分片下载场景中，控制决策和展示使用的速度来源**完全不同**：
+
+```
+每个分片内部 (HttpQuietDownloader = HttpFD)
+═══════════════════════════════════════════
+  子下载循环中的 calc_speed() 结果
+    ├──→ 子下载器的 throttledratelimit 检测  ← 控制决策（每个分片独立）
+    ├──→ 子下载器的 slow_down() 限速         ← 控制决策（每个分片独立）
+    └──→ frag_progress_hook() 接收
+              │
+              ▼
+FragmentFD 聚合层 (展示专用)
+═════════════════════════════
+  ProgressCalculator.update(子下载器的 downloaded_bytes)
+    │
+    ├─→ 3s 滑动窗口计算速度
+    ├─→ SmoothValue 指数平滑
+    │
+    └─→ state['speed'] = progress.speed.smooth   ← 仅展示，不参与控制
+        state['eta'] = progress.eta.smooth       ← 仅展示，不参与控制
+        │
+        └─→ self._hook_progress(state, ...)
+              ├─→ report_progress() 显示         ← 仅展示
+              └─→ 用户自定义钩子                  ← 仅观察
+```
+
+**代码证据：FragmentFD 中没有 throttledratelimit 检测逻辑**
+
+在 [downloader/fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py) 中搜索 `throttledratelimit` 或 `ThrottledDownload`，结果为 **0 匹配**。这证明：
+
+- 节流检测完全发生在子下载器（HttpQuietDownloader）内部
+- FragmentFD 层的 ProgressCalculator 计算出来的平滑速度**不参与任何控制决策**
+- 分片下载的限速也完全在子下载器内部独立执行
+
+### 2.5 速度值分类总表
+
+| 速度值 | 计算位置 | 算法 | 用途 | 是否参与控制决策 |
+|--------|----------|------|------|------------------|
+| slow_down 内部 speed | [common.py#L211](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L211) | 本次连接全程平均 | 限速 sleep | **是** |
+| calc_speed() 返回值 | [common.py#L165](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L165) | 本次连接全程平均 | 节流检测 + 展示 | **是（仅HttpFD）** |
+| best_block_size 内部 rate | [common.py#L187](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L187) | 单次 read 平均 | 调整块大小 | 间接影响 |
+| ProgressCalculator.speed.value | [progress.py#L89](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L89) | 3s 滑动窗口平均 | 平滑前原始值 | **否（仅展示）** |
+| ProgressCalculator.speed.smooth | [progress.py#L106](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L106) | 指数平滑后 | FragmentFD 展示用 | **否（仅展示）** |
+| report_progress finished 速度 | [common.py#L354](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L354) | 总大小 / 总耗时 | 完成时展示 | **否（仅展示）** |
+
+---
+
+## 三、ratelimit 与 throttledratelimit 的阈值组合关系
+
+### 3.1 四种组合情况
+
+```
+速度轴 (bytes/s)
+──────────────────────────────────────────────→
+              │                │
+  throttledratelimit      ratelimit
+    (下限，检测节流)     (上限，主动限速)
+```
+
+#### 组合 1：ratelimit > throttledratelimit（正常配置）
+
+```
+示例：ratelimit = 2M (2097152), throttledratelimit = 100K (102400)
+
+         100K              2M
+───────────┼─────────────────┼───────────→
+           │   正常工作区    │
+           │                 │
+      速度在此区间内可能触发    限速生效的稳定区
+      throttledratelimit 检测
+```
+
+**行为分析：**
+- 正常下载时，ratelimit 将速度稳定在 2MB/s 附近
+- 2MB/s 远高于 100KB/s，节流检测不会被触发
+- 只有当服务器真正限流时（速度从 2M 掉落到 100K 以下并持续 3s），才会触发重定向
+- **这是预期的工作模式**
+
+#### 组合 2：ratelimit < throttledratelimit（冲突配置 — 必触发）
+
+```
+示例：ratelimit = 50K (51200), throttledratelimit = 100K (102400)
+
+          50K         100K
+───────────┼────────────┼──────────────→
+           │            │
+    ratelimit 生效后    throttledratelimit 触发线
+    速度被限制在 50K    但 50K < 100K！
+    ←──────── 速度永远在这一侧
+```
+
+**这是最危险的配置，详细分析见下一节。**
+
+#### 组合 3：ratelimit = throttledratelimit（临界配置 — 大概率误判）
+
+```
+示例：ratelimit = 100K, throttledratelimit = 100K
+
+          100K
+───────────┼──────────────────────────────→
+           │
+      两个阈值重合
+```
+
+**行为分析：**
+- 限速系统的 sleep 精度有限（`time.sleep()` 精度 + 调度抖动），实际速度会在 ratelimit 附近上下波动
+- 波动的下探部分会进入 `< throttledratelimit` 区域
+- 一旦下探持续 3 秒以上，就会误判
+- **这种配置几乎一定会触发误判**
+
+#### 组合 4：未设置 throttledratelimit（默认值 0）
+
+```python
+# http.py#L315
+if speed and speed < (self.params.get('throttledratelimit') or 0):
+```
+
+- `throttledratelimit or 0` → 未设置时使用 0
+- `speed < 0` 在正常下载中永远不可能成立（speed ≥ 0）
+- **节流检测完全不生效**
+
+### 3.2 组合 2 详细分析：低限速遇高节流阈值
+
+#### 场景
+
+```bash
+# 用户同时设置了两个参数，但设置反了
+yt-dlp -r 50K --throttled-rate 100K URL
+# ratelimit (50K) < throttledratelimit (100K)
+```
+
+#### 逐步执行过程
+
+下载循环：[http.py#L248-L326](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L248-L326)
+
+```
+第 1 阶段：T=0s ~ T=0.5s
+  刚开始下载，速度逐步上升
+  speed 从 0 开始增长
+  speed < 50K，slow_down 不 sleep
+  speed < 100K，记录 throttle_start = T=0.0
+
+第 2 阶段：T=0.5s ~ T=1s
+  speed 达到并超过 50K
+  → slow_down() 开始介入：计算 sleep_time，主动 sleep
+  速度被限制在 50K 左右
+  但 50K < 100K → throttle_start 没有被重置
+  throttle_start 仍然是 T=0.0
+
+第 3 阶段：T=3.0s（关键节点）
+  现在的时间是 T=3.0
+  now - throttle_start = 3.0 - 0.0 = 3.0s
+  且 speed (≈50K) < throttledratelimit (100K)
+  → 条件 now - ctx.throttle_start > 3 成立！
+  → 抛出 ThrottledDownload 异常 ← 误判！
+```
+
+#### 误判的代码路径
+
+```python
+# http.py#L315-L325
+if speed and speed < (self.params.get('throttledratelimit') or 0):
+    # speed ≈ 50K < 100K → True
+    if ctx.throttle_start is None:
+        ctx.throttle_start = now       # T≈0 时设值
+    elif now - ctx.throttle_start > 3:
+        # T=3 时判断为 True
+        if ctx.stream is not None and ctx.tmpfilename != '-':
+            ctx.stream.close()
+        raise ThrottledDownload   # ← 这里抛出，误判
+elif speed:
+    ctx.throttle_start = None   # ← 永远走不到这里，因为 speed 始终 < 100K
+```
+
+#### 实际后果
+
+1. 抛出 `ThrottledDownload` → 被识别为 `ReExtractInfo` 类型
+2. YoutubeDL 会重新提取视频信息（重新向 YouTube/其他站点请求获取新的下载 URL）
+3. 用新 URL 重新开始下载 → 但新 URL 的 ratelimit 仍然是 50K，throttledratelimit 仍然是 100K
+4. **3 秒后再次误判**，形成循环：
+   ```
+   下载 3s → 误判 ThrottledDownload → 重新提取 URL → 再下载 3s → 再次误判 ...
+   ```
+5. 如果重试次数耗尽，最终下载失败
+
+#### 为什么 FragmentFD 中每个分片独立受影响
+
+在分片下载场景下：
+- 每个分片通过 `HttpQuietDownloader`（本质是 HttpFD）独立下载
+- 每个分片都有自己的下载循环和节流检测逻辑
+- 第 1 个分片下载 3s 后触发误判，抛出 `ThrottledDownload`
+- 这个异常会向上冒泡，影响整个分片下载流程
+- **不会等到所有分片都失败，第一个分片 3 秒后就会触发**
+
+---
+
+## 四、限速、节流与进度的关联全景
+
+### 4.1 核心协作链路
 
 ```
 用户参数 (ratelimit, throttledratelimit)
         │
         ▼
-┌─────────────────────────────────────────────────┐
-│          FileDownloader 基类                     │
-│  ┌─────────────┐   ┌────────────────────────┐  │
-│  │ slow_down() │   │ report_progress()      │  │
-│  │  (限速)     │   │  (进度展示)            │  │
-│  └──────┬──────┘   └───────────┬────────────┘  │
-└─────────┼──────────────────────┼───────────────┘
-          │                      │
-          ▼                      ▼
-┌──────────────────┐   ┌───────────────────────┐
-│  HttpFD (单文件) │   │ FragmentFD (分片)      │
-│  calc_speed()    │   │ ProgressCalculator    │
-│  calc_eta()      │   │ SmoothValue           │
-│  节流检测逻辑    │   │ 分片进度聚合          │
-└─────────┬────────┘   └──────────┬────────────┘
-          │                       │
-          └───────────┬───────────┘
-                      │
-                      ▼
-              throttledratelimit 检测
-              (速度 < 阈值 持续 3s → ThrottledDownload)
+┌──────────────────────────────────────────────────────────┐
+│           FileDownloader 基类                             │
+│  ┌──────────────────────┐   ┌────────────────────────┐   │
+│  │ slow_down()          │   │ report_progress()      │   │
+│  │  内部计算 speed_local │   │  纯格式化+展示         │   │
+│  │  → time.sleep()      │   │  (不修改任何控制变量)   │   │
+│  └─────────┬────────────┘   └───────────┬────────────┘   │
+└────────────┼────────────────────────────┼────────────────┘
+             │                            │
+             ▼                            ▼
+┌──────────────────────────┐   ┌───────────────────────────┐
+│  HttpFD (单文件)          │   │ FragmentFD (分片聚合)     │
+│  calc_speed()             │   │ ProgressCalculator       │
+│  → 用于 throttledratelimit│   │ + SmoothValue             │
+│  → 放入 _hook_progress    │   │ → state['speed'].smooth   │
+│  (控制 + 展示共用)        │   │ (仅展示，不参与控制)      │
+└────────────┬─────────────┘   └────────────┬──────────────┘
+             │                               │
+             │                               │ (子下载器内部)
+             │                               └─────┐
+             ▼                                     ▼
+    节流检测决策 (HttpFD 层)            每个分片独立决策
+    speed_ctrl < throttledratelimit?    (同上，每个分片走独立循环)
+     持续 3s → ThrottledDownload
 ```
 
-### 1.2 下载循环中的调用时序
+### 4.2 下载循环中的调用时序
 
 位置：[downloader/http.py#L248-L326](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L248-L326)
 
 ```
 while True:
-    1. data_block = ctx.data.read(block_size)   # 读取数据块
-    2. byte_counter += len(data_block)           # 更新计数器
-    3. ctx.stream.write(data_block)              # 写入文件
-    4. slow_down(start, now, byte_counter - ctx.resume_len)  # 限速
-    5. now = time.time(); after = now            # 更新时间戳
-    6. block_size = best_block_size(...)         # 动态调整块大小
-    7. speed = calc_speed(start, now, ...)       # 计算速度
-    8. eta = calc_eta(start, now, ...)           # 计算 ETA
-    9. _hook_progress({status, speed, eta, ...}) # 触发进度钩子
-    10. if speed < throttledratelimit:           # 节流检测
-         - 持续 3s → 抛 ThrottledDownload
+    # ── 数据层 ──
+    1. data_block = ctx.data.read(block_size)
+    2. byte_counter += len(data_block)
+    3. ctx.stream.write(data_block)
+
+    # ── 控制决策 1：限速 ──
+    4. slow_down(start, now, byte_counter - ctx.resume_len)
+       │   内部独立计算 speed_local
+       │   与 calc_speed 结果可能有微秒级差异
+       └─→ sleep (如果需要)
+
+    # ── 时间戳更新 ──
+    5. now = time.time()
+    6. block_size = best_block_size(after - before, len(data_block))
+       │   内部独立计算 rate (单次 read 平均)
+       └─→ 决定下一次 read 的块大小
+
+    # ── 计算速度：同一个值服务两个目的 ──
+    7. speed = calc_speed(start, now, byte_counter - ctx.resume_len)
+       │
+       ├─── 控制决策 2：节流检测
+       │    10. if speed < throttledratelimit:
+       │            持续 3s → 抛 ThrottledDownload
+       │
+       └─── 展示层：进度钩子
+            8. eta = calc_eta(...)
+            9. _hook_progress({status, speed, eta, ...})
+                 │
+                 ├── report_progress() → 格式化输出
+                 └── 用户自定义 hooks → 纯观察
+```
+
+### 4.3 限速生效后的稳定状态分析
+
+当 ratelimit 正常工作且 `ratelimit > throttledratelimit` 时：
+
+```
+时间轴: T0────T1────T2────T3────T4────T5──→
+速度:
+     ▲   ↗ 快速爬升
+     │  ↗
+ ratelimit━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ (稳定上限)
+     │╲  ╱╲  ╱╲  ╱╲  ╱╲  ╱       ← 实际速度在 ratelimit 附近抖动
+     │ ╲╱  ╲╱  ╲╱  ╲╱  ╲╱
+     │
+throttledratelimit ─────────────────────── (安全下限)
+     │
+     0
+
+关键点:
+• ratelimit 通过 sleep 把平均速度拉平到上限值
+• 波动范围通常在 ratelimit 的 ±10% 以内
+• 只要 throttledratelimit 明显低于波动下限，就不会误判
+• 经验建议：throttledratelimit ≤ ratelimit × 0.3 （留 70% 安全裕度）
 ```
 
 ---
 
-## 二、普通下载速度的计算方法
+## 五、误判控制点汇总
 
-### 2.1 速度计算核心函数
+除了之前的 8 个控制点，补充阈值组合相关的控制点：
+
+### 5.1 控制点 9：阈值相对大小（新增）
+
+**风险等级：最高**
+
+- **情况 A**：`ratelimit < throttledratelimit` → **必误判**，3 秒后必定触发 ThrottledDownload
+- **情况 B**：`ratelimit ≈ throttledratelimit` → **大概率误判**，速度波动下探到阈值以下
+- **情况 C**：`ratelimit > throttledratelimit × 3` → 安全
+
+### 5.2 控制点 10：第一次循环的速度为 None
+
+位置：[common.py#L163](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L163)
+
+```python
+if bytes == 0 or dif < 0.001:  # 1ms 保护
+    return None
+```
+
+节流检测的判断条件：
+```python
+if speed and speed < throttledratelimit:  # speed 为 None 时跳过
+```
+
+- 第 1ms 内 `speed=None`，`if speed and ...` 短路，不检测
+- 1ms 后开始检测，但 TCP 慢启动 + ratelimit sleep，前几百毫秒速度还在爬升
+- 所以 `throttle_start` 通常在 T≈0.1s 才会被设置，3 秒阈值实际是 T≈3.1s 才触发
+
+### 5.3 控制点 11：sleep 后的速度计算包含 sleep 时间
+
+```
+循环 1: read (实际 1ms, 得 1MB)
+         slow_down 计算: 1MB/1ms = 1000MB/s → 远超 ratelimit=1MB/s
+         sleep_time = 1MB / 1MB/s - 1ms ≈ 999ms
+         → sleep 999ms
+
+循环 2: read (1ms, 得 1MB)
+         calc_speed 计算: bytes=2MB, elapsed=1ms+999ms+1ms ≈ 1001ms
+         speed = 2MB / 1.001s ≈ 1.998MB/s
+```
+
+**关键点：**
+- `calc_speed()` 计算的 `elapsed` 包含了 `slow_down()` 内部 sleep 的时间
+- 所以限速生效后，`calc_speed()` 返回值才是真实的平均速度（≈ ratelimit）
+- 这保证了节流检测看到的是限速后的真实速度，而不是瞬时读取速度
+
+### 5.4 完整误判控制点表
+
+| 编号 | 控制点 | 位置 | 影响 | 风险等级 |
+|------|--------|------|------|----------|
+| 1 | resume_len 处理 | [http.py#L229](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L229) | 忘记减会导致速度虚高 | 中 |
+| 2 | Content-Length 可靠性 | [http.py#L201-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L201-L206) | 只影响 ETA，不影响控制 | 低 |
+| 3 | now=None 时序 | [http.py#L234](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L234) | 微秒级差异，影响可忽略 | 低 |
+| 4 | 3 秒防抖 | [http.py#L315-L325](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L315-L325) | TCP 慢启动可能误判 | 中 |
+| 5 | 分片大小估算 | [fragment.py#L261-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py#L261-L264) | 只影响 ETA 展示 | 低 |
+| 6 | 并发分片限速 | [fragment.py#L167-L174](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py#L167-L174) | 总带宽 = ratelimit × N | 中 |
+| 7 | 采样率限制 | [progress.py#L70-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L70-L72) | 只影响展示刷新频率 | 低 |
+| 8 | 外部下载器 | [external.py#L62-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L62-L76) | throttledratelimit 完全失效 | 高 |
+| **9** | **阈值相对大小** | **参数配置层** | **ratelimit < throttledratelimit 必误判** | **最高** |
+| 10 | 1ms 内 speed=None | [common.py#L163](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L163) | 跳过检测，实际延迟触发 | 低 |
+| 11 | sleep 计入 elapsed | 循环时序 | 保证节流检测看到限速后真实速度 | 有利（降低误判） |
+
+---
+
+## 六、普通下载速度的计算方法
+
+### 6.1 速度计算核心函数
 
 **calc_speed()** — 简单平均速度
 位置：[downloader/common.py#L160-L165](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L160-L165)
@@ -91,7 +586,7 @@ def calc_speed(start, now, bytes):
 speed = self.calc_speed(start, now, byte_counter - ctx.resume_len)
 ```
 
-### 2.2 ETA 计算核心函数
+### 6.2 ETA 计算核心函数
 
 **calc_eta()** — 基于当前速度的剩余时间估算
 位置：[downloader/common.py#L144-L158](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L144-L158)
@@ -124,7 +619,7 @@ else:
     eta = self.calc_eta(start, time.time(), ctx.data_len - ctx.resume_len, byte_counter - ctx.resume_len)
 ```
 
-### 2.3 速度计算中的变量说明
+### 6.3 速度计算中的变量说明
 
 | 变量 | 含义 | 说明 |
 |------|------|------|
@@ -140,7 +635,7 @@ speed = (byte_counter - resume_len) / (now - start)
 eta = (data_len - byte_counter) / speed   # 当 data_len 存在时
 ```
 
-### 2.4 动态块大小调整
+### 6.4 动态块大小调整（间接影响控制精度）
 
 **best_block_size()** — 根据当前速度动态调整读取块大小
 位置：[downloader/common.py#L181-L192](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L181-L192)
@@ -164,15 +659,13 @@ def best_block_size(elapsed_time, bytes):
 - 目标：让每次 `read()` 调用约耗时 1 秒
 - 块大小范围：`[max(bytes/2, 1), min(bytes*2, 4MB)]`
 - 如果速度极快（elapsed < 1ms），直接用最大值 4MB
-- 这样既避免频繁系统调用，又保证限速和进度更新的精度
+- **对控制精度的影响**：块太小会增加循环次数，限速和节流检测更精确；块太大则反之
 
 ---
 
-## 三、分片聚合的展示方式
+## 七、分片聚合的展示方式
 
-分片下载（HLS/DASH）使用 `ProgressCalculator` 进行更精确的速度计算和进度聚合。
-
-### 3.1 ProgressCalculator 滑动窗口算法
+### 7.1 ProgressCalculator 滑动窗口算法
 
 位置：[utils/progress.py#L8-L94](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L8-L94)
 
@@ -211,7 +704,7 @@ self.speed.set((self.downloaded - self._downloaded[0]) / download_time)
 - 太长：反应迟钝，真实速度变化很久后才体现
 - 3 秒是经验值，平衡了稳定性和灵敏度
 
-### 3.2 SmoothValue 指数平滑器
+### 7.2 SmoothValue 指数平滑器
 
 位置：[utils/progress.py#L96-L109](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L96-L109)
 
@@ -238,7 +731,7 @@ self.speed = SmoothValue(0, smoothing=0.7)
 self.eta = SmoothValue(None, smoothing=0.9)
 ```
 
-### 3.3 多线程支持
+### 7.3 多线程支持（仅展示层用）
 
 位置：[utils/progress.py#L46-L60](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L46-L60)
 
@@ -261,8 +754,9 @@ def update(self, size):
 - 每次 `update()` 传入的是该线程的 **累计** 大小，通过差值计算增量
 - `thread_reset()` 在分片切换时调用，重置该线程的累计值
 - `_lock` 保证多线程并发更新时的数据一致性
+- **重要：** 这套机制只为展示层聚合速度用，不参与每个分片内部的控制决策
 
-### 3.4 分片进度聚合逻辑
+### 7.4 分片进度聚合逻辑
 
 位置：[downloader/fragment.py#L242-L279](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py#L242-L279)
 
@@ -276,7 +770,7 @@ def frag_progress_hook(s):
     if ctx_id is not None and s.get('ctx_id') != ctx_id:
         return
 
-    # 非直播场景：估算总大小
+    # 非直播场景：估算总大小（仅用于 ETA 展示）
     if not ctx['live']:
         # 按当前已完成分片的平均大小估算总大小
         estimated_size = (
@@ -291,55 +785,53 @@ def frag_progress_hook(s):
     # 分片下载完成时
     if s['status'] == 'finished':
         state['fragment_index'] += 1
-        progress.thread_reset()  # 重置线程累计值
+        progress.thread_reset()  # 重置线程累计值（展示层用）
 
-    # 聚合后的状态
-    state['downloaded_bytes'] = progress.downloaded
-    state['speed'] = progress.speed.smooth   # 使用平滑后的值
-    state['eta'] = progress.eta.smooth       # 使用平滑后的值
+    # 聚合后的状态 → 全部用于展示
+    state['downloaded_bytes'] = ctx['complete_frags_downloaded_bytes'] = progress.downloaded
+    state['speed'] = ctx['speed'] = progress.speed.smooth   # 平滑后的值，仅展示
+    state['eta'] = progress.eta.smooth                       # 平滑后的值，仅展示
 
-    self._hook_progress(state, info_dict)
+    self._hook_progress(state, info_dict)  # 分发给展示层钩子
 ```
 
 **展示的数据流向：**
 ```
 子下载器 (HttpQuietDownloader)
     │  (每个分片独立下载，noprogress=True)
+    │  内部独立执行 slow_down 和 throttledratelimit 检测
+    │  ↓ 触发自己的 _hook_progress (status 含 speed)
     ▼
-frag_progress_hook (分片聚合钩子)
-    │  - 收集子下载器的进度事件
-    │  - ProgressCalculator 汇总速度
-    │  - 按平均分片大小估算总大小
+frag_progress_hook (FragmentFD 的分片聚合钩子)
+    │  读取子下载器传来的 downloaded_bytes
+    │  ProgressCalculator.update() 汇总到滑动窗口
+    │  SmoothValue 指数平滑
     ▼
-self._hook_progress (对外统一接口)
+state['speed'] = progress.speed.smooth   ← 仅展示，不参与控制
+state['eta'] = progress.eta.smooth       ← 仅展示，不参与控制
     │
     ▼
-report_progress (进度条显示)
+self._hook_progress(state, info_dict)
+    │
+    ├── report_progress() → 进度条显示
+    └── 用户自定义 progress hooks → 观察者模式（只读）
 ```
 
-### 3.5 分片与非分片的速度计算对比
+### 7.5 分片与非分片的对比
 
 | 维度 | HttpFD (非分片) | FragmentFD (分片) |
 |------|-----------------|-------------------|
-| 速度算法 | 全程平均速度 | 3 秒滑动窗口 + 指数平滑 |
-| 精度 | 低（随时间推移越来越"滞后"） | 高（反映最近 3 秒的真实速度） |
-| ETA 计算 | 直接用平均速度估算 | 用平滑后的速度估算 |
-| 多线程支持 | 无（单连接） | 有（_thread_sizes 字典） |
-| 代码位置 | [common.py#L160-L165](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L160-L165) | [progress.py#L89](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L89) |
-
-**为什么分片需要更复杂的算法？**
-- 分片下载涉及多个 HTTP 连接，每个连接有自己的启动、慢启动过程
-- 分片切换时会有短暂停顿，简单平均会被拉低
-- 并发分片下载时多个线程同时下载，需要汇总
-- 直播场景没有固定总大小，需要动态估算
+| 控制决策用速度算法 | calc_speed() 全程平均 | **每个分片内部**用 calc_speed() 全程平均（各分片独立） |
+| 展示用速度算法 | 同上，与控制层共用 | ProgressCalculator 3s 窗口 + SmoothValue 平滑（与控制层分离） |
+| 限速执行位置 | HttpFD 下载循环 | **每个分片的子下载器**独立执行（HttpQuietDownloader 内部） |
+| 节流检测位置 | HttpFD 下载循环 | **每个分片的子下载器**独立检测（FragmentFD 层无此逻辑） |
+| 数据一致性 | 控制和展示用同一个 speed 变量 | 两套完全独立的计算，可能出现显示值与控制值不一致 |
 
 ---
 
-## 四、外部下载器参数的转发机制
+## 八、外部下载器参数的转发机制
 
-当使用 `--external-downloader` 时，yt-dlp 不自己下载，而是将参数转发给外部下载器。
-
-### 4.1 类层次结构
+### 8.1 类层次结构
 
 ```
 FileDownloader
@@ -355,7 +847,7 @@ FileDownloader
 
 **注意：** `ExternalFD` 继承自 `FragmentFD` 而非直接继承 `FileDownloader`，这是为了复用分片处理逻辑。
 
-### 4.2 核心参数转发函数
+### 8.2 核心参数转发函数
 
 位置：[utils/_utils.py#L3582-L3596](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/_utils.py#L3582-L3596)
 
@@ -388,16 +880,16 @@ def _valueless_option(self, command_option, param, expected_value=True):
     return cli_valueless_option(self.params, command_option, param, expected_value)
 ```
 
-### 4.3 ratelimit 参数转发对照表
+### 8.3 ratelimit 参数转发对照表
 
-| 外部下载器 | 参数选项 | 代码位置 |
-|-----------|----------|----------|
-| curl | `--limit-rate` | [external.py#L237](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L237) |
-| wget | `--limit-rate` | [external.py#L287](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L287) |
-| aria2c | `--max-overall-download-limit` | [external.py#L322](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L322) |
-| axel | 不支持 | 未实现 |
-| httpie | 不支持 | 未实现 |
-| ffmpeg | 不支持 | 未实现 |
+| 外部下载器 | 参数选项 | 语义 | 代码位置 |
+|-----------|----------|------|----------|
+| curl | `--limit-rate` | 单连接限速 | [external.py#L237](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L237) |
+| wget | `--limit-rate` | 单连接限速 | [external.py#L287](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L287) |
+| aria2c | `--max-overall-download-limit` | **全局总带宽**限速 | [external.py#L322](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L322) |
+| axel | 不支持 | - | 未实现 |
+| httpie | 不支持 | - | 未实现 |
+| ffmpeg | 不支持 | - | 未实现 |
 
 **示例：** [CurlFD._make_cmd()](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L215-L249)
 ```python
@@ -411,7 +903,9 @@ def _make_cmd(self, tmpfilename, info_dict):
     return cmd
 ```
 
-### 4.4 外部下载器自定义参数
+**重要差异：aria2c 用 `--max-overall-download-limit`（全局限速）而不是单连接限速。** 这意味着只有 aria2c 外部下载器能实现真正意义上的全局带宽池，其他外部下载器和内置下载器都是单连接限速。
+
+### 8.4 外部下载器自定义参数
 
 **_configuration_args()** — 支持按下载器名称指定额外参数
 位置：[utils/_utils.py#L3619-L3629](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/_utils.py#L3619-L3629)
@@ -435,22 +929,18 @@ cmd += self._configuration_args()
 2. `external_downloader_args['default']`
 3. 兼容模式：如果 `external_downloader_args` 是列表，直接使用整个列表
 
-**用户使用示例：**
-```bash
-# 给 curl 额外传 --connect-timeout 30
-yt-dlp --external-downloader curl \
-       --external-downloader-args "curl:--connect-timeout 30" \
-       URL
-```
-
-### 4.5 外部下载器的进度反馈限制
+### 8.5 外部下载器的控制决策全部外包
 
 当使用外部下载器时：
-- **yt-dlp 不参与下载过程**，因此没有逐块的进度回调
-- 外部下载器自己处理限速（`--limit-rate` 等）
-- 进度显示由外部下载器自己控制（curl/wget 会输出进度）
-- **throttledratelimit 检测不生效** — 因为 yt-dlp 拿不到实时速度数据
-- 下载完成后 yt-dlp 才会收到一次 `finished` 状态的钩子
+
+| 功能 | 内置下载器 | 外部下载器 |
+|------|-----------|-----------|
+| ratelimit 限速 | slow_down() 内部 sleep | 转发给外部工具（aria2c 是全局，其他是单连接） |
+| throttledratelimit 检测 | 循环内判断 3s 防抖 | **完全失效**（yt-dlp 不解析外部工具输出） |
+| 速度计算 | calc_speed() / ProgressCalculator | **无实时数据**，只在完成时用 `total_bytes / elapsed` 算一次 |
+| ETA 计算 | calc_eta() / ProgressCalculator | **无** |
+| 进度钩子 | 逐块回调 | 只有 start 和 finished 两次 |
+| 块大小调整 | best_block_size() | 外部工具自己处理 |
 
 位置：[downloader/external.py#L62-L76](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py#L62-L76)
 ```python
@@ -460,219 +950,76 @@ if retval == 0:
         'status': 'finished',
         'elapsed': time.time() - started,
     }
-    # ... 获取文件大小 ...
-    self._hook_progress(status, info_dict)  # 只有这一次回调
+    if filename != '-':
+        fsize = os.path.getsize(tmpfilename)
+        self.try_rename(tmpfilename, filename)
+        status.update({
+            'downloaded_bytes': fsize,
+            'total_bytes': fsize,
+        })
+    self._hook_progress(status, info_dict)  # ← 只有这一次回调
     return True
 ```
 
 ---
 
-## 五、可能影响误判的控制点
-
-限速和节流检测依赖速度计算，多个控制点可能影响计算准确性，导致误判。
-
-### 5.1 控制点 1：断点续传的 resume_len 处理
-
-位置：[downloader/http.py#L229](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L229)
-
-```python
-byte_counter = 0 + ctx.resume_len
-```
-
-**速度计算时必须减去 resume_len：**
-```python
-# 正确：只计算本次连接下载的字节
-speed = self.calc_speed(start, now, byte_counter - ctx.resume_len)
-self.slow_down(start, now, byte_counter - ctx.resume_len)
-```
-
-**风险点：**
-- 如果忘记减 `resume_len`，会把历史下载量算入，导致速度计算偏高
-- 限速逻辑会误认为速度很快，不执行 sleep，实际会超速
-- 节流检测会误认为速度很快，不会触发重定向
-
-### 5.2 控制点 2：Content-Length 可靠性
-
-位置：[downloader/http.py#L201-L206](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L201-L206)
-
-```python
-data_len = ctx.data.headers.get('Content-length')
-if ctx.data.headers.get('Content-encoding'):
-    # Content-encoding 存在时，Content-length 不可靠（自动解压）
-    data_len = None
-```
-
-**当 data_len 为 None 时：**
-- `eta = None`，不显示剩余时间
-- `total_bytes = None`，进度条只显示已下载量，不显示百分比
-- **不影响限速**（slow_down 不依赖 total）
-- **不影响节流检测**（throttledratelimit 只看 speed）
-
-### 5.3 控制点 3：第一次循环的 now = None
-
-位置：[downloader/http.py#L234](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L234)
-
-```python
-now = None  # needed for slow_down() in the first loop run
-```
-
-**第一次循环的执行顺序：**
-```
-1. now = None (初始值)
-2. 读取数据块
-3. slow_down(start, now, ...) → now 为 None，内部用 time.time()
-4. now = time.time()  ← 这里才更新
-5. calc_speed(start, now, ...)
-```
-
-**slow_down 内部对 now=None 的处理：** [common.py#L206-L207](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py#L206-L207)
-```python
-if now is None:
-    now = time.time()
-```
-
-**风险点：**
-- 第一次循环 `slow_down` 和 `calc_speed` 使用的 `now` 有细微差异
-- 差异很小（微秒级），实际影响可忽略
-- 但如果代码重构时改变顺序，可能引入问题
-
-### 5.4 控制点 4：节流检测的 3 秒防抖
-
-位置：[downloader/http.py#L315-L325](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py#L315-L325)
-
-```python
-if speed and speed < (self.params.get('throttledratelimit') or 0):
-    if ctx.throttle_start is None:
-        ctx.throttle_start = now       # 第一次低于阈值，记录时间
-    elif now - ctx.throttle_start > 3:  # 持续超过 3 秒
-        raise ThrottledDownload
-elif speed:
-    ctx.throttle_start = None           # 速度回升，重置计时器
-```
-
-**误判风险：**
-
-| 场景 | 是否误判 | 原因 |
-|------|----------|------|
-| TCP 慢启动阶段 | 可能 | 刚开始下载速度低，3 秒内未达到全速 |
-| 网络瞬时抖动 | 不会 | 3 秒防抖过滤掉 |
-| 磁盘写入卡顿 | 可能 | read() 阻塞时间长，速度计算被拉低 |
-| 限速生效时 | 不会 | ratelimit 控制的速度是稳定的，不会突然低于 throttledratelimit |
-| 服务器限速但偶尔回升 | 不会 | 只要有一次高于阈值就重置计时 |
-
-**TCP 慢启动问题：**
-- 典型 TCP 拥塞控制从慢启动开始，窗口逐渐增大
-- 如果 `throttledratelimit` 设置较高，前 3 秒可能达不到
-- 解决：`throttledratelimit` 应设置为明显低于正常速度的值（如 100KB/s）
-
-### 5.5 控制点 5：分片估算大小的准确性
-
-位置：[downloader/fragment.py#L261-L264](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py#L261-L264)
-
-```python
-estimated_size = (
-    (ctx['complete_frags_downloaded_bytes'] + frag_total_bytes)
-    / (state['fragment_index'] + 1) * total_frags)
-```
-
-**估算公式：**
-```
-预估总大小 = (已下载字节 + 当前分片大小) / 已完成分片数 × 总分片数
-```
-
-**风险点：**
-- 分片大小不均匀时（如广告分片、片头片尾），估算偏差大
-- 刚开始只有少数分片完成时，估算不可靠
-- 影响 `eta` 计算，但 **不影响 speed 计算**（speed 只看下载速率）
-- 不影响限速和节流检测
-
-### 5.6 控制点 6：并发分片对限速的影响
-
-位置：[downloader/fragment.py#L167-L174](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py#L167-L174)
-
-```python
-dl = HttpQuietDownloader(self.ydl, {
-    **self.params,  # ratelimit 被传递给每个子下载器
-    'noprogress': True,
-    ...
-})
-```
-
-**当 concurrent_fragment_downloads = N 时：**
-- 每个分片线程有独立的 `slow_down()`
-- 每个线程独立限速 `ratelimit`
-- **实际总带宽 = ratelimit × N**
-- 这是设计行为，但用户可能误以为是"全局"限速
-
-**节流检测的情况：**
-- 每个分片独立检测自己的速度
-- 单个分片速度低会触发该分片的重定向
-- 但不会影响其他分片
-
-### 5.7 控制点 7：ProgressCalculator 的采样率限制
-
-位置：[utils/progress.py#L70-L72](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py#L70-L72)
-
-```python
-if self._last_update + self.SAMPLING_RATE > current_time:
-    return  # 50ms 内不重复采样
-self._last_update = current_time
-```
-
-**影响：**
-- 速度更新频率最高 20 次/秒
-- 进度显示不会过于频繁，节省 CPU
-- 但节流检测（在 HttpFD 中）不受此限制，每次循环都检测
-
-### 5.8 控制点 8：外部下载器的节流检测失效
-
-如 4.5 节所述，使用外部下载器时：
-- `throttledratelimit` 检测 **完全不生效**
-- 因为 yt-dlp 拿不到实时速度数据
-- 限速由外部下载器自己实现
-- 用户需要依赖外部下载器的限流检测机制
-
----
-
-## 六、限速与节流检测的完整决策树
+## 九、限速与节流检测的完整决策树
 
 ```
 下载开始
     │
     ▼
-┌─────────────────────────────────────┐
-│  计算速度 speed = bytes / elapsed    │
-│  (HttpFD: 全程平均)                 │
-│  (FragmentFD: 3s 滑动窗口 + 平滑)   │
-└──────────────┬──────────────────────┘
-               │
-       ┌───────┴───────┐
-       │               │
-       ▼               ▼
-┌─────────────┐  ┌───────────────────┐
-│ slow_down() │  │ throttledratelimit │
-│ 限速检查    │  │ 节流检测            │
-│             │  │  速度 < 阈值?       │
-│ speed > 限速?│  │  ├─ 是 → 计时     │
-│  ├─ 是 → sleep│  │  │   持续 3s?    │
-│  └─ 否 → 继续 │  │  │   ├─ 是 → 抛出 │
-│             │  │  │   └─ 否 → 继续  │
-└─────────────┘  │  ├─ 否 → 重置计时  │
-                 │  └─ speed 为 None → 跳过 │
-                 └───────────────────┘
+┌─────────────────────────────────────────────────────┐
+│  下载循环 (每个 read() 一次)                          │
+│                                                      │
+│  ┌─ slow_down() ─────────────────────────────────┐   │
+│  │  ① 内部计算 speed_local = bytes/elapsed        │   │
+│  │  ② if speed_local > ratelimit: time.sleep()   │   │
+│  │     (使用 本次连接全程平均)                     │   │
+│  └───────────────────────────────────────────────┘   │
+│                                                      │
+│  ┌─ calc_speed() ────────────────────────────────┐   │
+│  │  speed_ctrl = bytes/elapsed                    │   │
+│  │  (使用 本次连接全程平均，与①算法相同)            │   │
+│  │                                               │   │
+│  │  用途 1: 放入 _hook_progress → report_progress │   │
+│  │          (仅展示，不影响控制)                    │   │
+│  │                                               │   │
+│  │  用途 2: 节流检测决策 ← 真正的控制              │   │
+│  └───────────────────────────────────────────────┘   │
+└─────────────────────┬───────────────────────────────┘
+                      │
+         ┌────────────┴────────────┐
+         │                         │
+         ▼                         ▼
+┌────────────────────┐   ┌────────────────────────────┐
+│ FragmentFD 场景?    │   │ HttpFD 场景?                │
+│ (分片下载)          │   │ (单文件下载)                │
+└─────────┬──────────┘   └──────────────┬─────────────┘
+          │                             │
+          │ 每个分片独立走 HttpFD 循环   │ speed_ctrl 参与决策
+          │ (内部限速 + 内部节流检测)    │
+          │                             │
+          ▼                             ▼
+   子下载器内判断                if speed_ctrl < throttledratelimit:
+   (同上)                    ┌─ 是 → ctx.throttle_start 设值
+                             │     持续 3s 以上?
+                             │     ├─ 是 → raise ThrottledDownload
+                             │     └─ 否 → 等待下一轮
+                             └─ 否 (或 speed 回升) → throttle_start 清零
 ```
 
 ---
 
-## 七、相关文件索引
+## 十、相关文件索引
 
 | 文件 | 核心内容 |
 |------|----------|
-| [downloader/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py) | `slow_down()`、`calc_speed()`、`calc_eta()`、`best_block_size()`、进度钩子框架 |
-| [downloader/http.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py) | HttpFD 下载循环、限速调用点、节流检测逻辑 |
-| [downloader/fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py) | 分片进度聚合、`frag_progress_hook`、分片估算 |
-| [downloader/external.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py) | 外部下载器参数转发、各下载器 `_make_cmd()` |
-| [utils/progress.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py) | `ProgressCalculator` 滑动窗口、`SmoothValue` 指数平滑 |
-| [utils/_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/_utils.py) | `ThrottledDownload` 异常、`cli_option()` 系列、`_configuration_args()` |
-| [options.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/options.py) | CLI 选项：`-r/--limit-rate`、`--throttled-rate` |
-| [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py) | 参数汇总与传递 |
+| [downloader/common.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/common.py) | `slow_down()`（限速，第1套速度计算）、`calc_speed()`（第2套，控制+展示）、`calc_eta()`、`best_block_size()`（第3套，块大小）、`report_progress()`（纯展示）、进度钩子框架 |
+| [downloader/http.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/http.py) | HttpFD 下载循环、限速调用点 `#L281`、节流检测 `#L315-L325`、speed 变量共用控制+展示 |
+| [downloader/fragment.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/fragment.py) | 分片进度聚合 `frag_progress_hook`、分片大小估算、子下载器参数传递、无节流检测逻辑 |
+| [downloader/external.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/downloader/external.py) | 外部下载器参数转发、各下载器 `_make_cmd()`、ratelimit 映射、节流检测完全失效 |
+| [utils/progress.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/progress.py) | `ProgressCalculator`（3s 滑动窗口，仅展示层）、`SmoothValue`（指数平滑，仅展示层） |
+| [utils/_utils.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/utils/_utils.py) | `ThrottledDownload` 异常定义（`#L1130`）、`cli_option()` 系列（参数转发）、`_configuration_args()`（外部下载器自定义参数） |
+| [options.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/options.py) | CLI 选项：`-r/--limit-rate`（`#L1016`）、`--throttled-rate`（`#L1020`） |
+| [YoutubeDL.py](file:///d:/fz/0601-2/solo-dogfeeding/code/88-yt-dlp/yt_dlp/YoutubeDL.py) | 参数汇总、`dl()` 方法 `#L3283` 创建 FD 实例并注册 progress hooks、钩子链路组装 |
