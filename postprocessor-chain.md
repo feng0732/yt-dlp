@@ -127,7 +127,7 @@ def run_all_pps(self, key, info, *, additional_pps=None):
 - `additional_pps`（动态注入）先于静态链执行
 - 顺序执行，前一个的输出作为后一个的输入
 - `info` 字典在链中传递和修改
-- `video` 阶段不触发 `_forceprint`（打印在其他地方处理）
+- `video` 阶段不触发 `_forceprint`（打印在 `__forced_printings` 中单独处理）
 
 ### 2.5 动态后处理器注入
 
@@ -192,7 +192,7 @@ def _restrict_to(*, video=True, audio=True, images=True, simulated=True):
 **使用示例**：
 
 ```python
-# FFmpegVideoRemuxerPP: 不处理图片 [ffmpeg.py:556]
+# FFmpegVideoConvertorPP: 不处理图片 [ffmpeg.py:556]
 @PostProcessor._restrict_to(images=False)
 def run(self, info): ...
 
@@ -209,7 +209,7 @@ def run(self, info): ...
 
 装饰器检查通过后，具体后处理器还会进行内部条件判断，不满足则返回 `([], info)` 跳过。
 
-**示例 1：FFmpegVideoRemuxerPP [ffmpeg.py:557-562]**
+**示例 1：FFmpegVideoConvertorPP [ffmpeg.py:557-562]**
 ```python
 def run(self, info):
     filename, source_ext = info['filepath'], info['ext'].lower()
@@ -231,14 +231,14 @@ def run(self, info):
         return [], info  # 跳过
 ```
 
-### 3.3 常见跳过条件汇总
+### 3.3 常见跳过条件汇总（已核准行号）
 
-| 跳过原因 | 代码位置 |
-|---------|---------|
-| 模拟/跳过下载模式（`simulated=False` 时） | [common.py:131-133](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/common.py#L131-L133) |
-| 媒体类型不匹配 | [common.py:140-145](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/common.py#L140-L145) |
-| 已是目标格式（无需转换） | [ffmpeg.py:560-562](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L560-L562) |
-| 容器格式不支持嵌入 | [ffmpeg.py:590-592](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L590-L592) |
+| 跳过原因 | 代码位置（核准） |
+|---------|-----------------|
+| 模拟/跳过下载模式（`simulated=False` 时） | [common.py:121-122](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/common.py#L121-L122) |
+| 媒体类型不匹配（如 images=False 时处理图片） | [common.py:127-131](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/common.py#L127-L131) |
+| 已是目标格式（无需转换/重封装） | [ffmpeg.py:560-562](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L560-L562) |
+| 容器格式不支持嵌入字幕 | [ffmpeg.py:590-592](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L590-L592) |
 | 没有字幕需要嵌入 | [ffmpeg.py:593-596](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/postprocessor/ffmpeg.py#L593-L596) |
 
 ---
@@ -303,9 +303,9 @@ except PostProcessingError as err:
 - 用 `is_error=False` 调用 `report_error`，不会立即终止
 - 后续流程继续执行
 
-#### 4.3.2 错误暂存的检查时机
+### 4.4 暂存错误的重新抛出机制（4 个检查点详解）
 
-[_raise_pending_errors](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L2822-L2825) 在每个格式的 `process_info` 完成后调用：
+[_raise_pending_errors](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L2822-L2825) 定义：
 
 ```python
 def _raise_pending_errors(self, info):
@@ -314,12 +314,122 @@ def _raise_pending_errors(self, info):
         self.report_error(err, tb=False)
 ```
 
+**行为**：
+- 弹出并清除 `__pending_error`（`pop` 操作，下次调用时已清空）
+- 调用 `report_error`（默认 `is_error=True`）
+- 若 `ignoreerrors is False`，`report_error` 内部会抛出 `DownloadError`
+
+整个代码流程中共有 **4 个检查点**，覆盖从平铺结果到下载完成后的所有路径：
+
+---
+
+#### 检查点 ①：平铺结果返回后
+
+**调用位置**：[YoutubeDL.py:1934](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L1934-L1934)
+
+**代码上下文**：
+```python
+# process_ie_result 中，extract_flat 模式处理路径
+info_copy, _ = self.pre_process(info_copy)       # 可能产生 __pending_error
+self._fill_common_fields(info_copy, False)
+self.__forced_printings(info_copy)
+self._raise_pending_errors(info_copy)            # ← 检查点①
+return ie_result
+```
+
+**触发场景**：`--flat-playlist` 或 `extract_flat=True` 时，不进行实际下载，仅提取播放列表条目的元信息。此时 `pre_process` 阶段暂存的错误在此处抛出。
+
+---
+
+#### 检查点 ②：视频结果处理完成后
+
+**调用位置**：[YoutubeDL.py:1942](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L1942-L1942)
+
+**代码上下文**：
+```python
+# process_ie_result 中，video 类型处理路径
+if result_type == 'video':
+    self.add_extra_info(ie_result, extra_info)
+    ie_result = self.process_video_result(ie_result, download=download)  # 内部有检查点③④
+    self._raise_pending_errors(ie_result)       # ← 检查点②
+    additional_urls = (ie_result or {}).get('additional_urls')
+```
+
+**触发场景**：整个视频（含所有格式）的处理流程完成后，再次检查 `__pending_error`。这是**最终兜底检查点**——即使 `process_video_result` 内部某些路径未触发检查，这里也会确保暂存错误被处理。
+
+---
+
+#### 检查点 ③：单个格式 `process_info` 返回后
+
 **调用位置**：[YoutubeDL.py:3132](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3132-L3132)
 
-**行为特点**：
-- 弹出并清除 `__pending_error`
-- 调用 `report_error`（默认 `is_error=True`）
-- 如果 `ignoreerrors` 为 `False`，这里会抛出异常终止播放列表处理
+**代码上下文**：
+```python
+# process_video_result 中，对每个下载格式循环
+for fmt, chapter in itertools.product(formats_to_download, requested_ranges):
+    downloaded_formats.append(new_info)
+    try:
+        self.process_info(new_info)             # 内部有检查点④
+    except MaxDownloadsReached:
+        max_downloads_reached = True
+    self._raise_pending_errors(new_info)        # ← 检查点③
+```
+
+**触发场景**：每个具体格式（每个视频分辨率/音频编码组合）处理完成后立即检查。如果一个视频请求了多个格式（如 DASH 分离流），每个格式都会独立触发此检查。
+
+---
+
+#### 检查点 ④：下载完成后、后处理之前
+
+**调用位置**：[YoutubeDL.py:3596](file:///d:/fz/0601-2/solo-dogfeeding/code/93-yt-dlp/yt_dlp/YoutubeDL.py#L3596-L3596)
+
+**代码上下文**：
+```python
+# process_info 内部
+# ... 执行下载、捕获下载异常 ...
+self._raise_pending_errors(info_dict)          # ← 检查点④
+if success and full_filename != '-':
+    fixup()                                     # 动态注入 Fixup PP
+    replace_info_dict(self.post_process(dl_filename, info_dict, files_to_move))
+```
+
+**触发场景**：下载完成（或下载异常被捕获）后，**在执行 fixup 和 `post_process` 之前**检查暂存错误。如果 `before_dl` 阶段暂存了错误，会在进行任何后处理操作之前被抛出。
+
+---
+
+#### 4 个检查点的执行顺序
+
+```
+process_ie_result
+    │
+    ├─ extract_flat 模式 → 检查点①（L1934）→ return
+    │
+    └─ video 模式
+         │
+         └─ process_video_result
+              │
+              ├─ pre_process / after_filter 阶段 → 暂存错误
+              │
+              └─ 对每个格式循环
+                   │
+                   └─ process_info
+                        │
+                        ├─ video / before_dl 阶段 → 暂存错误
+                        │
+                        ├─ 执行下载
+                        │
+                        ├─ 检查点④（L3596）← 下载后、后处理前
+                        │
+                        ├─ fixup + post_process（不暂存，直接抛出）
+                        │
+                        └─ return
+                   │
+                   └─ 检查点③（L3132）← 每个格式处理完
+              │
+              └─ 检查点②（L1942）← 整个视频处理完（兜底）
+```
+
+---
 
 #### 4.3.3 `post_process` / `after_move` 阶段
 
@@ -340,7 +450,7 @@ except PostProcessingError as err:
 
 直接调用 `run_all_pps`，没有外层 try-catch，错误直接向上传播。
 
-### 4.4 失败传播路径图
+### 4.5 失败传播路径图
 
 ```
 后处理器抛出 PostProcessingError
@@ -355,7 +465,10 @@ except PostProcessingError as err:
                 ├─ pre_process() 包装 → 存入 __pending_error → 继续后续步骤 ⚠️
                 │    （pre_process / after_filter / video / before_dl）
                 │    │
-                │    └─ process_info 完成后 → _raise_pending_errors → 报告/抛出
+                │    ├─ 检查点④（L3596）：下载完成后、后处理之前
+                │    ├─ 检查点③（L3132）：每个格式 process_info 返回后
+                │    ├─ 检查点①（L1934）：平铺结果返回后
+                │    └─ 检查点②（L1942）：视频结果最终返回后（兜底）
                 │
                 ├─ post_process() 方法 → 向上抛出 → 外层捕获 → 视频失败 ❌
                 │    （post_process / after_move）
@@ -364,7 +477,7 @@ except PostProcessingError as err:
                      （after_video / playlist）
 ```
 
-### 4.5 文件清理规则
+### 4.6 文件清理规则
 
 执行成功后，后处理器返回的 `files_to_delete` 列表中的文件会被处理：
 
@@ -376,51 +489,67 @@ except PostProcessingError as err:
 ## 5. 完整执行流程图
 
 ```
-信息提取完成 (process_video_result)
+process_ie_result
     │
-    ├─ [pre_process] 阶段 ── 错误暂存到 __pending_error
+    ├─ extract_flat 模式？ ── 是 → pre_process → 检查点① → return
     │
-    ├─ 格式匹配 (_match_entry)
-    │
-    ├─ post_extract
-    │
-    ├─ [after_filter] 阶段 ── 错误暂存到 __pending_error
-    │
-    ├─ 格式选择
-    │
-    └─ 对每个下载格式循环
+    └─ video 模式
          │
-         └─ process_info
+         └─ process_video_result
               │
-              ├─ [video] 阶段 ── 错误暂存到 __pending_error
+              ├─ [pre_process] 阶段 ── 错误暂存
               │
-              ├─ 确定文件名
+              ├─ 格式匹配 (_match_entry)
               │
-              ├─ 写入描述/字幕/缩略图/info.json 等
+              ├─ post_extract
               │
-              ├─ [before_dl] 阶段 ── 错误暂存到 __pending_error
+              ├─ [after_filter] 阶段 ── 错误暂存
               │
-              ├─ skip_download？ ── 是 → 直接执行 MoveFilesAfterDownloadPP
-              │    │
-              │    └─ 否 → 执行下载
-              │         │
-              │         └─ 下载成功？
-              │              │
-              │              ├─ 否 → 报告错误，返回
-              │              │
-              │              └─ 是 → 动态注入 __postprocessors
-              │                   │
-              │                   └─ post_process() 方法
-              │                        ├─ additional_pps（__postprocessors）
-              │                        ├─ [post_process] 静态链
-              │                        ├─ MoveFilesAfterDownloadPP（硬编码）
-              │                        └─ [after_move] 阶段
+              ├─ 格式选择
               │
-              └─ _raise_pending_errors → 检查暂存错误
+              └─ 对每个下载格式循环
+                   │
+                   └─ process_info
+                        │
+                        ├─ [video] 阶段 ── 错误暂存
+                        │
+                        ├─ 确定文件名
+                        │
+                        ├─ 写入描述/字幕/缩略图/info.json 等
+                        │
+                        ├─ [before_dl] 阶段 ── 错误暂存
+                        │
+                        ├─ skip_download？
+                        │    │
+                        │    ├─ 是 → 直接执行 MoveFilesAfterDownloadPP
+                        │    │
+                        │    └─ 否 → 执行下载（捕获下载异常）
+                        │
+                        ├─ 检查点④：_raise_pending_errors ← 后处理之前
+                        │
+                        ├─ 下载成功？
+                        │    │
+                        │    ├─ 否 → return
+                        │    │
+                        │    └─ 是 → 动态注入 __postprocessors
+                        │         │
+                        │         └─ post_process() 方法
+                        │              ├─ additional_pps（__postprocessors）
+                        │              ├─ [post_process] 静态链
+                        │              ├─ MoveFilesAfterDownloadPP（硬编码）
+                        │              └─ [after_move] 阶段
+                        │
+                        └─ return
+                   │
+                   └─ 检查点③：_raise_pending_errors ← 每个格式完成
 
     ├─ [after_video] 阶段 ── 所有格式完成后
     │
-    └─ 播放列表完成 → [playlist] 阶段
+    └─ 检查点②：_raise_pending_errors ← 视频结果（兜底）
+         │
+         └─ additional_urls 处理
+              │
+              └─ 播放列表完成 → [playlist] 阶段
 ```
 
 ---
@@ -431,14 +560,20 @@ except PostProcessingError as err:
 
 2. **4 个阶段有错误暂存**：`pre_process`、`after_filter`、`video`、`before_dl` 通过 `pre_process()` 方法调用，错误暂存到 `__pending_error`，不会立即终止。
 
-3. **错误暂存的检查时机**：`_raise_pending_errors` 在每个格式的 `process_info` 完成后调用，此时才会真正抛出暂存的错误。
+3. **暂存错误有 4 个检查点**（按执行顺序）：
+   - 检查点④ [L3596]：下载完成后、后处理之前（最内层、最早触发）
+   - 检查点③ [L3132]：每个格式 `process_info` 返回后
+   - 检查点① [L1934]：`extract_flat` 平铺结果返回后
+   - 检查点② [L1942]：视频结果最终返回后（兜底）
 
-4. **`additional_pps` 执行顺序**：动态添加的后处理器（如 Merger、Fixup）**先于**静态链执行，且只作用于 `post_process` 阶段。
+4. **`_raise_pending_errors` 会清空错误**：使用 `pop` 操作，错误被处理后不会重复抛出。
 
-5. **`ignoreerrors` 的精确判断**：必须是 `True` 才忽略后处理错误，`'only_download'` 不生效。
+5. **`additional_pps` 执行顺序**：动态添加的后处理器（如 Merger、Fixup）**先于**静态链执行，且只作用于 `post_process` 阶段。
 
-6. **`MoveFilesAfterDownloadPP` 的硬编码插入**：在 `post_process` 和 `after_move` 之间强制执行，不经过常规链管理。`skip_download` 模式下会更早执行。
+6. **`ignoreerrors` 的精确判断**：必须是 `True` 才忽略后处理错误，`'only_download'` 不生效。
 
-7. **`_restrict_to` 的 `simulated` 参数**：设为 `False` 时，模拟模式会跳过该后处理器。
+7. **`MoveFilesAfterDownloadPP` 的硬编码插入**：在 `post_process` 和 `after_move` 之间强制执行，不经过常规链管理。`skip_download` 模式下会更早执行（`before_dl` 之后直接调用）。
 
-8. **返回值约定**：跳过执行时必须返回 `([], info)` 而不是 `None`，否则元类包装会因解包失败报错。
+8. **`_restrict_to` 的 `simulated` 参数**：设为 `False` 时，模拟模式会跳过该后处理器。
+
+9. **返回值约定**：跳过执行时必须返回 `([], info)` 而不是 `None`，否则元类包装会因解包失败报错。
