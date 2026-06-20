@@ -313,7 +313,8 @@ def post_process(self, filename, info, files_to_move=None):
     info = self.run_pp(MoveFilesAfterDownloadPP(self), info)
     del info['__files_to_move']
 
-    # 第三阶段: after_move（文件已就位，如写 xattr、执行外部命令）
+    # 第三阶段: after_move（文件已就位，如执行外部命令）
+    # 注意：XAttrMetadataPP 在 post_process 阶段执行（文件移动前），不在 after_move
     return self.run_all_pps('after_move', info)
 ```
 
@@ -372,8 +373,8 @@ POSTPROCESS_WHEN = ('pre_process', 'after_filter', 'video', 'before_dl',
 | `after_filter` | `post_extract()` 之后，格式筛选/列表打印之前 | **SponsorBlockPP**（提前获取分段） |
 | `video` | `process_info()` 中，任何文件写入之前 | MetadataParserPP（解析标题生成元数据） |
 | `before_dl` | 缩略图/字幕/infojson 已写入，视频下载之前 | FFmpegThumbnailsConvertorPP、FFmpegSubtitlesConvertorPP |
-| `post_process` | 视频下载完成后 | ModifyChaptersPP、FFmpegMetadataPP、EmbedThumbnailPP、FFmpegSplitChaptersPP 等 |
-| `after_move` | 文件已移动到最终输出目录 | XAttrMetadataPP、ExecPP（`--exec` after_move 变体） |
+| `post_process` | 视频下载完成后 | ModifyChaptersPP、FFmpegMetadataPP、EmbedThumbnailPP、FFmpegSplitChaptersPP、**XAttrMetadataPP** 等 |
+| `after_move` | 文件已移动到最终输出目录 | ExecPP（`--exec` 默认，无 WHEN 前缀时） |
 | `after_video` | 该视频所有分段（section/range）均已下载完成 | （插件扩展点） |
 | `playlist` | 整个播放列表所有视频均已下载完成 | FFmpegConcat（拼接播放列表视频） |
 
@@ -525,6 +526,8 @@ process_video_result() 完整调用链（yt_dlp/YoutubeDL.py）
 - 分割产生的章节文件路径仅存在于 `chapter['filepath']` 中（`FFmpegSplitChaptersPP._ffmpeg_args_for_chapter` 赋值），但**不回写到 info_dict 的顶层**
 
 这意味着 `--split-chapters` 与 `--xattrs` 同时使用时，xattr 只作用于分割前的完整文件，而非各章节片段。这是当前代码的已知行为。
+
+**特别注意 XAttrMetadataPP 的 when**：`yt_dlp/__init__.py#L722-L723` yield 时未显式传 `when`，取默认值 `post_process`，**不是 after_move**。因此它在 `MoveFilesAfterDownloadPP` 之前执行，xattr 写在临时目录的文件上，随后的文件移动会继承 xattr（取决于操作系统和文件系统）。
 
 **ExecPP 的 when 灵活性**：`--exec` 默认 `when='after_move'`，但用户可显式指定 `--exec post_process:CMD` 使其在 post_process 阶段执行。无论哪种，ExecPP 注释声明"must be the last PP of each category"——在 `get_postprocessors` 中它总是某个 when 类别的最后一个 yield。
 
