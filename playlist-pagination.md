@@ -398,9 +398,13 @@ def _getter(self):
                 # 装饰器内部：wrapper(self, *args, **kwargs) → func(self, *args, **kwargs)
                 # 也就是：func(self.ydl, i) → self._entries[i]
                 #
-                # LazyList.IndexError / PagedList.IndexError 在装饰器白名单内 → 原样 re-raise
-                # ExtractorError（翻页 HTTP 失败等） → 装饰器吞掉 + report_error + 返回 None
-                # 但 None 返回后会被外层 except 过滤，所以实际上只有白名单异常能出去
+                # 各种异常的真实路径（按装饰器匹配顺序）：
+                #   LazyList.IndexError / PagedList.IndexError → 白名单 re-raise → 外层 except 捕获
+                #   DownloadCancelled 子类 (ExistingVideoReached 等) → 白名单 re-raise → 冒泡
+                #   ReExtractInfo → continue 重试
+                #   GeoRestrictedError → report_error(国家列表+VPN建议) + 返回 None
+                #   其它 ExtractorError (UnsupportedError/RegexNotFoundError等) → report_error + 返回 None
+                #   其它 Exception → 看 ignoreerrors
                 return type(self.ydl)._handle_extraction_exceptions(
                     lambda _, i: self._entries[i])(self.ydl, i)
             except (LazyList.IndexError, PagedList.IndexError):
@@ -415,12 +419,14 @@ def _getter(self):
 
 **装饰器对 `_getter` 调用的影响**：
 
-| 底层 `self._entries[i]` 产生的异常 | 装饰器处理 | `get_entry(i)` 的行为 | `__getitem__` 的行为 |
-|---|---|---|---|
-| `LazyList.IndexError` / `PagedList.IndexError` | 白名单 re-raise | `except` 转成 `self.IndexError` | 正向：`break` 停止迭代；反向：`continue` |
-| `ExtractorError`（翻页失败） | `report_error` + 返回 None | 返回 None | `yield (i+1, None)` → for 循环 `if not entry: continue` |
-| `DownloadCancelled` 子类 | 白名单 re-raise | 冒泡出 `get_entry` | 冒泡出 `__getitem__` → 冒泡出 `get_requested_items` 生成器 |
-| 其它 `Exception` | `ignoreerrors=True` → 吞 + None；`False` → re-raise | 同上 | 同上 |
+| 底层 `self._entries[i]` 产生的异常 | 装饰器匹配分支 | 装饰器行为 | `get_entry(i)` 结果 | 对 `__getitem__` 的影响 |
+|---|---|---|---|---|
+| `LazyList.IndexError` / `PagedList.IndexError` | 白名单 except | re-raise | `except` 转成 `self.IndexError` 再 raise | 正向：`break` 停止迭代；反向：`continue` 跳过 |
+| `DownloadCancelled` 子类 (ExistingVideoReached 等) | 白名单 except | re-raise | 冒泡出 `get_entry` | 冒泡出 `__getitem__` → 冒泡出生成器 |
+| `ReExtractInfo` | `except ReExtractInfo` | continue 重试 → 再次调用 `func` | 重试成功 → 正常 entry；重试失败 → 看异常 | 重试直到成功或其它异常 |
+| `GeoRestrictedError` | `except GeoRestrictedError`（L1736，在 ExtractorError 之前） | report_error(国家+VPN建议) + break | 返回 None | `yield (i+1, None)` → 外层 for 循环 `if not entry: continue` |
+| 其它 `ExtractorError` 子类 (UnsupportedError/RegexNotFoundError 等) | `except ExtractorError`（L1743） | report_error + format_traceback + break | 返回 None | 同上，跳过单条 |
+| 其它 `Exception` | `except Exception`（L1745） | `ignoreerrors=True` → report_error + break；`False` → re-raise | None 或冒泡 | None → 跳过；冒泡 → 终止 |
 
 ---
 
@@ -810,37 +816,47 @@ def _handle_extraction_exceptions(func):
                 return func(self, *args, **kwargs)
             except (CookieLoadError, DownloadCancelled,
                     LazyList.IndexError, PagedList.IndexError):
-                raise                     # ⭐ 白名单：原样 re-raise，不 report_error
+                raise                     # ⭐ 白名单 1：原样 re-raise，不 report_error
             except ReExtractInfo as e:
-                ...; continue             # 重试：重新跑 while
+                if e.expected: self.to_screen(f'{e}; Re-extracting data')
+                else: self.to_stderr('\r'); self.report_warning(f'{e}; Re-extracting data')
+                continue                  # 重试：重新跑 while，相当于重新调用 func
             except GeoRestrictedError as e:
-                self.report_error(msg)    # 吞掉 + report_error + break（函数返回 None）
-            except ExtractorError as e:
-                self.report_error(...)    # 吞掉 + report_error + break（函数返回 None）
+                # ⭐ 专用分支：必须写在 ExtractorError 之前（否则父类先吃掉）
+                msg = e.msg
+                if e.countries:
+                    msg += '\nThis video is available in {}.'.format(
+                        ', '.join(map(ISO3166Utils.short2full, e.countries)))
+                msg += '\nYou might want to use a VPN or a proxy server (with --proxy) to workaround.'
+                self.report_error(msg)
+            except ExtractorError as e:   # ⭐ 其余 ExtractorError：UnsupportedError / RegexNotFoundError 等
+                self.report_error(str(e), e.format_traceback())
             except Exception as e:
                 if self.params.get('ignoreerrors'):
-                    self.report_error(...)    # ⚠️ ignoreerrors 才吞，否则 re-raise
+                    self.report_error(str(e), tb=encode_compat_str(traceback.format_exc()))
                 else:
                     raise
-            break
+            break                         # 走到这里（非 continue/re-raise）→ 退出 while，函数返回 None
     return wrapper
 ```
 
-**分类汇总**：
+**分类汇总**（注意 except 分支是**按书写顺序匹配**的，子类必须写在父类之前）：
 
-| 异常类型 | 继承链 | 装饰器匹配的 except 分支 | 行为 | 函数返回 |
-|---|---|---|---|---|
-| `LazyList.IndexError` | `IndexError` | 白名单 `except` | re-raise | — |
-| `PagedList.IndexError` | `IndexError` | 白名单 `except` | re-raise | — |
-| `DownloadCancelled` | `YoutubeDLError` | 白名单 `except` | re-raise | — |
-| **`ExistingVideoReached`** | `DownloadCancelled` → `YoutubeDLError` | **白名单 `except`**（因为 `DownloadCancelled` 在白名单，子类也匹配） | **re-raise，不吞** | — |
-| **`RejectedVideoReached`** | `DownloadCancelled` → `YoutubeDLError` | **白名单 `except`** | **re-raise，不吞** | — |
-| **`MaxDownloadsReached`** | `DownloadCancelled` → `YoutubeDLError` | **白名单 `except`** | **re-raise，不吞** | — |
-| `CookieLoadError` | `YoutubeDLError` | 白名单 `except` | re-raise | — |
-| `ReExtractInfo` | `YoutubeDLError` | 专用 `except ReExtractInfo` | continue 重试 | — |
-| `GeoRestrictedError` | `ExtractorError` → `YoutubeDLError` | `except ExtractorError`（父类先匹配） | report_error + break | None |
-| `ExtractorError`（其它） | `YoutubeDLError` | `except ExtractorError` | report_error + break | None |
-| 其它普通 `Exception` | — | `except Exception` | `ignoreerrors=True` → 吞 + None；`False` → re-raise | 视参数 |
+| 异常类型 | 继承链 | 在装饰器中的位置 | 匹配的 except 分支 | 行为 | 函数返回 |
+|---|---|---|---|---|---|
+| `LazyList.IndexError` | `IndexError` | L1727 | 白名单 `except (..., LazyList.IndexError, ...)` | re-raise | — |
+| `PagedList.IndexError` | `IndexError` | L1727 | 白名单 `except (..., PagedList.IndexError)` | re-raise | — |
+| `CookieLoadError` | `YoutubeDLError` | L1727 | 白名单 `except (CookieLoadError, ...)` | re-raise | — |
+| `DownloadCancelled` | `YoutubeDLError` | L1727 | 白名单 `except (..., DownloadCancelled, ...)` | re-raise | — |
+| **`ExistingVideoReached`** | `DownloadCancelled` → `YoutubeDLError` | L1727 | **白名单 except**（父类 DownloadCancelled 在白名单，子类也匹配） | **re-raise，不吞** | — |
+| **`RejectedVideoReached`** | `DownloadCancelled` → `YoutubeDLError` | L1727 | **白名单 except** | **re-raise，不吞** | — |
+| **`MaxDownloadsReached`** | `DownloadCancelled` → `YoutubeDLError` | L1727 | **白名单 except** | **re-raise，不吞** | — |
+| `ReExtractInfo` | `YoutubeDLError` | L1729 | `except ReExtractInfo` | continue 重试（重新跑 while 循环，相当于重新调用 func） | — |
+| **`GeoRestrictedError`** | `ExtractorError` → `YoutubeDLError` | L1736 | `except GeoRestrictedError` ⭐ **专用分支在 ExtractorError 之前**，所以正确匹配 | `report_error(msg + 国家列表 + VPN 建议)` + break | None |
+| `UnsupportedError` | `ExtractorError` → `YoutubeDLError` | L1743 | `except ExtractorError`（父类） | `report_error(str(e))` + format_traceback + break | None |
+| `RegexNotFoundError` | `ExtractorError` → `YoutubeDLError` | L1743 | `except ExtractorError` | `report_error` + break | None |
+| 其它 `ExtractorError` 子类 | `ExtractorError` → `YoutubeDLError` | L1743 | `except ExtractorError` | `report_error` + break | None |
+| 其它普通 `Exception`（非以上任何子类） | — | L1745 | `except Exception` | `ignoreerrors=True` → report_error + break；`False` → re-raise | 视参数 |
 
 **易错点**：`ExistingVideoReached` / `RejectedVideoReached` 不是普通 Exception 路径；它们继承 `DownloadCancelled`，会命中白名单并被 re-raise，`--ignore-errors` 对它们无效。
 
@@ -975,4 +991,5 @@ def _match_entry(self, info_dict, incomplete=False, silent=False):
 | **ChainMap 注入上下文** | playlist 元数据（playlist_index/playlist_title 等）用 `collections.ChainMap` 叠加到每个 entry，避免深拷贝 | `__process_playlist` |
 | **双重循环防死循环** | `_playlist_urls`（playlist 级别）+ `seen_continuations`（YouTube API 级别） | `process_ie_result` / `_entries()` |
 | **DownloadCancelled 继承链** | `ExistingVideoReached`/`RejectedVideoReached`/`MaxDownloadsReached` 继承 `DownloadCancelled`，在装饰器白名单内永远 re-raise，不受 `--ignore-errors` 影响 | `_handle_extraction_exceptions` 白名单 `except` |
+| **GeoRestrictedError 专用分支** | GeoRestrictedError 是 ExtractorError 子类，但在装饰器中 except 顺序写在 ExtractorError 之前，确保命中专用分支（打印国家列表+VPN建议），而不是被父类吃掉 | `_handle_extraction_exceptions` L1736 vs L1743 的顺序 |
 | **预检查 + 循环内双拦截** | 生成器消费期（非 lazy 预检查）和下载循环期（for 内 continue/raise）各有一次终止机会 | `get_requested_items` 内 try/except + `__process_playlist` for 循环 |
